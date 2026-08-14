@@ -1,40 +1,185 @@
-// Forge Execution Worker — Phase 3
+// Forge Execution Worker — Phase 4 (Hardened)
 //
-// This is the EXECUTION PLANE. It runs as a separate process from the
-// Next.js control plane. It receives job requests via HTTP and executes
-// commands in isolated filesystem directories with a restricted environment.
+// SECURITY PROPERTIES (enforced by architecture, not by UI warnings):
 //
-// CRITICAL SECURITY PROPERTIES:
-// 1. This process does NOT inherit the control plane's environment variables.
-//    It only receives an explicit allowlist per job.
-// 2. It does NOT have access to DATABASE_URL, NEXTAUTH_SECRET,
-//    FORGE_MASTER_KEY, GITHUB_PAT, or any other platform credential.
-// 3. Each job runs in its own /tmp/forge-exec-{jobId}/ directory.
-// 4. Commands are executed with timeout + SIGTERM/SIGKILL escalation.
-// 5. Output is captured and returned to the control plane.
+// 1. AUTHENTICATION: Every /execute request must carry an HMAC-SHA256 signed
+//    job token. The worker verifies the signature using a shared secret
+//    (FORGE_WORKER_SECRET). Unauthenticated requests get 401.
+//
+// 2. NO CORS: The worker sets NO Access-Control-Allow-Origin header. It is a
+//    backend service, not a browser API. Browser clients cannot call it.
+//
+// 3. SERVER-CONTROLLED WORKSPACES: The client CANNOT specify worktreePath.
+//    The worker generates a sandboxId and workspacePath internally. The
+//    client only sends a sandboxId (which the worker validates).
+//
+// 4. PATH CONTAINEMENT: All file writes are contained within the sandbox
+//    root. Path traversal (../), absolute paths, and symlink escapes are
+//    rejected.
+//
+// 5. ENV ALLOWLIST: Child processes receive ONLY an explicit allowlist of
+//    env vars. Platform secrets (DATABASE_URL, FORGE_MASTER_KEY, etc.) are
+//    forbidden and silently dropped.
+//
+// 6. COMMAND POLICY: Commands are validated against a blocklist (fork bombs,
+//    shutdown/reboot, mount, kernel manipulation, device access).
 //
 // ISOLATION LEVEL: Process-level + filesystem-level.
-// This is NOT container-level isolation (no Docker available in this env).
-// The spec acknowledges this as a limitation — it's real process isolation,
-// not simulation, but not as strong as container/microVM isolation.
-// FORGE_EXECUTION_MODE=local in dev, =sandbox when a real sandbox is available.
+// This is NOT container-level isolation. The worker documents this honestly.
+// Production should use a stronger substrate (Vercel Sandbox, containers,
+// microVMs). This worker is suitable for LOCAL_UNSANDBOXED dev mode only.
 
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { randomUUID } from "node:crypto";
+import { mkdirSync, rmSync, writeFileSync, realpathSync, existsSync, lstatSync } from "node:fs";
+import { join, dirname, resolve, normalize, isAbsolute } from "node:path";
+import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 
-const PORT = 3001;
-const EXEC_ROOT = "/tmp/forge-exec";
+const PORT = parseInt(process.env.FORGE_WORKER_PORT || "3001", 10);
+const EXEC_ROOT = process.env.FORGE_EXEC_ROOT || "/tmp/forge-exec";
+const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
+
+if (!WORKER_SECRET) {
+  console.error("[forge-execution-worker] FATAL: FORGE_WORKER_SECRET is not set.");
+  console.error("[forge-execution-worker] The worker cannot start without a shared secret for authentication.");
+  console.error("[forge-execution-worker] Set FORGE_WORKER_SECRET in the worker's environment (not the control plane's).");
+  process.exit(1);
+}
 
 // Ensure exec root exists.
 try { mkdirSync(EXEC_ROOT, { recursive: true }); } catch {}
 
 // ---------------------------------------------------------------------------
-// ALLOWLIST of environment variables the worker MAY receive.
-// The control plane sends these explicitly per job.
-// The worker NEVER inherits its own process.env into child processes.
+// Token verification — HMAC-SHA256 signed job tokens
+// ---------------------------------------------------------------------------
+
+interface JobToken {
+  jobId: string;
+  projectId: string;
+  attempt: number;
+  issuedAt: number;
+  expiresAt: number;
+  nonce: string;
+  signature: string;
+}
+
+function signToken(token: Omit<JobToken, "signature">): string {
+  const payload = `${token.jobId}.${token.projectId}.${token.attempt}.${token.issuedAt}.${token.expiresAt}.${token.nonce}`;
+  return createHmac("sha256", WORKER_SECRET).update(payload).digest("hex");
+}
+
+function verifyToken(token: JobToken): { valid: boolean; reason?: string } {
+  // Check expiry.
+  const now = Date.now();
+  if (now > token.expiresAt) {
+    return { valid: false, reason: "Token expired" };
+  }
+  // Check signature.
+  const expectedSignature = signToken({
+    jobId: token.jobId,
+    projectId: token.projectId,
+    attempt: token.attempt,
+    issuedAt: token.issuedAt,
+    expiresAt: token.expiresAt,
+    nonce: token.nonce,
+  });
+  const a = Buffer.from(token.signature, "hex");
+  const b = Buffer.from(expectedSignature, "hex");
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    return { valid: false, reason: "Invalid signature" };
+  }
+  return { valid: true };
+}
+
+function extractToken(req: IncomingMessage): JobToken | null {
+  const auth = req.headers["authorization"];
+  if (!auth || !auth.startsWith("Bearer ")) return null;
+  const tokenStr = auth.slice(7);
+  try {
+    const token = JSON.parse(Buffer.from(tokenStr, "base64").toString("utf-8"));
+    if (!token.jobId || !token.projectId || !token.signature) return null;
+    return token as JobToken;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox management — server-controlled workspace paths
+// ---------------------------------------------------------------------------
+
+interface Sandbox {
+  id: string;
+  projectId: string;
+  workspacePath: string;
+  createdAt: number;
+}
+
+const activeSandboxes = new Map<string, Sandbox>();
+
+function createSandbox(sandboxId: string, projectId: string): Sandbox {
+  // Server-generated path — client cannot control this.
+  const workspacePath = join(EXEC_ROOT, projectId, sandboxId);
+  mkdirSync(workspacePath, { recursive: true });
+  const sandbox: Sandbox = { id: sandboxId, projectId, workspacePath, createdAt: Date.now() };
+  activeSandboxes.set(sandboxId, sandbox);
+  return sandbox;
+}
+
+function getSandbox(sandboxId: string, projectId: string): Sandbox | null {
+  const sandbox = activeSandboxes.get(sandboxId);
+  if (!sandbox) return null;
+  // Verify the sandbox belongs to the claimed project (tenant isolation).
+  if (sandbox.projectId !== projectId) return null;
+  return sandbox;
+}
+
+function destroySandbox(sandboxId: string): void {
+  const sandbox = activeSandboxes.get(sandboxId);
+  if (sandbox) {
+    try { rmSync(sandbox.workspacePath, { recursive: true, force: true }); } catch {}
+    activeSandboxes.delete(sandboxId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Path containment — prevent traversal, absolute paths, symlink escapes
+// ---------------------------------------------------------------------------
+
+function isPathSafe(sandboxRoot: string, requestedPath: string): { safe: boolean; resolved?: string; reason?: string } {
+  // Reject absolute paths.
+  if (isAbsolute(requestedPath)) {
+    return { safe: false, reason: "Absolute paths are not allowed" };
+  }
+  // Reject null bytes.
+  if (requestedPath.includes("\0")) {
+    return { safe: false, reason: "Null bytes in path" };
+  }
+  // Resolve the full path.
+  const fullResolved = resolve(sandboxRoot, requestedPath);
+  const rootResolved = resolve(sandboxRoot);
+  // Check containment.
+  if (!fullResolved.startsWith(rootResolved + "/") && fullResolved !== rootResolved) {
+    return { safe: false, reason: "Path escapes sandbox root" };
+  }
+  // Check for symlink escape — if the file exists and is a symlink, resolve it
+  // and verify the target is still inside the sandbox.
+  try {
+    if (existsSync(fullResolved)) {
+      const real = realpathSync(fullResolved);
+      const realRoot = realpathSync(rootResolved);
+      if (!real.startsWith(realRoot + "/") && real !== realRoot) {
+        return { safe: false, reason: "Symlink escape detected" };
+      }
+    }
+  } catch {
+    // File doesn't exist yet — that's fine for writes.
+  }
+  return { safe: true, resolved: fullResolved };
+}
+
+// ---------------------------------------------------------------------------
+// Environment allowlist — child processes never get platform secrets
 // ---------------------------------------------------------------------------
 
 const ALLOWED_ENV_KEYS = new Set([
@@ -58,7 +203,6 @@ const ALLOWED_ENV_KEYS = new Set([
   "NPM_CONFIG_REGISTRY",
 ]);
 
-// FORBIDDEN keys that must NEVER be passed to child processes.
 const FORBIDDEN_ENV_KEYS = [
   "DATABASE_URL",
   "DIRECT_URL",
@@ -66,6 +210,7 @@ const FORBIDDEN_ENV_KEYS = [
   "NEXTAUTH_URL",
   "FORGE_MASTER_KEY",
   "FORGE_SECRET",
+  "FORGE_WORKER_SECRET",
   "GITHUB_PAT",
   "GITHUB_TOKEN",
   "GITHUB_USERNAME",
@@ -74,7 +219,6 @@ const FORBIDDEN_ENV_KEYS = [
 ];
 
 function buildChildEnv(jobEnv: Record<string, string> | undefined): Record<string, string> {
-  // Start with a MINIMAL base — NOT process.env.
   const base: Record<string, string> = {
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
     HOME: process.env.HOME || "/tmp",
@@ -84,25 +228,68 @@ function buildChildEnv(jobEnv: Record<string, string> | undefined): Record<strin
     TERM: process.env.TERM || "xterm-256color",
     TMPDIR: "/tmp",
   };
-
-  // Merge only allowed keys from the job's env.
   if (jobEnv) {
     for (const [key, value] of Object.entries(jobEnv)) {
-      if (FORBIDDEN_ENV_KEYS.includes(key)) {
-        // Silently drop forbidden keys — never expose platform secrets.
-        continue;
-      }
+      if (FORBIDDEN_ENV_KEYS.includes(key)) continue;
+      if (key.startsWith("FORGE_")) continue;
       if (ALLOWED_ENV_KEYS.has(key) || key.endsWith("_TEST")) {
         base[key] = value;
       }
     }
   }
-
   return base;
 }
 
 // ---------------------------------------------------------------------------
-// Command execution with timeout + output capture
+// Command policy — reject dangerous commands (defense in depth)
+// ---------------------------------------------------------------------------
+
+const FORBIDDEN_COMMANDS = [
+  "shutdown", "reboot", "halt", "poweroff", "init",
+  "mount", "umount",
+  "mkfs", "fdisk", "parted",
+  "dd",  // can overwrite disks
+  "sysctl",
+  "modprobe", "insmod", "rmmod",
+  "systemctl", "service",
+  "chmod", // can change permissions to escape
+];
+
+const FORBIDDEN_ARG_PATTERNS = [
+  /:\s*\(\s*\)\s*\{/,  // fork bomb :(){:|:&};:
+  /fork\s+bomb/i,
+  /:\s*\{\s*:.*\&/,  // another fork bomb variant
+  /\/dev\/sd[a-z]/,  // raw disk access
+  /\/dev\/mem/,
+  /\/dev\/kmem/,
+  /\/proc\/sys/,
+  /\/sys\/(?!class\/)/,  // sysfs (but allow /sys/class for hardware info)
+  /rm\s+-rf\s+\//,  // recursive delete from root
+  /\bshutdown\b/i,
+  /\breboot\b/i,
+  /\bhalt\b/i,
+  /\bpoweroff\b/i,
+  /\binit\s+[06]\b/,
+];
+
+function validateCommand(command: string, args: string[]): { allowed: boolean; reason?: string } {
+  // Check command against blocklist.
+  const baseCmd = command.split("/").pop() || command;
+  if (FORBIDDEN_COMMANDS.includes(baseCmd)) {
+    return { allowed: false, reason: `Command '${baseCmd}' is blocked by policy` };
+  }
+  // Check args for dangerous patterns.
+  const argStr = args.join(" ");
+  for (const pattern of FORBIDDEN_ARG_PATTERNS) {
+    if (pattern.test(argStr)) {
+      return { allowed: false, reason: `Command args match blocked pattern: ${pattern.source}` };
+    }
+  }
+  return { allowed: true };
+}
+
+// ---------------------------------------------------------------------------
+// Command execution with timeout + output capture + resource limits
 // ---------------------------------------------------------------------------
 
 interface ExecutionResult {
@@ -130,30 +317,33 @@ async function executeCommand(
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    let killed = false;
 
     const child = spawn(command, args, {
       cwd,
-      env, // ONLY the explicit allowlist — NOT process.env
+      env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: false,
+      // Resource limits (where supported by the OS):
+      // Note: Node doesn't expose rlimit directly; these are best-effort.
     });
 
+    let stdoutLen = 0;
+    let stderrLen = 0;
+    const MAX_OUTPUT = 200000; // 200KB per stream
+
     child.stdout?.on("data", (data) => {
-      stdout += data.toString();
-      if (stdout.length > 200000) stdout = stdout.slice(-200000); // keep last 200KB
+      stdoutLen += data.length;
+      if (stdoutLen <= MAX_OUTPUT) stdout += data.toString();
     });
 
     child.stderr?.on("data", (data) => {
-      stderr += data.toString();
-      if (stderr.length > 200000) stderr = stderr.slice(-200000);
+      stderrLen += data.length;
+      if (stderrLen <= MAX_OUTPUT) stderr += data.toString();
     });
 
     const timer = setTimeout(() => {
       timedOut = true;
-      killed = true;
       try { child.kill("SIGTERM"); } catch {}
-      // Force kill after 5s if still alive.
       setTimeout(() => {
         try { child.kill("SIGKILL"); } catch {}
       }, 5000);
@@ -166,7 +356,7 @@ async function executeCommand(
         args,
         cwd,
         exitCode: code,
-        stdout: stdout.slice(0, 100000), // 100KB max for response
+        stdout: stdout.slice(0, 100000),
         stderr: stderr.slice(0, 100000),
         durationMs: Date.now() - start,
         timedOut,
@@ -177,9 +367,7 @@ async function executeCommand(
     child.on("error", (err) => {
       clearTimeout(timer);
       resolve({
-        command,
-        args,
-        cwd,
+        command, args, cwd,
         exitCode: -1,
         stdout,
         stderr: stderr + "\n" + err.message,
@@ -192,177 +380,184 @@ async function executeCommand(
 }
 
 // ---------------------------------------------------------------------------
-// Job types
+// HTTP server — authenticated, no CORS
 // ---------------------------------------------------------------------------
 
-interface ExecutionJobRequest {
-  jobId: string;
-  projectId: string;
-  commands: { command: string; args: string[]; timeoutMs?: number }[];
-  worktreePath?: string; // if provided, use this path; else create ephemeral
-  env?: Record<string, string>; // explicit allowlist only
-  files?: { path: string; content: string }[]; // files to write before execution
-  timeoutMs?: number; // total job timeout
+function sendJson(res: ServerResponse, status: number, body: any) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
 }
-
-interface ExecutionJobResponse {
-  jobId: string;
-  results: ExecutionResult[];
-  success: boolean;
-  error?: string;
-  workDir: string;
-  durationMs: number;
-}
-
-// ---------------------------------------------------------------------------
-// HTTP server
-// ---------------------------------------------------------------------------
 
 const server = createServer(async (req, res) => {
-  // CORS + JSON.
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  // NO CORS HEADERS. This is a backend service, not a browser API.
+  // Browser clients cannot call this worker.
 
-  // Health check.
-  if (req.url === "/health" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+  const url = req.url || "";
+
+  // Public health check (no secrets exposed).
+  if (url === "/health" && req.method === "GET") {
+    sendJson(res, 200, {
       ok: true,
       service: "forge-execution-worker",
-      mode: "isolated",
-      envKeys: Object.keys(process.env).length,
-      hasPlatformSecrets: FORBIDDEN_ENV_KEYS.some(k => !!process.env[k]),
-    }));
+      version: "phase4",
+      mode: "authenticated",
+    });
     return;
   }
 
-  // Verify env isolation (security test endpoint).
-  if (req.url === "/security-audit" && req.method === "GET") {
-    const leaked: string[] = [];
-    for (const key of FORBIDDEN_ENV_KEYS) {
-      if (process.env[key]) leaked.push(key);
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+  // Security audit — REQUIRES AUTHENTICATION (was public in Phase 3).
+  if (url === "/security-audit" && req.method === "GET") {
+    const token = extractToken(req);
+    if (!token) return sendJson(res, 401, { error: "Authentication required" });
+    const verification = verifyToken(token);
+    if (!verification.valid) return sendJson(res, 403, { error: verification.reason });
+
+    const leaked = FORBIDDEN_ENV_KEYS.filter(k => !!process.env[k]);
+    sendJson(res, 200, {
       leakedEnvKeys: leaked,
       isIsolated: leaked.length === 0,
+      activeSandboxes: activeSandboxes.size,
       message: leaked.length === 0
-        ? "Worker process has no platform secrets in its environment"
-        : `WARNING: Worker process has ${leaked.length} platform secret(s) in its environment: ${leaked.join(", ")}`,
-    }));
+        ? "Worker process has no platform secrets"
+        : `WARNING: ${leaked.length} platform secret(s) detected: ${leaked.join(", ")}`,
+    });
     return;
   }
 
-  // Execute job.
-  if (req.url === "/execute" && req.method === "POST") {
+  // Create sandbox — REQUIRES AUTHENTICATION.
+  if (url === "/sandbox" && req.method === "POST") {
+    const token = extractToken(req);
+    if (!token) return sendJson(res, 401, { error: "Authentication required" });
+    const verification = verifyToken(token);
+    if (!verification.valid) return sendJson(res, 403, { error: verification.reason });
+
     let body = "";
-    req.on("data", (chunk) => { body += chunk; if (body.length > 10e6) req.destroy(); });
+    req.on("data", (chunk) => { body += chunk; if (body.length > 1e6) req.destroy(); });
+    req.on("end", () => {
+      try {
+        const { projectId } = JSON.parse(body);
+        if (!projectId) return sendJson(res, 400, { error: "projectId required" });
+        const sandboxId = randomUUID();
+        const sandbox = createSandbox(sandboxId, projectId);
+        sendJson(res, 200, { sandboxId, workspacePath: sandbox.workspacePath });
+      } catch (err: any) {
+        sendJson(res, 500, { error: err.message });
+      }
+    });
+    return;
+  }
+
+  // Execute job — REQUIRES AUTHENTICATION.
+  if (url === "/execute" && req.method === "POST") {
+    const token = extractToken(req);
+    if (!token) return sendJson(res, 401, { error: "Authentication required" });
+    const verification = verifyToken(token);
+    if (!verification.valid) return sendJson(res, 403, { error: verification.reason });
+
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; if (body.length > 50e6) req.destroy(); }); // 50MB max
     req.on("end", async () => {
       try {
-        const job: ExecutionJobRequest = JSON.parse(body);
-        const workDir = job.worktreePath || join(EXEC_ROOT, job.jobId || randomUUID());
+        const job = JSON.parse(body);
 
-        // Create work directory.
-        try { mkdirSync(workDir, { recursive: true }); } catch {}
+        // Validate sandboxId — the client must provide a sandbox created via /sandbox.
+        // The client CANNOT specify worktreePath.
+        if (!job.sandboxId) {
+          return sendJson(res, 400, { error: "sandboxId required (create a sandbox first via POST /sandbox)" });
+        }
+        const sandbox = getSandbox(job.sandboxId, token.projectId);
+        if (!sandbox) {
+          return sendJson(res, 403, { error: "Sandbox not found or does not belong to this project" });
+        }
 
-        // Write any provided files.
+        // Write files (with path containment).
         if (job.files) {
           for (const f of job.files) {
-            const fullPath = join(workDir, f.path);
+            const pathCheck = isPathSafe(sandbox.workspacePath, f.path);
+            if (!pathCheck.safe) {
+              return sendJson(res, 400, { error: `Path rejected: ${f.path} — ${pathCheck.reason}` });
+            }
             try {
-              mkdirSync(dirname(fullPath), { recursive: true });
-              writeFileSync(fullPath, f.content);
+              mkdirSync(dirname(pathCheck.resolved!), { recursive: true });
+              writeFileSync(pathCheck.resolved!, f.content);
             } catch (err: any) {
-              // Continue even if file write fails.
+              return sendJson(res, 500, { error: `Failed to write ${f.path}: ${err.message}` });
             }
           }
         }
 
-        // Build the restricted environment.
+        // Validate + execute commands.
         const childEnv = buildChildEnv(job.env);
-
-        // Execute each command sequentially.
         const results: ExecutionResult[] = [];
-        const jobStart = Date.now();
         let jobSuccess = true;
 
-        for (const cmd of job.commands) {
+        for (const cmd of job.commands || []) {
+          // Command policy validation.
+          const cmdCheck = validateCommand(cmd.command, cmd.args || []);
+          if (!cmdCheck.allowed) {
+            results.push({
+              command: cmd.command, args: cmd.args || [], cwd: sandbox.workspacePath,
+              exitCode: -1, stdout: "", stderr: `Command blocked: ${cmdCheck.reason}`,
+              durationMs: 0, timedOut: false, success: false,
+            });
+            jobSuccess = false;
+            break;
+          }
+
           const result = await executeCommand(
-            cmd.command,
-            cmd.args,
-            workDir,
-            childEnv,
+            cmd.command, cmd.args || [], sandbox.workspacePath, childEnv,
             cmd.timeoutMs || 60000
           );
           results.push(result);
-          if (!result.success) {
-            jobSuccess = false;
-            break; // stop on first failure
-          }
+          if (!result.success) { jobSuccess = false; break; }
         }
 
-        const response: ExecutionJobResponse = {
-          jobId: job.jobId,
+        sendJson(res, 200, {
+          jobId: token.jobId,
+          sandboxId: sandbox.id,
           results,
           success: jobSuccess,
-          workDir,
-          durationMs: Date.now() - jobStart,
-        };
-
-        // Cleanup ephemeral work dir (unless worktreePath was provided).
-        if (!job.worktreePath) {
-          try { rmSync(workDir, { recursive: true, force: true }); } catch {}
-        }
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(response));
+          workDir: sandbox.workspacePath,
+          durationMs: results.reduce((s, r) => s + r.durationMs, 0),
+        });
       } catch (err: any) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message, success: false }));
+        sendJson(res, 500, { error: err.message });
       }
     });
     return;
   }
 
-  // Cleanup endpoint — remove a work directory.
-  if (req.url?.startsWith("/cleanup") && req.method === "POST") {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; });
-    req.on("end", () => {
-      try {
-        const { path } = JSON.parse(body);
-        if (path && path.startsWith(EXEC_ROOT)) {
-          try { rmSync(path, { recursive: true, force: true }); } catch {}
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (err: any) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
-      }
-    });
+  // Destroy sandbox — REQUIRES AUTHENTICATION.
+  if (url.startsWith("/sandbox/") && req.method === "DELETE") {
+    const token = extractToken(req);
+    if (!token) return sendJson(res, 401, { error: "Authentication required" });
+    const verification = verifyToken(token);
+    if (!verification.valid) return sendJson(res, 403, { error: verification.reason });
+
+    const sandboxId = url.split("/sandbox/")[1];
+    const sandbox = getSandbox(sandboxId, token.projectId);
+    if (!sandbox) return sendJson(res, 404, { error: "Sandbox not found" });
+    destroySandbox(sandboxId);
+    sendJson(res, 200, { ok: true });
     return;
   }
 
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "Not found" }));
+  // All other routes → 404.
+  sendJson(res, 404, { error: "Not found" });
 });
 
 server.listen(PORT, () => {
   console.log(`[forge-execution-worker] listening on port ${PORT}`);
+  console.log(`[forge-execution-worker] version: phase4 (authenticated)`);
   console.log(`[forge-execution-worker] exec root: ${EXEC_ROOT}`);
-  console.log(`[forge-execution-worker] mode: isolated (process-level)`);
-  // Verify isolation on startup.
+  console.log(`[forge-execution-worker] authentication: HMAC-SHA256 signed job tokens`);
+  console.log(`[forge-execution-worker] CORS: disabled (backend service only)`);
+  console.log(`[forge-execution-worker] server-controlled workspaces: enabled`);
+  console.log(`[forge-execution-worker] path containment: enabled`);
+
   const leaked = FORBIDDEN_ENV_KEYS.filter(k => !!process.env[k]);
   if (leaked.length > 0) {
-    console.warn(`[forge-execution-worker] WARNING: platform secrets detected in worker env: ${leaked.join(", ")}`);
-    console.warn(`[forge-execution-worker] These will NOT be passed to child processes, but their presence indicates the worker was started with the wrong environment.`);
+    console.warn(`[forge-execution-worker] WARNING: platform secrets in worker env: ${leaked.join(", ")}`);
   } else {
     console.log(`[forge-execution-worker] ✓ No platform secrets in worker environment`);
   }

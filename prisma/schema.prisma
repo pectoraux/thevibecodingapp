@@ -524,9 +524,15 @@ model BuildJob {
   projectId   String
   project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   type        String   // BUILD | EXECUTION | VERIFICATION
-  status      String   @default("QUEUED") // QUEUED | DISPATCHING | RUNNING | WAITING | SUCCEEDED | FAILED | CANCELLED | TIMED_OUT | BLOCKED
+  status      String   @default("QUEUED") // QUEUED | CLAIMED | RUNNING | WAITING | SUCCEEDED | FAILED | CANCELLED | TIMED_OUT | BLOCKED
   taskId      String?
   attempt     Int      @default(0)
+
+  // Durable lease fields (Phase 4)
+  workerId    String?  // which worker claimed this job
+  leaseId     String?  // unique lease identifier
+  leaseExpiresAt DateTime?  // when the lease expires (for recovery)
+  heartbeatAt DateTime?  // last worker heartbeat
 
   // Execution metadata
   executionId String?  // sandbox/worker job ID
@@ -534,6 +540,9 @@ model BuildJob {
   workDir     String?
   commitSha   String?
   branch      String?
+
+  // Idempotency
+  idempotencyKey String? @unique  // projectId+taskId+attempt
 
   // Results
   results     String?  // JSON: execution results
@@ -548,4 +557,5 @@ model BuildJob {
   @@index([projectId])
   @@index([status])
   @@index([type])
+  @@index([leaseExpiresAt])
 }

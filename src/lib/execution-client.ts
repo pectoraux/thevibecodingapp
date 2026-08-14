@@ -1,53 +1,64 @@
-// Forge — execution client.
+// Forge — execution client (Phase 4: authenticated).
 //
-// This module is the control-plane side of the execution plane separation.
-// It sends job requests to the isolated execution worker via HTTP.
+// The control plane signs job tokens with HMAC-SHA256 using FORGE_WORKER_SECRET.
+// The worker verifies the signature before executing anything.
 //
-// The control plane NEVER executes generated code directly. All execution
-// goes through this client → the execution worker (separate process).
+// Flow:
+//   1. Control plane creates a sandbox via POST /sandbox (gets sandboxId)
+//   2. Control plane submits execution via POST /execute (with sandboxId + signed token)
+//   3. Control plane destroys sandbox via DELETE /sandbox/{id}
 //
-// If the worker is unavailable, the task is BLOCKED (not silently run locally).
+// The client NEVER specifies a filesystem path. The worker controls paths.
 
+import { createHmac, randomUUID } from "node:crypto";
 import { FORGE_EXECUTION_MODE } from "@/lib/execution-mode";
 
-export interface ExecutionJobRequest {
+const WORKER_URL = process.env.FORGE_EXECUTION_WORKER_URL || "http://localhost:3001";
+const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
+
+if (!WORKER_SECRET && FORGE_EXECUTION_MODE === "sandbox") {
+  console.error("[forge-execution-client] FATAL: FORGE_WORKER_SECRET not set in sandbox mode");
+}
+
+interface JobToken {
   jobId: string;
   projectId: string;
-  commands: { command: string; args: string[]; timeoutMs?: number }[];
-  worktreePath?: string;
-  env?: Record<string, string>; // explicit allowlist only
-  files?: { path: string; content: string }[];
-  timeoutMs?: number;
+  attempt: number;
+  issuedAt: number;
+  expiresAt: number;
+  nonce: string;
+  signature: string;
 }
 
-export interface ExecutionJobResponse {
-  jobId: string;
-  results: any[];
-  success: boolean;
-  error?: string;
-  workDir: string;
-  durationMs: number;
+function signToken(payload: Omit<JobToken, "signature">): string {
+  const data = `${payload.jobId}.${payload.projectId}.${payload.attempt}.${payload.issuedAt}.${payload.expiresAt}.${payload.nonce}`;
+  return createHmac("sha256", WORKER_SECRET || "").update(data).digest("hex");
 }
 
-const WORKER_URL = process.env.FORGE_EXECUTION_WORKER_URL || "http://localhost:3001";
+function createToken(jobId: string, projectId: string, attempt: number): JobToken {
+  const now = Date.now();
+  const payload: Omit<JobToken, "signature"> = {
+    jobId,
+    projectId,
+    attempt,
+    issuedAt: now,
+    expiresAt: now + 300000, // 5-minute validity
+    nonce: randomUUID(),
+  };
+  return { ...payload, signature: signToken(payload) };
+}
+
+function tokenToHeader(token: JobToken): string {
+  const encoded = Buffer.from(JSON.stringify(token)).toString("base64");
+  return `Bearer ${encoded}`;
+}
 
 /**
- * Check if the execution worker is available.
+ * Check if the execution worker is available and authenticated.
  */
 export async function isExecutionWorkerAvailable(): Promise<boolean> {
-  if (FORGE_EXECUTION_MODE === "local") {
-    // In local mode, the worker may not be running. We fall back to local
-    // execution but mark it as UNSANDBOXED.
-    try {
-      const res = await fetch(`${WORKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-      return res.ok;
-    } catch {
-      return false;
-    }
-  }
-  // In sandbox mode, the worker MUST be available.
   try {
-    const res = await fetch(`${WORKER_URL}/health`, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(`${WORKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
     return res.ok;
   } catch {
     return false;
@@ -55,8 +66,65 @@ export async function isExecutionWorkerAvailable(): Promise<boolean> {
 }
 
 /**
- * Submit an execution job to the isolated worker.
- * Returns the job results, or throws if the worker is unavailable.
+ * Create a sandbox on the worker. Returns the sandboxId.
+ * The workspace path is server-controlled — the client cannot specify it.
+ */
+export async function createSandbox(projectId: string, jobId: string, attempt: number): Promise<{ sandboxId: string; workspacePath: string }> {
+  const token = createToken(jobId, projectId, attempt);
+  const res = await fetch(`${WORKER_URL}/sandbox`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": tokenToHeader(token),
+    },
+    body: JSON.stringify({ projectId }),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to create sandbox: HTTP ${res.status}: ${await res.text()}`);
+  }
+  return await res.json() as any;
+}
+
+/**
+ * Destroy a sandbox on the worker.
+ */
+export async function destroySandbox(sandboxId: string, projectId: string, jobId: string, attempt: number): Promise<void> {
+  const token = createToken(jobId, projectId, attempt);
+  try {
+    await fetch(`${WORKER_URL}/sandbox/${sandboxId}`, {
+      method: "DELETE",
+      headers: { "Authorization": tokenToHeader(token) },
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    // Best-effort cleanup.
+  }
+}
+
+export interface ExecutionJobRequest {
+  jobId: string;
+  projectId: string;
+  attempt: number;
+  sandboxId: string; // REQUIRED — created via createSandbox()
+  commands: { command: string; args: string[]; timeoutMs?: number }[];
+  env?: Record<string, string>;
+  files?: { path: string; content: string }[]; // paths are contained by the worker
+  timeoutMs?: number;
+}
+
+export interface ExecutionJobResponse {
+  jobId: string;
+  sandboxId: string;
+  results: any[];
+  success: boolean;
+  error?: string;
+  workDir: string;
+  durationMs: number;
+}
+
+/**
+ * Submit an execution job to the isolated, authenticated worker.
  */
 export async function submitExecutionJob(request: ExecutionJobRequest): Promise<ExecutionJobResponse> {
   const available = await isExecutionWorkerAvailable();
@@ -68,24 +136,32 @@ export async function submitExecutionJob(request: ExecutionJobRequest): Promise<
     return localExecutionFallback(request);
   }
 
+  const token = createToken(request.jobId, request.projectId, request.attempt);
   const res = await fetch(`${WORKER_URL}/execute`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": tokenToHeader(token),
+    },
+    body: JSON.stringify({
+      sandboxId: request.sandboxId,
+      commands: request.commands,
+      env: request.env,
+      files: request.files,
+    }),
     signal: AbortSignal.timeout(request.timeoutMs || 300000),
   });
 
-  if (!res.ok) {
-    throw new Error(`Execution worker returned HTTP ${res.status}: ${await res.text()}`);
-  }
+  if (res.status === 401) throw new Error("Worker rejected token: unauthorized");
+  if (res.status === 403) throw new Error(`Worker rejected token: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Execution worker HTTP ${res.status}: ${await res.text()}`);
 
   return await res.json() as ExecutionJobResponse;
 }
 
 /**
- * Local execution fallback — used ONLY in FORGE_EXECUTION_MODE=local when
- * the worker is not running. This is explicitly UNSANDBOXED and the UI
- * shows a warning. Production deployments must use sandbox mode.
+ * Local execution fallback — UNSANDBOXED, dev only.
+ * Production must use sandbox mode.
  */
 async function localExecutionFallback(request: ExecutionJobRequest): Promise<ExecutionJobResponse> {
   const { spawn } = await import("node:child_process");
@@ -93,10 +169,9 @@ async function localExecutionFallback(request: ExecutionJobRequest): Promise<Exe
   const { join } = await import("node:path");
   const { randomUUID } = await import("node:crypto");
 
-  const workDir = request.worktreePath || join("/tmp/forge-exec", request.jobId || randomUUID());
+  const workDir = join("/tmp/forge-exec-local", request.jobId || randomUUID());
   try { mkdirSync(workDir, { recursive: true }); } catch {}
 
-  // Write files.
   if (request.files) {
     for (const f of request.files) {
       const fullPath = join(workDir, f.path);
@@ -108,10 +183,7 @@ async function localExecutionFallback(request: ExecutionJobRequest): Promise<Exe
     }
   }
 
-  // CRITICAL: In local fallback, we still use a restricted env (NOT process.env).
-  // This is less safe than the worker (same process), but we still don't pass
-  // platform secrets to the child.
-  const FORBIDDEN = ["DATABASE_URL", "DIRECT_URL", "NEXTAUTH_SECRET", "FORGE_MASTER_KEY", "FORGE_SECRET", "GITHUB_PAT", "GITHUB_TOKEN", "VERCEL_TOKEN"];
+  const FORBIDDEN = ["DATABASE_URL", "DIRECT_URL", "NEXTAUTH_SECRET", "FORGE_MASTER_KEY", "FORGE_SECRET", "FORGE_WORKER_SECRET", "GITHUB_PAT", "GITHUB_TOKEN", "VERCEL_TOKEN"];
   const childEnv: Record<string, string> = {
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
     HOME: process.env.HOME || "/tmp",
@@ -133,11 +205,7 @@ async function localExecutionFallback(request: ExecutionJobRequest): Promise<Exe
       let stdout = "";
       let stderr = "";
       let timedOut = false;
-      const child = spawn(cmd.command, cmd.args, {
-        cwd: workDir,
-        env: childEnv,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      const child = spawn(cmd.command, cmd.args, { cwd: workDir, env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
       child.stdout?.on("data", (d) => { stdout += d.toString(); if (stdout.length > 200000) stdout = stdout.slice(-200000); });
       child.stderr?.on("data", (d) => { stderr += d.toString(); if (stderr.length > 200000) stderr = stderr.slice(-200000); });
       const timer = setTimeout(() => {
@@ -147,52 +215,17 @@ async function localExecutionFallback(request: ExecutionJobRequest): Promise<Exe
       }, cmd.timeoutMs || 60000);
       child.on("close", (code) => {
         clearTimeout(timer);
-        resolve({
-          command: cmd.command, args: cmd.args, cwd: workDir,
-          exitCode: code, stdout: stdout.slice(0, 100000), stderr: stderr.slice(0, 100000),
-          durationMs: 0, timedOut, success: !timedOut && code === 0,
-        });
+        resolve({ command: cmd.command, args: cmd.args, cwd: workDir, exitCode: code, stdout: stdout.slice(0, 100000), stderr: stderr.slice(0, 100000), durationMs: 0, timedOut, success: !timedOut && code === 0 });
       });
-      child.on("error", (err) => {
-        clearTimeout(timer);
-        resolve({
-          command: cmd.command, args: cmd.args, cwd: workDir,
-          exitCode: -1, stdout, stderr: stderr + err.message,
-          durationMs: 0, timedOut, success: false,
-        });
-      });
+      child.on("error", (err) => { clearTimeout(timer); resolve({ command: cmd.command, args: cmd.args, cwd: workDir, exitCode: -1, stdout, stderr: stderr + err.message, durationMs: 0, timedOut, success: false }); });
     });
     results.push(result);
     if (!result.success) { success = false; break; }
   }
 
-  // Cleanup ephemeral dir.
-  if (!request.worktreePath) {
+  if (!request.sandboxId) {
     try { rmSync(workDir, { recursive: true, force: true }); } catch {}
   }
 
-  return {
-    jobId: request.jobId,
-    results,
-    success,
-    workDir,
-    durationMs: 0,
-    error: success ? undefined : "Local execution (UNSANDBOXED) failed",
-  };
-}
-
-/**
- * Cleanup a work directory on the worker.
- */
-export async function cleanupWorkDir(path: string): Promise<void> {
-  try {
-    await fetch(`${WORKER_URL}/cleanup`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-      signal: AbortSignal.timeout(5000),
-    });
-  } catch {
-    // Best-effort cleanup.
-  }
+  return { jobId: request.jobId, sandboxId: "local", results, success, workDir, durationMs: 0, error: success ? undefined : "Local execution (UNSANDBOXED) failed" };
 }

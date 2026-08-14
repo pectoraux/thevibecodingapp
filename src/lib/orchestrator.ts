@@ -23,7 +23,7 @@ import { buildPrompt } from "@/lib/prompts";
 import { ensureBuildEvent } from "@/lib/events";
 // Phase 3: execution plane separation — tests run in the isolated worker, NOT in-process.
 import * as gitEngine from "@/lib/git-engine";
-import { submitExecutionJob, isExecutionWorkerAvailable } from "@/lib/execution-client";
+import { submitExecutionJob, isExecutionWorkerAvailable, createSandbox, destroySandbox } from "@/lib/execution-client";
 import { FORGE_EXECUTION_MODE } from "@/lib/execution-mode";
 import { runDeterministicGuardian } from "@/lib/guardian-deterministic";
 import { recordEvidence, hasSufficientEvidence } from "@/lib/evidence";
@@ -660,21 +660,27 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
     payload: JSON.stringify({ sha, files: files.map((f: any) => f.path), worktree: worktreePath }),
   });
 
-  // 3. --- Phase 3: Real Test Execution via ISOLATED EXECUTION WORKER ---
+  // 3. --- Phase 4: Real Test Execution via AUTHENTICATED ISOLATED WORKER ---
   // Tests are NOT executed inside the Next.js process. They are sent to the
-  // execution worker (separate process, isolated environment). If the worker
-  // is unavailable, the task is BLOCKED — never silently run locally.
+  // execution worker (separate process, HMAC-authenticated, isolated env).
+  // If the worker is unavailable in sandbox mode, the task is BLOCKED.
   let testResults: any[] = [];
   let testsOk = false;
+  let sandboxId: string | null = null;
   if (worktreeCreated && realCommitSha) {
     try {
-      // Submit the test execution job to the isolated worker.
-      // The worker receives ONLY the worktree path and an explicit env allowlist.
-      // It does NOT inherit FORGE_MASTER_KEY, DATABASE_URL, NEXTAUTH_SECRET, etc.
+      // Phase 4: Create a server-controlled sandbox on the worker.
+      // The worker generates the workspace path — the client cannot control it.
+      const sandbox = await createSandbox(projectId, `${task.code}-${task.attempts}`, task.attempts);
+      sandboxId = sandbox.sandboxId;
+
+      // Submit the test execution job to the authenticated worker.
+      // The worker receives ONLY the sandboxId and an explicit env allowlist.
       const jobResponse = await submitExecutionJob({
         jobId: `${task.code}-${task.attempts}-test`,
         projectId,
-        worktreePath,
+        attempt: task.attempts,
+        sandboxId: sandbox.sandboxId,
         commands: [
           { command: "npm", args: ["install", "--silent"], timeoutMs: 120000 },
           { command: "npm", args: ["test", "--", "--json", "--silent"], timeoutMs: 120000 },
@@ -1029,9 +1035,12 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
     }
   }
 
-  // Cleanup worktree.
+  // Cleanup worktree + sandbox.
   if (worktreeCreated) {
     await gitEngine.removeWorktree(projectId, `${task.code.toLowerCase()}-${task.attempts}`).catch(() => {});
+  }
+  if (sandboxId) {
+    await destroySandbox(sandboxId, projectId, `${task.code}-${task.attempts}`, task.attempts).catch(() => {});
   }
 }
 
