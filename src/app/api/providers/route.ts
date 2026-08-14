@@ -1,12 +1,17 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { obfuscate } from "@/lib/crypto";
+import { requireUserId } from "@/lib/auth";
 import { stripProvider, readJsonBody } from "../_lib";
 
-// GET /api/providers — list all configured LLM providers (BYOK)
+// GET /api/providers — list all configured LLM providers (BYOK) owned by the authenticated user
 export async function GET() {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const providers = await db.llmProvider.findMany({
+      where: { userId },
       orderBy: { createdAt: "desc" },
     });
     return NextResponse.json({ providers: providers.map(stripProvider) });
@@ -18,6 +23,9 @@ export async function GET() {
 // POST /api/providers — create a new LLM provider (obfuscate apiKey before storing)
 export async function POST(req: Request) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const body = await readJsonBody(req);
     const { name, provider, model, apiKey, capabilities, contextWindow, pricingPer1kInput, pricingPer1kOutput, isDefault } = body || {};
     if (!name || !provider || !model || !apiKey) {
@@ -26,15 +34,16 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
-    // If isDefault, unset any existing default first.
+    // If isDefault, unset any existing default first (scoped to this user).
     if (isDefault) {
       await db.llmProvider.updateMany({
-        where: { isDefault: true },
+        where: { isDefault: true, userId },
         data: { isDefault: false },
       });
     }
     const created = await db.llmProvider.create({
       data: {
+        userId,
         name,
         provider,
         model,

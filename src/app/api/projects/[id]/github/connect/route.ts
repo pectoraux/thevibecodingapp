@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { requireUserId } from "@/lib/auth";
 import { initRepository } from "@/lib/repo";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType } from "@/lib/types";
@@ -11,6 +12,9 @@ import { readJsonBody } from "../../../../_lib";
 //   if repo not yet initialized.
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
     const body = await readJsonBody(req);
     const { repoName } = body || {};
@@ -18,8 +22,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return NextResponse.json({ error: "Missing required field: repoName" }, { status: 400 });
     }
     const existing = await db.project.findUnique({ where: { id } });
-    if (!existing) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    if (!existing || existing.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 
     const project = await db.project.update({

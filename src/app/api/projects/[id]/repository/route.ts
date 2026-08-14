@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { requireUserId } from "@/lib/auth";
 import { listFiles, listCommits, listPullRequests } from "@/lib/repo";
 import {
   parseRepoFile,
@@ -11,10 +12,13 @@ import {
 // File shape includes pre-parsed suspiciousPatterns.
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
     const project = await db.project.findUnique({ where: { id } });
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    if (!project || project.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
     const [branches, commits, files, pullRequests] = await Promise.all([
       db.repoBranch.findMany({

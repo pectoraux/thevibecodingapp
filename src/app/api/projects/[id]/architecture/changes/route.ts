@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { requireUserId } from "@/lib/auth";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType } from "@/lib/types";
 import { readJsonBody } from "../../../../_lib";
@@ -26,7 +27,14 @@ function safeJson<T>(str: string, fallback: T): T {
 // GET /api/projects/[id]/architecture/changes — list change requests
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
+    const project = await db.project.findUnique({ where: { id } });
+    if (!project || project.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
     const changeRequests = await db.architectureChangeRequest.findMany({
       where: { projectId: id },
       orderBy: { createdAt: "desc" },
@@ -42,6 +50,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 // POST /api/projects/[id]/architecture/changes — create a new change request
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
     const body = await readJsonBody(req);
     const {
@@ -64,8 +75,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       );
     }
     const project = await db.project.findUnique({ where: { id } });
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    if (!project || project.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
     const created = await db.architectureChangeRequest.create({
       data: {

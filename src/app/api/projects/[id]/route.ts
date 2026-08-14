@@ -1,14 +1,19 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { requireUserId } from "@/lib/auth";
 import { parseArchitecture, readJsonBody } from "../../_lib";
 
 // GET /api/projects/[id] — full project detail + architecture + counts
+// Only accessible if the project belongs to the authenticated user.
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
     const project = await db.project.findUnique({ where: { id } });
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    if (!project || project.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
     const architecture = await db.architecture.findUnique({ where: { projectId: id } });
 
@@ -57,12 +62,15 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 // PATCH /api/projects/[id] — update editable project fields
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
     const body = await readJsonBody(req);
     const { name, description, productSpec, requirements, stack } = body || {};
     const existing = await db.project.findUnique({ where: { id } });
-    if (!existing) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    if (!existing || existing.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
     const data: Record<string, string> = {};
     if (typeof name === "string") data.name = name;
@@ -80,10 +88,13 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
 // DELETE /api/projects/[id] — cascade delete (handled by Prisma schema)
 export async function DELETE(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
     const existing = await db.project.findUnique({ where: { id } });
-    if (!existing) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    if (!existing || existing.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
     await db.project.delete({ where: { id } });
     return NextResponse.json({ ok: true });

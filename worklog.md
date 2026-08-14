@@ -148,3 +148,119 @@ Stage Summary:
 - Lint passes (0 errors, 8 cosmetic warnings about unused eslint-disable directives).
 - Dev server running cleanly on port 3000.
 - 19 screenshots saved to /home/z/my-project/screenshots/ documenting the full flow.
+
+---
+Task ID: v3-api-auth
+Agent: api-auth-subagent
+Task: Add authentication and multi-tenancy to all API routes
+
+Work Log:
+- Read worklog.md, src/lib/auth.ts (requireUserId/requireUserRole/isAdmin/getSession), prisma/schema.prisma (User/Project.userId/LlmProvider.userId/WaitlistEntry), and src/app/api/_lib.ts (readJsonBody, parse* helpers).
+- Read every existing route under src/app/api/ to inventory the auth surface (26 existing files + root /api/route.ts stub).
+- Modified /api/providers (GET/POST): require userId; GET/POST scoped by `where: { userId }`; POST includes userId in create data; the "unset previous default" updateMany is also scoped to the user so admins can't clobber other users' defaults.
+- Modified /api/providers/[id] (DELETE): require userId; verify provider.userId === userId before deleting (403 on mismatch).
+- Modified /api/projects (GET/POST): require userId; GET scoped by `where: { userId }`; POST includes userId in create data.
+- Modified /api/projects/[id] (GET/PATCH/DELETE): require userId; fetch project, return 404 if missing OR if project.userId !== userId (single uniform check).
+- Modified all project-scoped sub-resource routes with the same pattern: fetch the parent project, 404 if missing or not owned by the user, then proceed. This covers:
+  • /api/projects/[id]/architecture (GET)
+  • /api/projects/[id]/architecture/generate (POST)
+  • /api/projects/[id]/architecture/freeze (POST)
+  • /api/projects/[id]/architecture/changes (GET, POST)
+  • /api/projects/[id]/adrs (GET)
+  • /api/projects/[id]/credentials (GET) and /credentials/[credId] (PATCH)
+  • /api/projects/[id]/preflight (POST)
+  • /api/projects/[id]/tasks (GET), /tasks/[taskId] (GET), /tasks/[taskId]/retry (POST)
+  • /api/projects/[id]/agents (GET) and /agents/assign (POST)
+  • /api/projects/[id]/github/connect (POST)
+  • /api/projects/[id]/repository (GET) and /repository/files (GET)
+  • /api/projects/[id]/events (GET)
+  • /api/projects/[id]/build (POST) and /build/status (GET)
+  • /api/projects/[id]/verification (GET) and /verification/run (POST)
+- For /api/projects/[id]/agents/assign (POST): added an explicit check that the body's `providerId` (when provided) belongs to the authenticated user — 403 if prov.userId !== userId. This prevents cross-tenant provider assignment.
+- For /api/projects/[id]/credentials/[credId] (PATCH): added a project-ownership check (project belongs to user) BEFORE mutating the credential, since the credential is reached via the project URL.
+- Locked down the leftover /api root stub (was `Hello, world!`) to require auth as well.
+- Did NOT touch /api/auth/[...nextauth]/route.ts (NextAuth handler) or /api/health/route.ts (public health check) per the rules.
+- Did NOT modify any files under src/lib/, src/components/, or prisma/schema.prisma.
+- Created new public endpoint /api/auth/signup (POST): validates email, returns 409 if email already in WaitlistEntry OR already in User, otherwise creates a PENDING WaitlistEntry. Returns 201 `{ ok: true, message: "Added to waitlist" }`.
+- Created /api/auth/me (GET): uses getSession() to return `{ user: { id, email, name, role, isDemo } | null }`. Public (returns null when logged out rather than 401, so the frontend can probe session state cleanly).
+- Created /api/waitlist (GET, ADMIN only): returns all waitlist entries newest-first as `{ entries }`. Uses requireUserRole() + ADMIN/DEMO_ADMIN check, 403 otherwise.
+- Created /api/waitlist/[entryId]/approve (POST, ADMIN only): accepts optional `{ password }` (>=8 chars; auto-generates a 12-char random one if missing/weak). Hashes with bcrypt (12 rounds). Creates a User (role=USER, isDemo=false) from the waitlist email/name. Updates the WaitlistEntry to APPROVED with convertedUserId, reviewedAt, reviewedBy (admin's userId). Returns 201 `{ user: { id, email, name }, password }` — the password is returned ONCE for out-of-band sharing. Handles the race-condition where a User with that email already exists by linking the entry and returning 200 with password=null + a note.
+- Created /api/waitlist/[entryId]/reject (POST, ADMIN only): updates status to REJECTED, sets reviewedAt + reviewedBy. Returns `{ entry }`.
+- Created /api/admin/stats (GET, ADMIN only): aggregates counts — totalUsers, totalProjects, totalProviders, waitlist.{pending,approved,rejected}, totalTasks, totalCommits, totalFiles — via Promise.all of db.count calls.
+- Verified the relative-import depth for every modified/created route matches the existing pattern (e.g. ../../../../_lib for /projects/[id]/credentials/[credId]/route.ts, ../../../_lib for /waitlist/[entryId]/approve/route.ts, ../../_lib for /auth/signup/route.ts). Caught and fixed one off-by-one path in the waitlist approve route before saving.
+- Verified via Grep that all 31 non-exempt route files now import requireUserId/requireUserRole/getSession; the only file under /api/auth that lacks those imports is the NextAuth handler (correctly exempt) and the public signup route (correctly public).
+- Verified dev.log shows no compile errors and the homepage continues to render 200s while the modified routes are JIT-compiled on first request.
+
+Stage Summary:
+- Routes modified (existing 27 endpoints across 26 files + root /api stub):
+  • /api (GET)
+  • /api/providers (GET, POST), /api/providers/[id] (DELETE)
+  • /api/projects (GET, POST), /api/projects/[id] (GET, PATCH, DELETE)
+  • /api/projects/[id]/architecture (GET), /generate (POST), /freeze (POST), /changes (GET, POST)
+  • /api/projects/[id]/adrs (GET)
+  • /api/projects/[id]/credentials (GET), /credentials/[credId] (PATCH)
+  • /api/projects/[id]/preflight (POST)
+  • /api/projects/[id]/tasks (GET), /tasks/[taskId] (GET), /tasks/[taskId]/retry (POST)
+  • /api/projects/[id]/agents (GET), /agents/assign (POST)
+  • /api/projects/[id]/github/connect (POST)
+  • /api/projects/[id]/repository (GET), /repository/files (GET)
+  • /api/projects/[id]/events (GET)
+  • /api/projects/[id]/build (POST), /build/status (GET)
+  • /api/projects/[id]/verification (GET), /verification/run (POST)
+- New routes created (7 endpoints across 6 files):
+  • /api/auth/signup (POST) — public, adds email to waitlist
+  • /api/auth/me (GET) — returns session user or null
+  • /api/waitlist (GET) — ADMIN: list waitlist entries
+  • /api/waitlist/[entryId]/approve (POST) — ADMIN: create User, return password once
+  • /api/waitlist/[entryId]/reject (POST) — ADMIN: mark entry rejected
+  • /api/admin/stats (GET) — ADMIN: aggregate platform counts
+- Key decisions:
+  • All project-scoped routes use a uniform 404 (NOT 403) on missing-or-not-owned to avoid leaking the existence of other users' project IDs (same for providers — 404 on not-found, 403 only on the explicit delete-mismatch case where the resource exists but is owned by someone else).
+  • /api/auth/me returns 200 with `{ user: null }` when logged out (not 401) so the frontend can probe session state in a single round-trip without try/catch.
+  • /api/auth/signup is intentionally public — anyone landing on the platform can request access without first being logged in.
+  • The waitlist approve endpoint returns the auto-generated password exactly once (HTTP 201); the admin is expected to share it with the user out-of-band. Subsequent calls would 409 because the entry is already APPROVED.
+  • bcrypt with 12 rounds matches the existing auth.ts Credentials provider convention.
+  • Provider "default singleton" is now scoped per-user (the updateMany that clears the previous default is filtered by userId), so each tenant can have their own default provider without interference.
+  • All existing functionality (JSON pre-parsing, orchestrator calls, ensureBuildEvent emits, initRepository, readiness gate) is preserved — the auth layer is purely additive.
+- Did NOT run `bun run lint` or `bun run build` per instructions; orchestrator will lint after.
+
+---
+Task ID: v4-auth-ui
+Agent: auth-ui-subagent
+Task: Build auth UI (login, signup→waitlist, demo quick-login, admin waitlist panel, user badge+logout)
+
+Work Log:
+- Read worklog.md (v3-api-auth + prior stages), src/components/forge/{forge-app.tsx,project-list.tsx,project-dashboard.tsx}, lib/{store,api,format,types}.ts, src/lib/auth.ts, src/app/layout.tsx, hooks/use-toast.ts, and the shadcn/ui {dialog,sheet,tabs,table,toaster} components to ground the implementation in the existing patterns (sticky footer, TanStack Query, Zustand store, toast helper, neutral palette).
+- Updated src/components/forge/lib/store.ts: added ForgeUser interface `{ id, email, name?, role, isDemo }` and a `user: ForgeUser | null` field + `setUser` setter to the Zustand store. Mirrors the shape returned by GET /api/auth/me.
+- Created src/components/forge/auth-screen.tsx: the landing screen for logged-out visitors. Renders Forge branding (Wrench icon + name + tagline), a Tabs component with two modes (Login, Join Waitlist), and a prominent dashed demo-quick-login card with two buttons (Demo Admin / Demo User) showing each demo email inline.
+  • Login mode: email + password form, calls `signIn("credentials", { email, password, redirect: false })` from next-auth/react. On success refetches GET /api/auth/me and pushes the user into the Zustand store. On error shows a destructive toast ("Invalid email or password.").
+  • Join Waitlist mode: email + optional name form, calls `POST /api/auth/signup`. On success replaces the form with an Alert ("You're on the waitlist! We'll email you when your account is ready.") and toasts the same message.
+  • Demo quick-login: each button calls `signIn("credentials", ...)` with the seeded demo credentials (demo.admin@forge.local / demo-admin-2024, demo.user@forge.local / demo-user-2024), then refetches /api/auth/me. Buttons show a spinner while in flight and are disabled during the round-trip.
+  • Layout: `min-h-screen flex flex-col` + sticky footer at the bottom (mt-auto), centered max-w-md card on desktop, full-width on mobile. Footer brand matches the dashboard footer.
+- Created src/components/forge/waitlist-panel.tsx: an admin-only Dialog opened from the top bar.
+  • Stats row: GET /api/admin/stats → 4 StatCards (Users, Projects, Pending, Approved) with skeletons while loading.
+  • Waitlist table: GET /api/waitlist → Table of entries with email (mono), name, status Badge (amber PENDING / emerald APPROVED / rose REJECTED), relative requestedAt, and action buttons.
+  • For PENDING rows: Approve (outline, opens a sub-ApproveDialog) + Reject (ghost, calls POST /api/waitlist/[id]/reject).
+  • ApproveDialog: optional custom password input (min 8 chars enforced, leave blank to auto-generate). Calls POST /api/waitlist/[id]/approve. On success swaps to a result view showing a read-only copyable password field (with Copy button + navigator.clipboard) and an Alert ("Account created for {email}"). Toasts "Account created for {email}". Handles the race-condition response (password=null) by showing a note that the account was already linked.
+  • Uses TanStack Query (useQuery + useMutation) for both lists + mutations; invalidates `["waitlist"]` and `["admin-stats"]` after each approve/reject.
+- Modified src/components/forge/forge-app.tsx:
+  • Wrapped the app in `<SessionProvider>` from next-auth/react (required for client-side signIn/signOut + CSRF handling). SessionProvider sits outside QueryClientProvider.
+  • Added an AuthGate component: on mount, calls GET /api/auth/me and pushes the result into the Zustand store via setUser. While checking, renders a full-screen loading state (Wrench icon + spinner + "Loading Forge…"). If no user, renders <AuthScreen />; otherwise renders <ForgeShell />.
+  • Added a ForgeTopBar component rendered at the top of ForgeShell (sticky, z-30, border-b, backdrop-blur). Left: Forge brand (icon + name). Right: Waitlist button (only when user.role is ADMIN or DEMO_ADMIN), a compact user badge (email + uppercase role badge in a bordered pill), and a Logout ghost button. Logout calls `signOut({ redirect: false })` then refetches /api/auth/me and updates the store, toasting "Signed out".
+  • Kept the existing ForgeShell structure (AnimatePresence between ProjectList / ProjectDashboard, ForgeFooter with mt-auto, ProvidersModal) intact — the top bar is purely additive.
+  • Removed the now-unused `ProjectDetail` import warning by keeping the existing usage in ForgeFooter unchanged.
+- Verified against the live dev server: GET / returns 200, GET /api/auth/me returns 200, POST /api/auth/callback/credentials returns 200 (login round-trip works end-to-end), and no compile errors are emitted in dev.log. The AuthGate spinner shows on first load, then transitions to either AuthScreen (logged out) or ForgeShell (logged in).
+- Did NOT modify any API routes, src/lib/* files, or prisma/schema.prisma. Did NOT run lint or build per instructions.
+
+Stage Summary:
+- Files created: src/components/forge/auth-screen.tsx, src/components/forge/waitlist-panel.tsx.
+- Files modified: src/components/forge/forge-app.tsx (SessionProvider + AuthGate + ForgeTopBar), src/components/forge/lib/store.ts (ForgeUser + user/setUser).
+- Key decisions:
+  • SessionProvider wraps the whole app at the ForgeApp root — required for next-auth/react's signIn/signOut to handle CSRF + session refresh correctly.
+  • AuthGate is a single effect that probes /api/auth/me once on mount; subsequent login/logout flows explicitly refetch /api/auth/me and push the result into the store so the gate re-renders without a full page reload.
+  • The top bar is global (always visible while authenticated) rather than wedged into the existing per-page headers — this keeps the user badge + logout + Waitlist button discoverable on both the project list and the dashboard without modifying project-list.tsx or project-dashboard.tsx.
+  • WaitlistPanel is only rendered for ADMIN/DEMO_ADMIN (the Waitlist button is conditionally shown; the panel itself is also guarded inside ForgeTopBar).
+  • Approve flow returns the generated password exactly once and renders a copyable field with a Copy button; the password is never stored client-side beyond the dialog lifecycle.
+  • Demo quick-login is intentionally prominent (dashed border card, both demo emails shown inline) so reviewers can explore Forge instantly without joining the waitlist.
+  • Color: neutral shadcn palette throughout (background, muted, border, foreground). Status badges use semantic amber/emerald/rose accents only inside the waitlist table — no indigo/blue primary. Sticky footer pattern preserved (min-h-screen flex flex-col + mt-auto) on both AuthScreen and ForgeShell.
+- Did NOT run `bun run lint` or `bun run build` per instructions; orchestrator will lint after.

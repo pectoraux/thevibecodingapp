@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { obfuscate } from "@/lib/crypto";
+import { requireUserId } from "@/lib/auth";
 import { stripCredential, readJsonBody } from "../../../../_lib";
 
 // PATCH /api/projects/[id]/credentials/[credId]
@@ -8,7 +9,15 @@ import { stripCredential, readJsonBody } from "../../../../_lib";
 //   Side effect: obfuscates value, sets configured=true, validated=true (basic non-empty check)
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string; credId: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id, credId } = await params;
+    // Verify the project belongs to the user before mutating any credential under it.
+    const project = await db.project.findUnique({ where: { id } });
+    if (!project || project.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
     const body = await readJsonBody(req);
     const { value, environment } = body || {};
     if (typeof value !== "string") {

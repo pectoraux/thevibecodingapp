@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { requireUserId } from "@/lib/auth";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType } from "@/lib/types";
 import { parseAgentAssignment, readJsonBody } from "../../../../_lib";
@@ -7,8 +8,12 @@ import { parseAgentAssignment, readJsonBody } from "../../../../_lib";
 // POST /api/projects/[id]/agents/assign
 //   Body: { agentType, providerId }
 //   Upserts AgentAssignment for the given agentType on this project.
+//   The providerId (if provided) must belong to the authenticated user.
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
     const body = await readJsonBody(req);
     const { agentType, providerId } = body || {};
@@ -16,14 +21,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return NextResponse.json({ error: "Missing required field: agentType" }, { status: 400 });
     }
     const project = await db.project.findUnique({ where: { id } });
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    if (!project || project.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
-    // If a providerId is given, verify it exists.
+    // If a providerId is given, verify it exists AND belongs to the user.
     if (providerId) {
       const prov = await db.llmProvider.findUnique({ where: { id: providerId } });
       if (!prov) {
         return NextResponse.json({ error: "Provider not found" }, { status: 404 });
+      }
+      if (prov.userId !== userId) {
+        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
       }
     }
 

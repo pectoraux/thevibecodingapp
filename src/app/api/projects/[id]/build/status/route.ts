@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { requireUserId } from "@/lib/auth";
 import { listEvents } from "@/lib/events";
 import { parseTask, parseBuildEvent } from "../../../../_lib";
 
@@ -9,10 +10,13 @@ import { parseTask, parseBuildEvent } from "../../../../_lib";
 //   currentTask = the task in RUNNING or REVIEWING state (if any).
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const { id } = await params;
     const project = await db.project.findUnique({ where: { id } });
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    if (!project || project.userId !== userId) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
     const [totalTasks, completedTasks, failedTasks, currentTask, recentEventsRaw] = await Promise.all([
       db.task.count({ where: { projectId: id } }),

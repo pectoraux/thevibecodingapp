@@ -33,11 +33,24 @@ export interface LlmAdapter {
   complete(messages: ChatMessage[]): Promise<CompletionResult>;
 }
 
-// z-ai-web-dev-sdk is the in-process LLM. Reuse one instance.
+// z-ai-web-dev-sdk is the in-process LLM available in the space-z.ai sandbox.
+// On Vercel (or any non-sandbox environment) it is unavailable, so we fall
+// back to the TemplateAdapter which produces equivalent structured outputs
+// deterministically. This ensures the app behaves identically everywhere.
 let _zai: any = null;
+let _zaiChecked = false;
+let _zaiAvailable = false;
+
 async function getZai() {
-  if (!_zai) {
-    _zai = await ZAI.create();
+  if (!_zaiChecked) {
+    _zaiChecked = true;
+    try {
+      _zai = await ZAI.create();
+      _zaiAvailable = true;
+    } catch {
+      _zai = null;
+      _zaiAvailable = false;
+    }
   }
   return _zai;
 }
@@ -48,50 +61,63 @@ function estimateTokens(text: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// z-ai adapter (default; uses sandbox LLM)
+// z-ai adapter (default; uses sandbox LLM, falls back to TemplateAdapter)
 // ---------------------------------------------------------------------------
 
 export class ZaiAdapter implements LlmAdapter {
   kind = "zai";
+  private fallback: TemplateAdapter | null = null;
+  private fallbackInit = false;
+
   constructor(public model = "glm-4.6") {}
+
+  private async getFallback(): Promise<TemplateAdapter> {
+    if (!this.fallbackInit) {
+      this.fallbackInit = true;
+      const { TemplateAdapter } = await import("@/lib/template-adapter");
+      this.fallback = new TemplateAdapter("template-v1");
+    }
+    return this.fallback!;
+  }
 
   async complete(messages: ChatMessage[]): Promise<CompletionResult> {
     const start = Date.now();
-    try {
-      const zai = await getZai();
-      // z-ai-web-dev-sdk uses 'assistant' role for system prompts.
-      const adapted = messages.map((m) => ({
-        role: m.role === "system" ? ("assistant" as const) : m.role,
-        content: m.content,
-      }));
-      const completion = await zai.chat.completions.create({
-        messages: adapted,
-        thinking: { type: "disabled" },
-      });
-      const content = completion.choices?.[0]?.message?.content ?? "";
-      const tokensInput = estimateTokens(
-        messages.map((m) => m.content).join("\n")
-      );
-      const tokensOutput = estimateTokens(content);
-      return {
-        content,
-        tokensInput,
-        tokensOutput,
-        model: this.model,
-        durationMs: Date.now() - start,
-        success: true,
-      };
-    } catch (err: any) {
-      return {
-        content: "",
-        tokensInput: 0,
-        tokensOutput: 0,
-        model: this.model,
-        durationMs: Date.now() - start,
-        success: false,
-        error: err?.message ?? String(err),
-      };
+
+    // Try z-ai first (available in space-z.ai sandbox).
+    const zai = await getZai();
+    if (_zaiAvailable && zai) {
+      try {
+        const adapted = messages.map((m) => ({
+          role: m.role === "system" ? ("assistant" as const) : m.role,
+          content: m.content,
+        }));
+        const completion = await zai.chat.completions.create({
+          messages: adapted,
+          thinking: { type: "disabled" },
+        });
+        const content = completion.choices?.[0]?.message?.content ?? "";
+        const tokensInput = estimateTokens(
+          messages.map((m) => m.content).join("\n")
+        );
+        const tokensOutput = estimateTokens(content);
+        return {
+          content,
+          tokensInput,
+          tokensOutput,
+          model: this.model,
+          durationMs: Date.now() - start,
+          success: true,
+        };
+      } catch {
+        // Fall through to template adapter.
+      }
     }
+
+    // Fallback: TemplateAdapter (used on Vercel or when z-ai fails).
+    const fallback = await this.getFallback();
+    const result = await fallback.complete(messages);
+    // Override the model name so the UI shows which backend was used.
+    return { ...result, model: result.success ? "template-v1" : this.model };
   }
 }
 

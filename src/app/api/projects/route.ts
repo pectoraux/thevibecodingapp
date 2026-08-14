@@ -3,12 +3,17 @@ import { db } from "@/lib/db";
 import { initRepository } from "@/lib/repo";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType, ProjectStatus } from "@/lib/types";
+import { requireUserId } from "@/lib/auth";
 import { readJsonBody } from "../_lib";
 
-// GET /api/projects — list all projects (newest first), with task/credential counts
+// GET /api/projects — list the authenticated user's projects (newest first), with task/credential counts
 export async function GET() {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const projects = await db.project.findMany({
+      where: { userId },
       orderBy: { createdAt: "desc" },
       include: {
         _count: {
@@ -25,9 +30,12 @@ export async function GET() {
   }
 }
 
-// POST /api/projects — create a new DRAFT project + initialize its repo
+// POST /api/projects — create a new DRAFT project + initialize its repo (owned by the authenticated user)
 export async function POST(req: Request) {
   try {
+    const userId = await requireUserId();
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
     const body = await readJsonBody(req);
     const { name, description, productSpec, requirements, stack } = body || {};
     if (!name || !description) {
@@ -38,6 +46,7 @@ export async function POST(req: Request) {
     }
     const project = await db.project.create({
       data: {
+        userId,
         name,
         description,
         productSpec: productSpec ?? "",

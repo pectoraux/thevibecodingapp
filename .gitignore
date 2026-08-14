@@ -52,3 +52,14 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# Forge-specific: don't commit local artifacts
+/db/
+/screenshots/
+/tool-results/
+/upload/
+/download/
+/agent-ctx/
+worklog.md
+API_CONTRACT.md
+seed.ts

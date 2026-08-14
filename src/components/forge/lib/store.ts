@@ -12,6 +12,15 @@ export type ForgeTab =
   | "credentials"
   | "build-log";
 
+// The authenticated viewer. Mirrors the shape returned by GET /api/auth/me.
+export interface ForgeUser {
+  id: string;
+  email: string;
+  name?: string;
+  role: string;
+  isDemo: boolean;
+}
+
 interface ForgeState {
   selectedProjectId: string | null;
   setSelectedProjectId: (id: string | null) => void;
@@ -25,6 +34,10 @@ interface ForgeState {
 
   providersModalOpen: boolean;
   setProvidersModalOpen: (open: boolean) => void;
+
+  // current authenticated user (null while checking or logged out)
+  user: ForgeUser | null;
+  setUser: (user: ForgeUser | null) => void;
 }
 
 export const useForgeStore = create<ForgeState>((set) => ({
@@ -40,4 +53,7 @@ export const useForgeStore = create<ForgeState>((set) => ({
 
   providersModalOpen: false,
   setProvidersModalOpen: (open) => set({ providersModalOpen: open }),
+
+  user: null,
+  setUser: (user) => set({ user }),
 }));
