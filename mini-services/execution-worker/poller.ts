@@ -10,7 +10,7 @@
 // The control plane NEVER executes generated code.
 
 import { createHmac, randomUUID } from "node:crypto";
-import { spawn, execSync } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute } from "node:path";
 
@@ -18,7 +18,7 @@ import { join, dirname, resolve, isAbsolute } from "node:path";
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase10";
+const WORKER_VERSION = "phase11";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
@@ -113,42 +113,109 @@ async function triggerSchedulerTick(): Promise<void> {
 }
 
 // ===========================================================================
-// P10-1: REAL GIT — Initialize repo, create branch, commit, return SHA
+// P11: REAL GIT — Safe argument arrays, real clone/fetch, repository continuity
 // ===========================================================================
 
-function gitInit(repoPath: string): void {
-  execSync("git init", { cwd: repoPath, timeout: 10000 });
-  execSync('git config user.email "forge-worker@local"', { cwd: repoPath, timeout: 5000 });
-  execSync('git config user.name "Forge Worker"', { cwd: repoPath, timeout: 5000 });
-}
+// All git commands use execFileSync with argument arrays — NO shell interpolation.
 
-function gitCheckoutBranch(repoPath: string, branchName: string, baseCommit?: string): void {
-  const cmd = baseCommit
-    ? `git checkout -b ${branchName} ${baseCommit}`
-    : `git checkout -b ${branchName}`;
-  execSync(cmd, { cwd: repoPath, timeout: 10000 });
-}
-
-function gitAddAndCommit(repoPath: string, message: string): string {
-  execSync("git add -A", { cwd: repoPath, timeout: 10000 });
-  execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: repoPath, timeout: 10000 });
-  return execSync("git rev-parse HEAD", { cwd: repoPath, timeout: 5000 }).toString().trim();
-}
-
-function gitDiff(repoPath: string): string {
+function gitExec(repoPath: string, args: string[], timeoutMs = 10000): { ok: boolean; stdout: string; stderr: string } {
   try {
-    return execSync("git diff HEAD~1 --stat", { cwd: repoPath, timeout: 10000 }).toString();
-  } catch {
-    return execSync("git diff --cached --stat", { cwd: repoPath, timeout: 10000 }).toString();
+    const stdout = execFileSync("git", args, {
+      cwd: repoPath,
+      timeout: timeoutMs,
+      encoding: "utf-8",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, // never prompt for credentials
+    });
+    return { ok: true, stdout: stdout.toString().trim(), stderr: "" };
+  } catch (err: any) {
+    return { ok: false, stdout: "", stderr: (err.stderr || err.message || "").toString().trim() };
   }
+}
+
+function gitInit(repoPath: string): void {
+  gitExec(repoPath, ["init"]);
+  gitExec(repoPath, ["config", "user.email", "forge-worker@local"]);
+  gitExec(repoPath, ["config", "user.name", "Forge Worker"]);
+}
+
+function gitClone(repoUrl: string, targetPath: string): boolean {
+  const result = gitExec("/tmp", ["clone", repoUrl, targetPath], 60000);
+  if (!result.ok) {
+    console.log(`[worker] git clone failed: ${result.stderr}`);
+    return false;
+  }
+  gitExec(targetPath, ["config", "user.email", "forge-worker@local"]);
+  gitExec(targetPath, ["config", "user.name", "Forge Worker"]);
+  return true;
+}
+
+function gitFetch(repoPath: string): boolean {
+  const result = gitExec(repoPath, ["fetch", "origin"], 30000);
+  return result.ok;
+}
+
+function gitCheckoutBranch(repoPath: string, branchName: string, baseCommit?: string): boolean {
+  const args = baseCommit
+    ? ["checkout", "-b", branchName, baseCommit]
+    : ["checkout", "-b", branchName];
+  const result = gitExec(repoPath, args);
+  if (!result.ok) {
+    console.log(`[worker] git checkout -b failed: ${result.stderr}`);
+    return false;
+  }
+  return true;
+}
+
+function gitCheckout(repoPath: string, ref: string): boolean {
+  const result = gitExec(repoPath, ["checkout", ref]);
+  return result.ok;
+}
+
+function gitRevParse(repoPath: string, ref: string): string | null {
+  const result = gitExec(repoPath, ["rev-parse", ref]);
+  return result.ok ? result.stdout : null;
+}
+
+function gitAddAndCommit(repoPath: string, message: string): string | null {
+  const addResult = gitExec(repoPath, ["add", "-A"]);
+  if (!addResult.ok) return null;
+  const commitResult = gitExec(repoPath, ["commit", "-m", message]);
+  if (!commitResult.ok) return null;
+  return gitRevParse(repoPath, "HEAD");
+}
+
+function gitDiff(repoPath: string, baseCommit?: string): string {
+  const args = baseCommit
+    ? ["diff", `${baseCommit}...HEAD"]
+    : ["diff", "HEAD~1"];
+  const result = gitExec(repoPath, args, 10000);
+  if (result.ok) return result.stdout;
+  // Fallback to cached diff for first commit.
+  const cached = gitExec(repoPath, ["diff", "--cached"]);
+  return cached.ok ? cached.stdout : "";
+}
+
+function gitDiffStat(repoPath: string, baseCommit?: string): string {
+  const args = baseCommit
+    ? ["diff", "--stat", `${baseCommit}...HEAD`]
+    : ["diff", "--stat", "HEAD~1"];
+  const result = gitExec(repoPath, args);
+  if (result.ok) return result.stdout;
+  const cached = gitExec(repoPath, ["diff", "--cached", "--stat"]);
+  return cached.ok ? cached.stdout : "";
+}
+
+function gitPush(repoPath: string, branchName: string, remoteUrl?: string): boolean {
+  if (remoteUrl) {
+    gitExec(repoPath, ["remote", "set-url", "origin", remoteUrl]);
+  }
+  const result = gitExec(repoPath, ["push", "origin", branchName], 30000);
+  return result.ok;
 }
 
 function gitLog(repoPath: string): string {
-  try {
-    return execSync("git log --oneline -5", { cwd: repoPath, timeout: 5000 }).toString();
-  } catch {
-    return "";
-  }
+  const result = gitExec(repoPath, ["log", "--oneline", "-5"]);
+  return result.ok ? result.stdout : "";
 }
 
 // ===========================================================================
@@ -403,26 +470,22 @@ Respond with JSON:
 
 function getVerificationCommands(verificationPlan: any): {
   install: string[]; test: string[]; build: string[]; lint: string[];
-} {
-  if (verificationPlan && typeof verificationPlan === "object") {
+} | null {
+  if (verificationPlan && typeof verificationPlan === "object" && Object.keys(verificationPlan).length > 0) {
     return {
-      install: verificationPlan.install || ["npm install"],
+      install: verificationPlan.install || verificationPlan.install || ["npm install"],
       test: verificationPlan.unit || verificationPlan.test || ["npm test"],
       build: verificationPlan.build || ["npm run build"],
       lint: verificationPlan.lint || verificationPlan.static || [],
     };
   }
-  // Default to npm if no plan.
-  return {
-    install: ["npm install"],
-    test: ["npm test"],
-    build: ["npm run build"],
-    lint: [],
-  };
+  // P11: No silent npm fallback — return null to signal BLOCKED.
+  // The Architecture Contract must produce a VerificationPlan.
+  return null;
 }
 
 // ===========================================================================
-// MAIN EXECUTE TASK — Real Git + BYOK + Independent Guardian/Reviewer
+// P11: MAIN EXECUTE TASK — Real Repository Continuity + BYOK + Guardian/Reviewer
 // ===========================================================================
 
 async function executeTask(spec: any): Promise<{
@@ -435,22 +498,85 @@ async function executeTask(spec: any): Promise<{
 }> {
   console.log(`[worker] Executing task ${spec.task.code} (${spec.executionId})`);
 
-  // Create sandbox directory.
-  const sandboxPath = join(EXEC_ROOT, spec.projectId, spec.executionId);
-  mkdirSync(sandboxPath, { recursive: true });
-
-  // P10-1: Initialize a REAL Git repository in the sandbox.
-  gitInit(sandboxPath);
   const branchName = `forge/${spec.task.code}/attempt-${spec.attempt}`;
-  gitCheckoutBranch(sandboxPath, branchName);
 
-  // If there's a base commit (from a previous task), check it out.
-  if (spec.baseCommitSha) {
-    try {
-      execSync(`git checkout ${spec.baseCommitSha}`, { cwd: sandboxPath, timeout: 10000 });
+  // P11: REAL REPOSITORY CONTINUITY
+  // For GitHub-backed projects: clone the actual repository.
+  // For local-only projects: init a new repo.
+  // If baseCommitSha is required but unavailable: BLOCKED (no silent fallback).
+
+  let sandboxPath: string;
+  let repoCloned = false;
+
+  if (spec.repository?.githubRepo) {
+    // GitHub-backed: clone the actual repository.
+    sandboxPath = join(EXEC_ROOT, spec.projectId, spec.executionId);
+    const cloneUrl = `https://github.com/${spec.repository.githubRepo}.git`;
+    console.log(`[worker] Cloning repository: ${spec.repository.githubRepo}`);
+    repoCloned = gitClone(cloneUrl, sandboxPath);
+
+    if (!repoCloned) {
+      // Clone failed — BLOCKED, not silent fallback.
+      return {
+        commitSha: null,
+        testResults: [],
+        guardianResult: { verdict: "VIOLATION", summary: "BLOCKED: Could not clone repository", violations: [], warnings: [] },
+        reviewResult: { verdict: "REJECTED", summary: "Repository clone failed", findings: [] },
+        filesChanged: [],
+        implementationLog: `BLOCKED: git clone failed for ${spec.repository.githubRepo}`,
+      };
+    }
+
+    // Fetch latest.
+    gitFetch(sandboxPath);
+
+    // P11: If baseCommitSha is specified, verify it exists in the repository.
+    if (spec.baseCommitSha) {
+      const baseExists = gitRevParse(sandboxPath, spec.baseCommitSha);
+      if (!baseExists) {
+        // Base commit not found — BLOCKED, not silent fallback.
+        return {
+          commitSha: null,
+          testResults: [],
+          guardianResult: { verdict: "VIOLATION", summary: `BLOCKED: Required base commit ${spec.baseCommitSha.slice(0, 7)} not found in repository`, violations: [], warnings: [] },
+          reviewResult: { verdict: "REJECTED", summary: "Base commit unavailable", findings: [] },
+          filesChanged: [],
+          implementationLog: `BLOCKED: base commit ${spec.baseCommitSha} not found`,
+        };
+      }
+
+      // Checkout the base commit.
+      gitCheckout(sandboxPath, spec.baseCommitSha);
+      // Create branch from base commit.
       gitCheckoutBranch(sandboxPath, branchName, spec.baseCommitSha);
-    } catch {
-      console.log(`[worker] Could not checkout base commit ${spec.baseCommitSha} — starting fresh`);
+    } else {
+      // No base commit — checkout default branch (main/master) and create branch from there.
+      const defaultBranch = gitRevParse(sandboxPath, "origin/main") ? "origin/main" : "origin/master";
+      gitCheckout(sandboxPath, defaultBranch);
+      gitCheckoutBranch(sandboxPath, branchName, defaultBranch);
+    }
+  } else {
+    // Local-only project: init a new repo (no GitHub connection).
+    sandboxPath = join(EXEC_ROOT, spec.projectId, spec.executionId);
+    mkdirSync(sandboxPath, { recursive: true });
+    gitInit(sandboxPath);
+
+    if (spec.baseCommitSha) {
+      // For local-only projects with baseCommitSha, verify it exists.
+      const baseExists = gitRevParse(sandboxPath, spec.baseCommitSha);
+      if (!baseExists) {
+        return {
+          commitSha: null,
+          testResults: [],
+          guardianResult: { verdict: "VIOLATION", summary: `BLOCKED: Required base commit ${spec.baseCommitSha.slice(0, 7)} not found in local repository`, violations: [], warnings: [] },
+          reviewResult: { verdict: "REJECTED", summary: "Base commit unavailable", findings: [] },
+          filesChanged: [],
+          implementationLog: `BLOCKED: base commit ${spec.baseCommitSha} not found in local repo`,
+        };
+      }
+      gitCheckoutBranch(sandboxPath, branchName, spec.baseCommitSha);
+    } else {
+      gitCheckoutBranch(sandboxPath, branchName);
     }
   }
 
@@ -518,9 +644,21 @@ Generate the implementation files. Respond with ONLY JSON:
     filesChanged.push({ path: f.path, content: f.content || "" });
   }
 
-  // P10-5: Execute the architecture-driven VerificationPlan.
+  // P11: Execute the architecture-driven VerificationPlan.
+  // If no VerificationPlan exists: BLOCKED (no silent npm fallback).
   const verCommands = getVerificationCommands(spec.verificationPlan);
   let testResults: any[] = [];
+
+  if (!verCommands) {
+    return {
+      commitSha: null,
+      testResults: [],
+      guardianResult: { verdict: "VIOLATION", summary: "BLOCKED: No VerificationPlan in architecture contract — cannot execute verification", violations: [], warnings: [] },
+      reviewResult: { verdict: "REJECTED", summary: "No VerificationPlan", findings: [] },
+      filesChanged: [],
+      implementationLog: "BLOCKED: Architecture Contract must include a VerificationPlan",
+    };
+  }
 
   // Install dependencies.
   for (const cmd of verCommands.install) {
@@ -552,30 +690,38 @@ Generate the implementation files. Respond with ONLY JSON:
     }
   }
 
-  // P10-1: Create a REAL Git commit.
+  // P11: Create a REAL Git commit (using safe argument arrays).
   let commitSha: string | null = null;
-  try {
-    commitSha = gitAddAndCommit(sandboxPath, `feat(${spec.task.code}): ${spec.task.title}`);
+  commitSha = gitAddAndCommit(sandboxPath, `feat(${spec.task.code}): ${spec.task.title}`);
+  if (commitSha) {
     console.log(`[worker] Real git commit: ${commitSha.slice(0, 7)}`);
-  } catch (err: any) {
-    console.log(`[worker] Git commit failed: ${err.message}`);
+  } else {
+    console.log(`[worker] Git commit failed`);
   }
 
-  // Get the real diff.
-  const diff = gitDiff(sandboxPath);
+  // P11: Get the FULL real diff (not just stat) for Guardian inspection.
+  const diff = gitDiff(sandboxPath, spec.baseCommitSha || undefined);
+  const diffStat = gitDiffStat(sandboxPath, spec.baseCommitSha || undefined);
+
+  // P11: Push branch to remote for GitHub-backed projects.
+  let pushedToRemote = false;
+  if (repoCloned && commitSha && spec.repository?.githubRepo) {
+    pushedToRemote = gitPush(sandboxPath, branchName);
+    console.log(`[worker] Push to remote: ${pushedToRemote ? "success" : "failed"}`);
+  }
 
   // P10-3: Run INDEPENDENT deterministic Guardian (checks architecture, NOT tests).
   const guardianResult = runDeterministicGuardian(
     spec.architecture,
     filesChanged,
-    diff
+    diff + "\n\n--- DIFF STAT ---\n" + diffStat
   );
 
   // P10-4: Run INDEPENDENT LLM Reviewer (separate invocation).
   const reviewResult = await runLlmReviewer(spec, filesChanged, testResults, guardianResult);
 
   // Clean up sandbox ONLY after evidence is collected.
-  // The commit SHA is the durable artifact.
+  // The commit SHA and pushed branch are the durable artifacts.
   try { rmSync(sandboxPath, { recursive: true, force: true }); } catch {}
 
   return {

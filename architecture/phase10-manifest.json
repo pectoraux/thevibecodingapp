@@ -1,6 +1,6 @@
 {
-  "architectureVersion": "phase10",
-  "description": "Phase 10 — Complete Frozen Execution Architecture with real Git, BYOK, independent Guardian/Reviewer, and commit-required completion",
+  "architectureVersion": "phase11",
+  "description": "Phase 11 — Real Repository Continuity: clone/fetch, base commit verification, no silent fallback, safe git arguments, push to remote, no npm fallback for VerificationPlan",
   "requiredFiles": [
     "mini-services/execution-worker/poller.ts",
     "src/app/api/worker/job-spec/route.ts",
@@ -15,8 +15,8 @@
     "tests/phase10-invariants.ts"
   ],
   "requiredInvariants": {
-    "workerVersion": "phase10",
-    "versionEndpoint": "phase10",
+    "workerVersion": "phase11",
+    "versionEndpoint": "phase11",
     "realGit": true,
     "realCommit": true,
     "baseCommitPropagation": true,
@@ -39,7 +39,11 @@
     "successWithoutCommit": "success = guardianOk && reviewOk && testsOk (missing hasRealCommit)",
     "executeTaskEndpoint": "/api/worker/execute-task must not exist",
     "versionPhase5": "Version endpoint must not report phase5",
-    "versionPhase8": "Version endpoint must not report phase8"
+    "versionPhase8": "Version endpoint must not report phase8",
+    "versionPhase10": "Version endpoint must not report phase10",
+    "silentBaseCommitFallback": "Worker must not silently fall back when baseCommitSha is unavailable",
+    "npmFallbackForVerificationPlan": "Worker must not silently fall back to npm when VerificationPlan is missing",
+    "shellInterpolatedGit": "Git commands must use argument arrays, not shell-interpolated strings"
   },
   "tests": [
     "tests/architecture-invariants.ts",

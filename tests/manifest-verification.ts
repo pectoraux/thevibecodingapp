@@ -25,6 +25,11 @@ function readFile(path: string): string {
   try { return readFileSync(path, "utf-8"); } catch { return ""; }
 }
 
+function getVerificationCommandsReturnsNull(poller: string): boolean {
+  // P11: getVerificationCommands should return null when no plan exists
+  return poller.includes("return null;") && poller.includes("getVerificationCommands");
+}
+
 function fileExists(path: string): boolean {
   try { return existsSync(path); } catch { return false; }
 }
@@ -71,6 +76,47 @@ results.push({
   name: `versionEndpoint = ${manifest.requiredInvariants.versionEndpoint}`,
   passed: versionString === manifest.requiredInvariants.versionEndpoint,
   details: `Found: ${versionString}`,
+});
+
+// P11: No silent base commit fallback
+const hasSilentBaseCommitFallback = poller.includes("starting fresh");
+results.push({
+  name: "No silent base commit fallback",
+  passed: !hasSilentBaseCommitFallback,
+  details: hasSilentBaseCommitFallback ? "FOUND 'starting fresh' — silent fallback" : "No silent fallback",
+});
+
+// P11: No npm fallback for VerificationPlan
+const hasNpmFallback = poller.includes('install: ["npm install"]\n    test: ["npm test"]\n    build: ["npm run build"]\n    lint: []');
+results.push({
+  name: "No silent npm fallback for VerificationPlan",
+  passed: !hasNpmFallback,
+  details: hasNpmFallback ? "FOUND npm fallback" : "No npm fallback (returns null = BLOCKED)",
+});
+
+// P11: Git uses execFileSync (safe argument arrays), not execSync (shell interpolation)
+const hasExecSync = poller.includes("execSync(");
+const hasExecFileSync = poller.includes("execFileSync(");
+results.push({
+  name: "Git uses safe argument arrays (execFileSync, not execSync)",
+  passed: !hasExecSync && hasExecFileSync,
+  details: `execSync: ${hasExecSync}, execFileSync: ${hasExecFileSync}`,
+});
+
+// P11: Worker clones real repository
+const hasGitClone = poller.includes("function gitClone");
+results.push({
+  name: "Worker has gitClone for real repository continuity",
+  passed: hasGitClone,
+  details: hasGitClone ? "gitClone found" : "No gitClone",
+});
+
+// P11: Worker pushes to remote
+const hasGitPush = poller.includes("function gitPush");
+results.push({
+  name: "Worker has gitPush for remote branch creation",
+  passed: hasGitPush,
+  details: hasGitPush ? "gitPush found" : "No gitPush",
 });
 
 // realGit
@@ -196,6 +242,34 @@ for (const [pattern, description] of Object.entries(manifest.forbiddenPatterns))
       name: `Forbidden: ${pattern}`,
       passed: !hasPhase8,
       details: hasPhase8 ? "Version endpoint says phase8" : "Clean",
+    });
+  } else if (pattern === "versionPhase10") {
+    const hasPhase10 = versionRoute.includes('"phase10"');
+    results.push({
+      name: `Forbidden: ${pattern}`,
+      passed: !hasPhase10,
+      details: hasPhase10 ? "Version endpoint says phase10" : "Clean",
+    });
+  } else if (pattern === "silentBaseCommitFallback") {
+    const hasFallback = poller.includes("starting fresh");
+    results.push({
+      name: `Forbidden: ${pattern}`,
+      passed: !hasFallback,
+      details: hasFallback ? "Found 'starting fresh'" : "Clean",
+    });
+  } else if (pattern === "npmFallbackForVerificationPlan") {
+    const hasNpmFallback = getVerificationCommandsReturnsNull(poller);
+    results.push({
+      name: `Forbidden: ${pattern}`,
+      passed: hasNpmFallback,
+      details: hasNpmFallback ? "Returns null (BLOCKED)" : "Still has npm fallback",
+    });
+  } else if (pattern === "shellInterpolatedGit") {
+    const hasExecSync = poller.includes("execSync(");
+    results.push({
+      name: `Forbidden: ${pattern}`,
+      passed: !hasExecSync,
+      details: hasExecSync ? "Uses execSync (shell interpolation)" : "Uses execFileSync (safe)",
     });
   }
 }
