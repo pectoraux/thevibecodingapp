@@ -1062,3 +1062,75 @@ Stage Summary:
 - SHA reconciliation: GitHub = Local = Deployed = f7922b2e967a
 - Worker execution foundation is real but simplified
 - Next phase should focus on: real Git, independent Guardian/Reviewer, BYOK
+
+---
+Task ID: phase10
+Agent: orchestrator (main) — Phase 10 complete frozen execution architecture
+Task: Implement real Git, BYOK, independent Guardian/Reviewer, VerificationPlan
+
+Work Log:
+- P10-1: Real Git in worker
+  - Worker initializes git repo in sandbox (gitInit)
+  - Creates branch: forge/{taskCode}/attempt-{n}
+  - Writes files, runs git add + commit
+  - Returns real commit SHA
+  - Generates real diff for Guardian inspection
+  - 7 git functions: gitInit, gitCheckoutBranch, gitAddAndCommit, gitDiff, gitLog
+
+- P10-2: BYOK provider gateway in worker
+  - Worker no longer hardcodes z-ai-web-dev-sdk
+  - callLLM() checks spec.modelProviderRef
+  - If BYOK provider configured, resolves credentials via /api/worker/resolve-credential
+  - Calls provider API directly (OpenAI, Anthropic, Google, xAI)
+  - Falls back to z-ai only when no BYOK provider configured
+  - New endpoint: /api/worker/resolve-credential (authenticated)
+
+- P10-3: Independent deterministic Guardian
+  - runDeterministicGuardian() checks ARCHITECTURE, not test results
+  - Checks forbidden technologies (firebase, mongoose, mongodb, supabase)
+  - Checks for TODO/FIXME in production paths
+  - Checks required component presence
+  - Verdict is INDEPENDENT of test results
+
+- P10-4: Independent LLM Reviewer
+  - runLlmReviewer() is a separate LLM invocation
+  - Inspects actual diff, test evidence, guardian results
+  - Does NOT derive approval from test results
+  - Returns APPROVED/CHANGES_REQUESTED/REJECTED with findings
+
+- P10-5: Architecture-driven VerificationPlan
+  - job-spec endpoint extracts verificationPlan from architecture contract
+  - Falls back to npm defaults if not in contract
+  - Worker executes the plan's install/test/build/lint commands
+
+- P10-6: Completion requires real commitSha
+  - submit-evidence enforces: hasRealCommit = !!commitSha && length >= 7
+  - Task CANNOT be COMPLETED without a real commit
+  - failureReason includes 'commit=MISSING' when no commit
+
+Revision-level evidence:
+  GitHub SHA:   0f9f7c5cb66e
+  Local SHA:    0f9f7c5cb66e
+  Deployed SHA: 0f9f7c5cb66e
+  All match:    ✓
+
+  Worker version:   phase10
+  Worker protocol:  v1
+  Architecture invariants: 16/16 passed
+
+  Worker endpoints (all authenticated):
+    /api/worker/register:            401 ✓
+    /api/worker/claim:               401 ✓
+    /api/worker/heartbeat:           401 ✓
+    /api/worker/complete:            401 ✓
+    /api/worker/job-spec:            401 ✓
+    /api/worker/submit-evidence:     401 ✓
+    /api/worker/resolve-credential:  401 ✓
+    /api/worker/execute-task:        404 ✓ (deleted)
+
+Remaining honest limitations:
+  1. baseCommitSha not yet wired (dependent tasks start fresh, not from parent commit)
+  2. No real GitHub push/PR from worker (sandbox-only git)
+  3. executionMode is local (Vercel is serverless, can't host persistent worker)
+  4. No E2E/browser testing yet
+  5. No runtime verification (app startup/health checks) yet
