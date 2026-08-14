@@ -708,3 +708,62 @@ Stage Summary:
 - GitHub repo: https://github.com/pectoraux/thevibecodingapp
 - Lint: 0 errors
 - Known limitation: process-level isolation (not container/microVM) — documented honestly
+
+---
+Task ID: phase5
+Agent: orchestrator (main) — Phase 5 canonical repository integrity + durable workers
+Task: Reconcile repository state, add version endpoint, enhanced tokens, production enforcement, regression tests
+
+Work Log:
+- P5-1: Repository reconciliation
+  - Verified local HEAD = GitHub main (initially ad327d0, now 53293e6)
+  - Confirmed via GitHub API that Phase 4 code IS on main (HMAC=True, CORS wildcard=False, worktreePath client control=False)
+  - Pushed unpushed worklog commit to achieve full sync
+- P5-2: /api/version endpoint
+  - Returns gitSha, buildTime, environment, executionMode, version, vercelUrl, vercelRegion
+  - Uses VERCEL_GIT_COMMIT_SHA env var (set by Vercel) or .git-sha file
+  - Build script writes .git-sha at build time
+  - Allows verification: "Which exact code revision is actually running?"
+- P5-3: Enhanced job tokens (Phase 5)
+  - Token includes: iss, aud, executionId, tenantId, capabilities, iat, exp, nonce
+  - Worker verifies ALL claims: issuer, audience, expiry, future-issued, replay
+  - Replay protection via nonce tracking (usedNonces Set)
+  - 3 new security tests: wrong issuer, wrong audience, replay attack
+- P5-4: Production enforcement
+  - src/lib/production-enforcement.ts
+  - enforceProductionMode(): NODE_ENV=production + mode!=sandbox → refuse to start
+  - canReachProductionReady(): LOCAL_UNSANDBOXED can never reach PRODUCTION_READY
+- P5-5: Durable job queue
+  - claimNextJob(workerId): claims via lease, extends on reclaim
+  - heartbeat(jobId, workerId): extends lease
+  - recoverExpiredJobs(): requeues stale CLAIMED/RUNNING jobs
+  - Idempotency: projectId+taskId+attempt key
+- P5-6: Regression tests (19 tests, all pass)
+  - Phase 1: no template fallback/instantiation
+  - Phase 2: no fake SHA, BLOCKED on missing commit
+  - Phase 3: orchestrator uses execution client, env allowlist
+  - Phase 4: HMAC, no CORS, server-controlled workspaces, path containment, command policy
+  - Phase 5: leases, heartbeat, recovery, idempotency, production enforcement, version endpoint
+- P5-7: Hostile security tests (21 tests, all pass)
+  - Added: wrong issuer → 403
+  - Added: wrong audience → 403
+  - Added: replay attack (reused nonce) → 403
+  - All tests use fresh tokens per request (replay protection is real)
+- Deployed to Vercel: https://thevibecodingapp.vercel.app (READY)
+- Verified deployed SHA = GitHub main = 53293e6
+
+Revision-level evidence:
+  GitHub main: 53293e6cf41edc84b740a8a66b79c41c59c9c46b
+  Deployed revision: 53293e6cf41e (via /api/version)
+  Worker version: phase5 (authenticated)
+  Execution mode: local (Vercel — worker not hosted there)
+  Tests: 19 regression + 21 hostile security = 40 total, 0 failed
+  Production readiness: NOT READY (execution mode is local, not sandbox)
+
+Stage Summary:
+- Repository truth is established: local = GitHub = deployed
+- /api/version provides canonical revision verification
+- Enhanced tokens with issuer/audience/capabilities/replay protection
+- Production enforcement refuses LOCAL_UNSANDBOXED
+- Durable job queue with leases, heartbeats, recovery, idempotency
+- All phase invariants verified by regression tests
