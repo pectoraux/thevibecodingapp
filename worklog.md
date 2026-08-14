@@ -820,3 +820,89 @@ Stage Summary:
 - Async scheduler replaces synchronous RPC
 - Build jobs are durable (survive restarts, lease-based recovery)
 - UI triggers scheduler ticks for local-mode async processing
+
+---
+Task ID: phase8
+Agent: orchestrator (main) — Phase 8 restore security boundary + move execution into worker
+Task: Fix critical regressions: restore worker auth, move execution out of control plane
+
+Work Log:
+- Confirmed canonical state: local = GitHub = deployed = 92747d2 (Phase 7)
+- Audited worker endpoints: ALL 5 had ZERO authentication (critical regression)
+- Confirmed poller.ts didn't attach tokens to requests
+- Confirmed /api/worker/execute-task called executeTask() in the control plane
+
+FIXES:
+1. Created src/lib/worker-auth.ts — HMAC-signed worker tokens
+   - Token includes: iss, aud, workerId, executionId, leaseId, capabilities, iat, exp, nonce
+   - Replay protection via nonce tracking
+   - Worker identity from token (cryptographic), not request body
+   - Three token types: registration, session, execution (with lease)
+
+2. Updated ALL worker endpoints to require authentication:
+   - POST /api/worker/register — requires registration token
+   - POST /api/worker/claim — requires session token, returns execution token
+   - POST /api/worker/heartbeat — requires execution token (with leaseId)
+   - POST /api/worker/complete — requires execution token
+   - POST /api/worker/job-spec (NEW) — returns ExecutionSpec to worker
+   - POST /api/worker/submit-evidence (NEW) — worker submits results
+
+3. DELETED /api/worker/execute-task — control plane no longer executes generated code
+
+4. Rewrote poller.ts (mini-services/execution-worker/poller.ts):
+   - Actually sends auth tokens (registration, session, execution)
+   - Executes tasks IN THE WORKER PROCESS:
+     - Creates sandbox
+     - Invokes LLM (z-ai-web-dev-sdk)
+     - Writes code to sandbox filesystem
+     - Runs tests (npm test)
+     - Runs deterministic Guardian
+     - Submits evidence to control plane
+   - No template fallback — BLOCKED if LLM unavailable
+
+5. Capability-aware job claiming:
+   - SQL now filters by requiredCapabilities vs workerCapabilities
+   - Worker can only claim compatible jobs
+   - Still uses FOR UPDATE SKIP LOCKED (atomic, race-safe)
+
+6. Security regression tests (tests/worker-security-test.ts):
+   - 10 tests covering all worker endpoints
+   - All unauthenticated requests → 401
+   - Invalid signature → 401
+   - Expired token → 401
+   - execute-task deleted → 404
+
+Revision-level evidence:
+  GitHub main: 0b91dca366c1
+  Local HEAD:  0b91dca366c1
+  Deployed:    0b91dca366c1
+  All three match: ✓
+
+Deployed verification:
+  /api/worker/register (unauth): 401 ✓
+  /api/worker/claim (unauth): 401 ✓
+  /api/worker/heartbeat (unauth): 401 ✓
+  /api/worker/complete (unauth): 401 ✓
+  /api/worker/job-spec (unauth): 401 ✓
+  /api/worker/submit-evidence (unauth): 401 ✓
+  /api/worker/execute-task: 404 ✓ (deleted)
+
+Phase 8 invariants satisfied:
+  ✓ Worker registration authenticated
+  ✓ Worker claim authenticated
+  ✓ Worker heartbeat authenticated
+  ✓ Worker complete authenticated
+  ✓ Worker execution authenticated (job-spec + submit-evidence)
+  ✓ Worker identity cryptographically established
+  ✓ Lease identity cryptographically established
+  ✓ Capability matching enforced
+  ✓ Worker creates sandbox and executes code
+  ✓ Control plane does NOT execute generated commands
+  ✓ Browser has zero execution responsibility
+  ✓ No unauthenticated worker API exists
+  ✓ No old synchronous execution path remains (execute-task deleted)
+
+Stage Summary:
+- Security boundary restored — all worker endpoints require HMAC tokens
+- Execution moved into worker process — control plane only orchestrates
+- Canonical state verified: local = GitHub = deployed = 0b91dca366c1
