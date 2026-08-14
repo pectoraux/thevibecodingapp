@@ -559,3 +559,69 @@ model BuildJob {
   @@index([type])
   @@index([leaseExpiresAt])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7: Worker Registry — real worker-owned scheduler
+// ---------------------------------------------------------------------------
+
+model WorkerRegistry {
+  id                String   @id @default(cuid())
+  workerId          String   @unique
+  workerVersion     String
+  protocolVersion   String
+  capabilities      String   @default("[]") // JSON array: ["node","git","test","build"]
+  maxConcurrency    Int      @default(1)
+  currentConcurrency Int     @default(0)
+  status            String   @default("STARTING") // STARTING | READY | BUSY | DRAINING | OFFLINE
+  lastHeartbeat     DateTime @default(now())
+  currentJobId      String?
+  registeredAt      DateTime @default(now())
+
+  @@index([status])
+  @@index([lastHeartbeat])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: ExecutionJob — individual task execution (separate from BuildJob)
+// ---------------------------------------------------------------------------
+
+model ExecutionJob {
+  id              String   @id @default(cuid())
+  projectId       String
+  buildJobId      String?
+  taskId          String?
+  executionId     String   @unique  // stable id for idempotency
+  attempt         Int      @default(0)
+
+  status          String   @default("QUEUED") // QUEUED | CLAIMED | RUNNING | VERIFYING | SUCCEEDED | FAILED | TIMED_OUT | CANCELLED | BLOCKED
+
+  // Lease
+  workerId        String?
+  leaseId         String?
+  leaseExpiresAt  DateTime?
+  heartbeatAt     DateTime?
+
+  // Required capabilities
+  requiredCapabilities String @default("[]") // JSON array
+
+  // Execution timeout (separate from lease timeout)
+  executionTimeoutMs Int @default(1800000) // 30 minutes
+
+  // Result
+  commitSha       String?
+  results         String?  // JSON
+  errorMessage    String?
+
+  // Timing
+  queuedAt        DateTime @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  // Idempotency
+  idempotencyKey  String   @unique  // projectId+taskId+attempt
+
+  @@index([projectId])
+  @@index([status])
+  @@index([leaseExpiresAt])
+  @@index([workerId])
+}

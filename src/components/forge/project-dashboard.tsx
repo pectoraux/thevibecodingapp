@@ -117,19 +117,10 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
   const isArchitecting = status === ProjectStatus.ARCHITECTING;
   const isBusy = isBuilding || isVerifying || isArchitecting;
 
-  // Phase 6: When the build is running and the server says to trigger a
-  // scheduler tick, POST to /api/scheduler/tick to process the next job.
-  // This is the local-mode equivalent of a worker polling loop.
-  const triggerTick = statusQ.data?.triggerSchedulerTick;
-  const tickMut = useMutation({
-    mutationFn: () => apiPost("/api/scheduler/tick", {}),
-    onError: () => {}, // silent — ticks are best-effort
-  });
-  React.useEffect(() => {
-    if (triggerTick && !tickMut.isPending) {
-      tickMut.mutate();
-    }
-  }, [triggerTick, statusQ.dataUpdatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Phase 7: The browser does NOT drive execution.
+  // The worker process continuously polls for jobs independently.
+  // The UI only observes status — it never triggers scheduler ticks.
+  // Closing the browser has zero effect on build progress.
 
   const [buildOpen, setBuildOpen] = React.useState(false);
   const [longOp, setLongOp] = React.useState<null | "build">(null);
@@ -138,7 +129,9 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
     mutationFn: () => apiPost<{ project: ProjectDetail }>(`/api/projects/${projectId}/build`),
     onMutate: () => setLongOp("build"),
     onSuccess: () => {
-      toast({ title: "Build finished", description: "Refreshing project state." });
+      // Phase 7: The build is QUEUED, not finished.
+      // The worker process will execute it asynchronously.
+      toast({ title: "Build queued", description: "The worker will execute it asynchronously. Monitor progress below." });
       qc.invalidateQueries({ queryKey: ["project", projectId] });
       qc.invalidateQueries({ queryKey: ["build-status", projectId] });
       qc.invalidateQueries({ queryKey: ["tasks", projectId] });
@@ -147,7 +140,7 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
     onError: (err: unknown) => {
       toast({
         variant: "destructive",
-        title: "Build failed",
+        title: "Build failed to queue",
         description: err instanceof Error ? err.message : undefined,
       });
     },

@@ -1,58 +1,41 @@
-// Forge — Phase 6 Async Scheduler
+// Forge — Phase 7 Scheduler
 //
-// This module replaces the synchronous execution RPC with a genuine
-// asynchronous durable worker scheduler.
+// The scheduler creates ExecutionJobs for each task in the build graph.
+// The WORKER (not the scheduler) claims and executes these jobs.
 //
 // Flow:
-//   Task created → BuildJob QUEUED → Scheduler claims → Worker executes
-//   → Heartbeat → Result persisted → Job completed
+//   BuildJob QUEUED → Scheduler creates ExecutionJobs → Workers claim → Workers execute
+//   → Workers report results → Scheduler monitors → BuildJob completes
 //
-// The control-plane request that starts a build returns quickly after
-// enqueueing. The build runs asynchronously.
-//
-// CRITICAL INVARIANTS:
-// 1. Starting a build creates a QUEUED BuildJob and returns.
-// 2. The control-plane request does NOT wait for build completion.
-// 3. Workers claim jobs via atomic lease acquisition.
-// 4. If a worker crashes, its lease expires and the job is requeued.
-// 5. Duplicate results are idempotent (idempotency key).
+// The scheduler does NOT execute tasks. It only:
+// - Creates ExecutionJobs for runnable tasks
+// - Monitors job completion
+// - Runs the readiness gate when all tasks are done
 
 import { db } from "@/lib/db";
 import { randomUUID } from "node:crypto";
-import type { BuildJob, Task } from "@prisma/client";
-import {
-  createJob,
-  updateJobStatus,
-  getJob,
-  getIncompleteJobs,
-  claimNextJob,
-  heartbeat,
-  recoverExpiredJobs,
-} from "@/lib/job-queue";
+import type { BuildJob } from "@prisma/client";
+import { createJob, updateJobStatus, recoverExpiredJobs } from "@/lib/job-queue";
+import { createExecutionJob, recoverExpiredExecutionJobs } from "@/lib/execution-jobs";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType, TaskStatus, ProjectStatus } from "@/lib/types";
 
-const LEASE_DURATION_MS = 300000; // 5 minutes
-const HEARTBEAT_INTERVAL_MS = 60000; // 1 minute
-const MAX_BUILD_LOOP_ITERATIONS = 60;
-
 // ---------------------------------------------------------------------------
 // Enqueue a build — creates a QUEUED BuildJob and returns immediately.
-// The actual execution happens via processBuildQueue().
 // ---------------------------------------------------------------------------
 
 export async function enqueueBuild(projectId: string): Promise<BuildJob> {
   const job = await createJob({
     projectId,
     type: "BUILD",
-    timeoutMs: 600000, // 10 minutes total
+    timeoutMs: 600000,
   });
 
   await ensureBuildEvent({
     projectId,
     type: BuildEventType.BUILD_STARTED,
     level: "success",
-    message: `Build job ${job.id} queued (async)`,
+    message: `Build job ${job.id} queued (async, worker-driven)`,
     payload: JSON.stringify({ jobId: job.id, status: job.status }),
   });
 
@@ -60,177 +43,184 @@ export async function enqueueBuild(projectId: string): Promise<BuildJob> {
 }
 
 // ---------------------------------------------------------------------------
-// Process the build queue — called by the scheduler tick.
-// This is the ASYNC execution path. It does NOT block the HTTP request.
+// Process the build queue — creates ExecutionJobs for runnable tasks.
 //
-// In a full deployment, this would be called by:
-// - A cron job / Vercel Cron endpoint
-// - A worker polling loop
-// - A scheduler service
-//
-// For now, it's called by the /api/scheduler/tick endpoint, which can be
-// triggered by cron or by the build status polling.
+// This is called by the /api/scheduler/tick endpoint (for dev mode) or
+// by a periodic recovery process. It does NOT execute tasks — it only
+// creates ExecutionJobs that workers will claim.
 // ---------------------------------------------------------------------------
 
 export async function processBuildQueue(): Promise<{
   processed: number;
   recovered: number;
   remaining: number;
+  executionJobsCreated: number;
 }> {
   // 1. Recover expired jobs (workers that crashed).
-  const recovered = await recoverExpiredJobs();
+  const recoveredBuildJobs = await recoverExpiredJobs();
+  const recoveredExecJobs = await recoverExpiredExecutionJobs();
+  const recovered = recoveredBuildJobs + recoveredExecJobs;
   if (recovered > 0) {
     console.log(`[scheduler] recovered ${recovered} expired job(s)`);
   }
 
-  // 2. Find projects with QUEUED build jobs.
-  const queuedJobs = await db.buildJob.findMany({
+  let executionJobsCreated = 0;
+
+  // 2. Find QUEUED build jobs and create ExecutionJobs for their tasks.
+  const queuedBuildJobs = await db.buildJob.findMany({
     where: { status: "QUEUED", type: "BUILD" },
     orderBy: { queuedAt: "asc" },
-    take: 1, // Process one at a time for correctness.
   });
 
   let processed = 0;
-  for (const job of queuedJobs) {
-    await processBuildJob(job);
+  for (const buildJob of queuedBuildJobs) {
+    // Claim the build job.
+    const claimed = await claimBuildJob(buildJob.id);
+    if (!claimed) continue;
+
+    await updateJobStatus(buildJob.id, "RUNNING");
+    await db.project.update({
+      where: { id: buildJob.projectId },
+      data: { status: ProjectStatus.BUILDING },
+    });
+
+    // Create ExecutionJobs for all PLANNED tasks whose dependencies are met.
+    const tasks = await db.task.findMany({
+      where: { projectId: buildJob.projectId },
+      orderBy: { priority: "asc" },
+    });
+    const byCode = new Map(tasks.map((t) => [t.code, t]));
+
+    for (const task of tasks) {
+      // Skip tasks that are already done or already have an execution job.
+      if (task.status === TaskStatus.COMPLETED) continue;
+
+      // Check dependencies.
+      const deps = JSON.parse(task.dependencies || "[]") as string[];
+      const allDepsDone = deps.every((d) => {
+        const dep = byCode.get(d);
+        return dep?.status === TaskStatus.COMPLETED;
+      });
+      if (!allDepsDone) continue;
+
+      // Create an ExecutionJob for this task (idempotent).
+      const execJob = await createExecutionJob({
+        projectId: buildJob.projectId,
+        taskId: task.id,
+        attempt: task.attempts + 1,
+        buildJobId: buildJob.id,
+        requiredCapabilities: ["node", "git", "test", "build"],
+      });
+
+      // Only count as "created" if it's new (not already existed).
+      if (execJob.status === "QUEUED") {
+        executionJobsCreated++;
+      }
+    }
+
     processed++;
   }
 
-  // 3. Count remaining jobs.
+  // 3. Check for completed builds (all tasks done).
+  await checkCompletedBuilds();
+
+  // 4. Count remaining.
   const remaining = await db.buildJob.count({
     where: { status: { in: ["QUEUED", "CLAIMED", "RUNNING"] } },
   });
 
-  return { processed, recovered, remaining };
+  return { processed, recovered, remaining, executionJobsCreated };
 }
 
 // ---------------------------------------------------------------------------
-// Process a single build job — the full autonomous build loop.
-// This is the same logic that was previously in startBuild(), but now
-// it's driven by the job queue, not by an HTTP request.
+// Claim a build job atomically.
 // ---------------------------------------------------------------------------
 
-async function processBuildJob(job: BuildJob): Promise<void> {
-  const projectId = job.projectId;
+async function claimBuildJob(buildJobId: string): Promise<boolean> {
+  const result = await db.buildJob.updateMany({
+    where: { id: buildJobId, status: "QUEUED" },
+    data: {
+      status: "RUNNING",
+      workerId: `scheduler-${randomUUID()}`,
+      leaseExpiresAt: new Date(Date.now() + 600000),
+      startedAt: new Date(),
+    },
+  });
+  return result.count > 0;
+}
 
-  // Claim the job atomically (race-safe).
-  const claimed = await claimNextJob(`scheduler-${randomUUID()}`);
-  if (!claimed || claimed.id !== job.id) {
-    // Another worker claimed it first, or job was cancelled.
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Check for builds where all tasks are completed → run readiness gate.
+// ---------------------------------------------------------------------------
 
-  try {
-    await updateJobStatus(job.id, "RUNNING");
+async function checkCompletedBuilds(): Promise<void> {
+  const runningBuildJobs = await db.buildJob.findMany({
+    where: { status: "RUNNING", type: "BUILD" },
+  });
 
-    const project = await db.project.findUnique({ where: { id: projectId } });
-    if (!project) {
-      await updateJobStatus(job.id, "FAILED", { errorMessage: "Project not found" });
-      return;
-    }
-
-    await db.project.update({
-      where: { id: projectId },
-      data: { status: ProjectStatus.BUILDING },
+  for (const buildJob of runningBuildJobs) {
+    const tasks = await db.task.findMany({
+      where: { projectId: buildJob.projectId },
     });
 
-    // Run the autonomous build loop (bounded iterations).
-    for (let i = 0; i < MAX_BUILD_LOOP_ITERATIONS; i++) {
-      // Heartbeat on each iteration.
-      await heartbeat(job.id, claimed.workerId || "scheduler");
+    const pendingTasks = tasks.filter((t) => t.status !== TaskStatus.COMPLETED);
 
-      const shouldStop = await tickOnce(projectId);
-      if (shouldStop) break;
-    }
-
-    // Final verification.
-    await db.project.update({
-      where: { id: projectId },
-      data: { status: ProjectStatus.VERIFYING },
-    });
-
-    // Run readiness gate.
-    const { runReadinessGate } = await import("@/lib/readiness");
-    const gate = await runReadinessGate(projectId);
-
-    if (gate.passed) {
+    if (pendingTasks.length === 0) {
+      // All tasks done — run readiness gate.
+      await finalizeBuild(buildJob);
+    } else if (tasks.some((t) => t.status === TaskStatus.FAILED && t.attempts >= t.maxAttempts)) {
+      // A task exhausted retries — build is blocked.
       await db.project.update({
-        where: { id: projectId },
-        data: { status: ProjectStatus.PRODUCTION_READY },
-      });
-      await ensureBuildEvent({
-        projectId,
-        type: BuildEventType.PRODUCTION_READY,
-        level: "success",
-        message: `PRODUCTION READY — ${gate.passedCount}/${gate.total} readiness checks passed`,
-      });
-      await updateJobStatus(job.id, "SUCCEEDED", {
-        results: JSON.stringify(gate),
-      });
-    } else {
-      await db.project.update({
-        where: { id: projectId },
+        where: { id: buildJob.projectId },
         data: { status: ProjectStatus.HUMAN_REVIEW_REQUIRED },
       });
-      await ensureBuildEvent({
-        projectId,
-        type: BuildEventType.HUMAN_REVIEW_REQUIRED,
-        level: "warn",
-        message: `Human review required — ${gate.failedCount} readiness check(s) failed`,
-      });
-      await updateJobStatus(job.id, "BLOCKED", {
-        errorMessage: `${gate.failedCount} readiness checks failed`,
-        results: JSON.stringify(gate.results.filter((r: any) => r.status !== "PASSED")),
+      await updateJobStatus(buildJob.id, "BLOCKED", {
+        errorMessage: "Task exhausted retries",
       });
     }
-  } catch (err: any) {
-    await updateJobStatus(job.id, "FAILED", { errorMessage: err.message });
-    await ensureBuildEvent({
-      projectId,
-      type: BuildEventType.TASK_FAILED,
-      level: "error",
-      message: `Build job ${job.id} failed: ${err.message}`,
-    });
   }
 }
 
 // ---------------------------------------------------------------------------
-// One tick of the autonomous loop — imported from orchestrator.
-// Returns true if the loop should stop.
+// Finalize a build — run the readiness gate and update project status.
 // ---------------------------------------------------------------------------
 
-async function tickOnce(projectId: string): Promise<boolean> {
-  // Dynamic import to avoid circular dependency with orchestrator.ts.
-  const { executeTask } = await import("@/lib/orchestrator");
-  const tasks = await db.task.findMany({ where: { projectId }, orderBy: { priority: "asc" } });
-  const byCode = new Map(tasks.map((t) => [t.code, t]));
+async function finalizeBuild(buildJob: BuildJob): Promise<void> {
+  await db.project.update({
+    where: { id: buildJob.projectId },
+    data: { status: ProjectStatus.VERIFYING },
+  });
 
-  let next: Task | null = null;
-  for (const t of tasks) {
-    if ([TaskStatus.RUNNING, TaskStatus.REVIEWING, TaskStatus.COMPLETED].includes(t.status as any)) continue;
-    if (t.status === TaskStatus.FAILED && t.attempts >= t.maxAttempts) continue;
-    const deps = JSON.parse(t.dependencies || "[]") as string[];
-    const allDepsDone = deps.every((d) => {
-      const dep = byCode.get(d);
-      return dep?.status === TaskStatus.COMPLETED;
+  const { runReadinessGate } = await import("@/lib/readiness");
+  const gate = await runReadinessGate(buildJob.projectId);
+
+  if (gate.passed) {
+    await db.project.update({
+      where: { id: buildJob.projectId },
+      data: { status: ProjectStatus.PRODUCTION_READY },
     });
-    if (!allDepsDone) continue;
-    next = t;
-    break;
+    await ensureBuildEvent({
+      projectId: buildJob.projectId,
+      type: BuildEventType.PRODUCTION_READY,
+      level: "success",
+      message: `PRODUCTION READY — ${gate.passedCount}/${gate.total} checks passed`,
+    });
+    await updateJobStatus(buildJob.id, "SUCCEEDED", { results: JSON.stringify(gate) });
+  } else {
+    await db.project.update({
+      where: { id: buildJob.projectId },
+      data: { status: ProjectStatus.HUMAN_REVIEW_REQUIRED },
+    });
+    await ensureBuildEvent({
+      projectId: buildJob.projectId,
+      type: BuildEventType.HUMAN_REVIEW_REQUIRED,
+      level: "warn",
+      message: `Human review required — ${gate.failedCount} checks failed`,
+    });
+    await updateJobStatus(buildJob.id, "BLOCKED", {
+      errorMessage: `${gate.failedCount} readiness checks failed`,
+    });
   }
-
-  if (!next) {
-    const pending = tasks.filter((t) => t.status !== TaskStatus.COMPLETED);
-    if (pending.length === 0) return true;
-    if (tasks.some((t) => t.status === TaskStatus.FAILED && t.attempts >= t.maxAttempts)) {
-      await db.project.update({ where: { id: projectId }, data: { status: ProjectStatus.HUMAN_REVIEW_REQUIRED } });
-      return true;
-    }
-    return true;
-  }
-
-  await executeTask(projectId, next.id);
-  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,24 +228,35 @@ async function tickOnce(projectId: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 export async function getSchedulerStatus(): Promise<{
-  queuedJobs: number;
-  runningJobs: number;
-  claimedJobs: number;
+  queuedBuildJobs: number;
+  runningBuildJobs: number;
+  queuedExecutionJobs: number;
+  runningExecutionJobs: number;
+  activeWorkers: number;
   totalJobs: number;
-  lastRecoveryAt: number | null;
 }> {
-  const [queued, running, claimed, total] = await Promise.all([
+  const [
+    queuedBuildJobs,
+    runningBuildJobs,
+    queuedExecutionJobs,
+    runningExecutionJobs,
+    activeWorkers,
+    totalJobs,
+  ] = await Promise.all([
     db.buildJob.count({ where: { status: "QUEUED" } }),
     db.buildJob.count({ where: { status: "RUNNING" } }),
-    db.buildJob.count({ where: { status: "CLAIMED" } }),
+    db.executionJob.count({ where: { status: "QUEUED" } }),
+    db.executionJob.count({ where: { status: { in: ["CLAIMED", "RUNNING"] } } }),
+    db.workerRegistry.count({ where: { status: { in: ["READY", "BUSY"] } } }),
     db.buildJob.count({}),
   ]);
 
   return {
-    queuedJobs: queued,
-    runningJobs: running,
-    claimedJobs: claimed,
-    totalJobs: total,
-    lastRecoveryAt: null, // Could track this in a metadata table.
+    queuedBuildJobs,
+    runningBuildJobs,
+    queuedExecutionJobs,
+    runningExecutionJobs,
+    activeWorkers,
+    totalJobs,
   };
 }

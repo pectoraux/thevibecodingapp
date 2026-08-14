@@ -392,21 +392,11 @@ export async function startBuild(projectId: string): Promise<void> {
     return;
   }
 
-  // Phase 6: Enqueue the build job and return immediately.
-  // The actual execution happens asynchronously via the scheduler.
-  // The HTTP request that calls startBuild() returns quickly.
-  const { enqueueBuild, processBuildQueue } = await import("@/lib/scheduler");
+  // Phase 7: Enqueue the build job and return immediately.
+  // The WORKER (separate process) claims and executes tasks.
+  // The browser has ZERO influence on execution progress.
+  const { enqueueBuild } = await import("@/lib/scheduler");
   await enqueueBuild(projectId);
-
-  // In development (local mode), process the queue immediately so the
-  // build runs synchronously for convenience. In production (sandbox mode),
-  // the queue is processed by a separate worker/scheduler process.
-  if (FORGE_EXECUTION_MODE === "local") {
-    // Process asynchronously — don't block the HTTP request.
-    processBuildQueue().catch((err) => {
-      console.error("[startBuild] async processing failed:", err);
-    });
-  }
 
   await db.project.update({
     where: { id: projectId },
@@ -416,7 +406,7 @@ export async function startBuild(projectId: string): Promise<void> {
     projectId,
     type: BuildEventType.BUILD_STARTED,
     level: "success",
-    message: "Build queued — async orchestration engaged",
+    message: "Build queued — worker-driven async execution",
   });
 }
 

@@ -44,7 +44,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       failedTasks,
       currentTask: currentTask ? parseTask(currentTask) : null,
       recentEvents: recentEventsRaw.map(parseBuildEvent),
-      // Phase 6: async job queue state.
+      // Phase 7: async job queue state.
       buildJobs: buildJobs.map((j) => ({
         id: j.id,
         type: j.type,
@@ -57,9 +57,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         completedAt: j.completedAt,
         errorMessage: j.errorMessage,
       })),
-      // Phase 6: when the build is in BUILDING state, trigger a scheduler tick
-      // so the async queue is processed (local mode only).
-      triggerSchedulerTick: project.status === "BUILDING",
+      // Phase 7: The browser does NOT drive execution.
+      // The worker process polls independently. No triggerSchedulerTick.
     });
   } catch (e: any) {
     return NextResponse.json({ error: e.message ?? "Failed to fetch build status" }, { status: 500 });
