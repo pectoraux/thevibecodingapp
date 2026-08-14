@@ -117,6 +117,20 @@ export function ProjectDashboard({ projectId }: { projectId: string }) {
   const isArchitecting = status === ProjectStatus.ARCHITECTING;
   const isBusy = isBuilding || isVerifying || isArchitecting;
 
+  // Phase 6: When the build is running and the server says to trigger a
+  // scheduler tick, POST to /api/scheduler/tick to process the next job.
+  // This is the local-mode equivalent of a worker polling loop.
+  const triggerTick = statusQ.data?.triggerSchedulerTick;
+  const tickMut = useMutation({
+    mutationFn: () => apiPost("/api/scheduler/tick", {}),
+    onError: () => {}, // silent — ticks are best-effort
+  });
+  React.useEffect(() => {
+    if (triggerTick && !tickMut.isPending) {
+      tickMut.mutate();
+    }
+  }, [triggerTick, statusQ.dataUpdatedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const [buildOpen, setBuildOpen] = React.useState(false);
   const [longOp, setLongOp] = React.useState<null | "build">(null);
 

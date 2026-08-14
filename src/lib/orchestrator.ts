@@ -378,8 +378,6 @@ export async function freezeArchitecture(projectId: string): Promise<Architectur
 export async function startBuild(projectId: string): Promise<void> {
   const project = await db.project.findUnique({ where: { id: projectId } });
   if (!project) throw new Error("Project not found");
-  // GitHub connection is optional in dev mode — we can use a local repo.
-  // In production, GitHub should be connected for canonical source-of-truth.
 
   const architecture = await db.architecture.findUnique({ where: { projectId } });
   if (!architecture?.frozen) throw new Error("Architecture must be frozen first");
@@ -394,6 +392,22 @@ export async function startBuild(projectId: string): Promise<void> {
     return;
   }
 
+  // Phase 6: Enqueue the build job and return immediately.
+  // The actual execution happens asynchronously via the scheduler.
+  // The HTTP request that calls startBuild() returns quickly.
+  const { enqueueBuild, processBuildQueue } = await import("@/lib/scheduler");
+  await enqueueBuild(projectId);
+
+  // In development (local mode), process the queue immediately so the
+  // build runs synchronously for convenience. In production (sandbox mode),
+  // the queue is processed by a separate worker/scheduler process.
+  if (FORGE_EXECUTION_MODE === "local") {
+    // Process asynchronously — don't block the HTTP request.
+    processBuildQueue().catch((err) => {
+      console.error("[startBuild] async processing failed:", err);
+    });
+  }
+
   await db.project.update({
     where: { id: projectId },
     data: { status: ProjectStatus.BUILDING },
@@ -402,46 +416,8 @@ export async function startBuild(projectId: string): Promise<void> {
     projectId,
     type: BuildEventType.BUILD_STARTED,
     level: "success",
-    message: "Build started — autonomous orchestration engaged",
+    message: "Build queued — async orchestration engaged",
   });
-
-  // Run the loop. We do bounded iterations to avoid infinite loops.
-  const MAX_LOOP_ITERATIONS = 60;
-  for (let i = 0; i < MAX_LOOP_ITERATIONS; i++) {
-    const shouldStop = await tickOnce(projectId);
-    if (shouldStop) break;
-  }
-
-  // Final verification.
-  await db.project.update({
-    where: { id: projectId },
-    data: { status: ProjectStatus.VERIFYING },
-  });
-  const gate = await runReadinessGate(projectId);
-  if (gate.passed) {
-    await db.project.update({
-      where: { id: projectId },
-      data: { status: ProjectStatus.PRODUCTION_READY },
-    });
-    await ensureBuildEvent({
-      projectId,
-      type: BuildEventType.PRODUCTION_READY,
-      level: "success",
-      message: `PRODUCTION READY — ${gate.passedCount}/${gate.total} readiness checks passed`,
-    });
-  } else {
-    await db.project.update({
-      where: { id: projectId },
-      data: { status: ProjectStatus.HUMAN_REVIEW_REQUIRED },
-    });
-    await ensureBuildEvent({
-      projectId,
-      type: BuildEventType.HUMAN_REVIEW_REQUIRED,
-      level: "warn",
-      message: `Human review required — ${gate.failedCount} readiness check(s) failed`,
-      payload: JSON.stringify(gate.results.filter((r) => r.status !== "PASSED")),
-    });
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +468,8 @@ async function tickOnce(projectId: string): Promise<boolean> {
 // Execute a single task: implementation → tests → commit → guardian → review.
 // ---------------------------------------------------------------------------
 
-async function executeTask(projectId: string, taskId: string): Promise<void> {
+// Phase 6: executeTask is now exported so the async scheduler can call it.
+export async function executeTask(projectId: string, taskId: string): Promise<void> {
   const task = await db.task.findUnique({ where: { id: taskId } });
   if (!task) return;
   const architecture = await db.architecture.findUnique({ where: { projectId } });

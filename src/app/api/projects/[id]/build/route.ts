@@ -2,10 +2,16 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { requireUserId } from "@/lib/auth";
 import { startBuild } from "@/lib/orchestrator";
+import { enforceProductionMode } from "@/lib/production-enforcement";
 
 // POST /api/projects/[id]/build
-//   Runs the full autonomous build loop. May take 1–5 minutes.
-//   Frontend shows a loading spinner; we await completion and return the updated project.
+//
+// Phase 6: This endpoint ENQUEUES a build job and returns immediately.
+// The build runs asynchronously via the scheduler/worker.
+// The frontend polls /api/projects/[id]/build/status for progress.
+//
+// In production, this endpoint enforces the execution mode policy:
+// if FORGE_EXECUTION_MODE != sandbox, the build is refused.
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const userId = await requireUserId();
@@ -16,7 +22,21 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
     if (!project || project.userId !== userId) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
+
+    // Phase 6: Enforce production execution mode.
+    // In production, LOCAL_UNSANDBOXED is forbidden — builds cannot start.
+    const enforcement = enforceProductionMode();
+    if (!enforcement.allowed) {
+      return NextResponse.json(
+        { error: `Build refused: ${enforcement.reason}` },
+        { status: 403 }
+      );
+    }
+
+    // Phase 6: Enqueue the build job and return immediately.
+    // The actual execution happens asynchronously via the scheduler.
     await startBuild(id);
+
     const updated = await db.project.findUnique({ where: { id } });
     return NextResponse.json({ project: updated });
   } catch (e: any) {
