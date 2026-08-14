@@ -1,47 +1,60 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { getWorkerToken } from "@/lib/worker-auth";
 
 // POST /api/worker/register
 //
-// Phase 7: Worker registers with the control plane on startup.
-// The worker provides its capabilities and version info.
-// The control plane stores this in WorkerRegistry for scheduling.
+// Phase 8: AUTHENTICATED — requires a valid registration token.
+// The worker proves it knows FORGE_WORKER_SECRET by sending a signed token.
+// The workerId is derived from the token (cryptographic identity), not the body.
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const { workerId, workerVersion, protocolVersion, capabilities, maxConcurrency } = body;
+    const token = getWorkerToken(req);
+    if (!token) {
+      return NextResponse.json({ error: "Authentication required" }, { status: 401 });
+    }
 
-    if (!workerId || !workerVersion || !protocolVersion) {
-      return NextResponse.json({ error: "workerId, workerVersion, protocolVersion required" }, { status: 400 });
+    // The workerId comes from the token, not the body.
+    const body = await req.json();
+    const workerId = token.workerId;
+
+    if (!body.workerVersion || !body.protocolVersion) {
+      return NextResponse.json({ error: "workerVersion, protocolVersion required" }, { status: 400 });
     }
 
     // Check protocol version compatibility.
-    if (protocolVersion !== "v1") {
-      return NextResponse.json({ error: `Unsupported protocol version: ${protocolVersion}` }, { status: 400 });
+    if (body.protocolVersion !== "v1") {
+      return NextResponse.json({ error: `Unsupported protocol version: ${body.protocolVersion}` }, { status: 400 });
     }
+
+    const capabilities = body.capabilities || token.capabilities || ["node", "git", "test", "build"];
 
     const worker = await db.workerRegistry.upsert({
       where: { workerId },
       create: {
         workerId,
-        workerVersion,
-        protocolVersion,
-        capabilities: JSON.stringify(capabilities || ["node", "git", "test", "build"]),
-        maxConcurrency: maxConcurrency || 1,
+        workerVersion: body.workerVersion,
+        protocolVersion: body.protocolVersion,
+        capabilities: JSON.stringify(capabilities),
+        maxConcurrency: body.maxConcurrency || 1,
         status: "READY",
         lastHeartbeat: new Date(),
       },
       update: {
-        workerVersion,
-        protocolVersion,
-        capabilities: JSON.stringify(capabilities || ["node", "git", "test", "build"]),
-        maxConcurrency: maxConcurrency || 1,
+        workerVersion: body.workerVersion,
+        protocolVersion: body.protocolVersion,
+        capabilities: JSON.stringify(capabilities),
+        maxConcurrency: body.maxConcurrency || 1,
         status: "READY",
         lastHeartbeat: new Date(),
       },
     });
 
-    return NextResponse.json({ ok: true, worker });
+    // Issue a session token for subsequent operations.
+    const { createWorkerSessionToken } = await import("@/lib/worker-auth");
+    const sessionToken = createWorkerSessionToken(workerId, capabilities);
+
+    return NextResponse.json({ ok: true, worker, sessionToken });
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 });
   }

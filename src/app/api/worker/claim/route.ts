@@ -1,22 +1,20 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { getWorkerToken } from "@/lib/worker-auth";
 import { claimExecutionJob } from "@/lib/execution-jobs";
 
 // POST /api/worker/claim
 //
-// Phase 7: Worker requests the next available job.
-// The control plane atomically assigns a job using FOR UPDATE SKIP LOCKED.
-// Two workers can NEVER claim the same job.
-//
-// Returns: { job: ClaimedJob | null }
+// Phase 8: AUTHENTICATED — requires a valid worker session token.
+// The worker identity is established cryptographically via the token.
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const { workerId, capabilities } = body;
-
-    if (!workerId) {
-      return NextResponse.json({ error: "workerId required" }, { status: 400 });
+    const token = getWorkerToken(req);
+    if (!token) {
+      return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }
+
+    const workerId = token.workerId;
 
     // Verify the worker is registered and active.
     const worker = await db.workerRegistry.findUnique({ where: { workerId } });
@@ -30,7 +28,8 @@ export async function POST(req: Request) {
     }
 
     // Atomically claim the next job.
-    const job = await claimExecutionJob(workerId, capabilities || JSON.parse(worker.capabilities));
+    const capabilities = JSON.parse(worker.capabilities || "[]");
+    const job = await claimExecutionJob(workerId, capabilities);
 
     if (job) {
       // Update worker concurrency.
@@ -43,9 +42,21 @@ export async function POST(req: Request) {
           lastHeartbeat: new Date(),
         },
       });
+
+      // Issue an execution-specific token (with leaseId) for heartbeat/complete.
+      const { createExecutionToken } = await import("@/lib/worker-auth");
+      const executionToken = createExecutionToken(
+        workerId,
+        job.executionId,
+        job.id, // use job.id as leaseId
+        job.projectId,
+        capabilities
+      );
+
+      return NextResponse.json({ job, executionToken });
     }
 
-    return NextResponse.json({ job });
+    return NextResponse.json({ job: null });
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 });
   }

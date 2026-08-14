@@ -1,21 +1,33 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { getWorkerToken } from "@/lib/worker-auth";
 import { completeExecutionJob } from "@/lib/execution-jobs";
 
 // POST /api/worker/complete
 //
-// Phase 7: Worker reports the result of a job.
-// Idempotent — if the same result is submitted twice, the second is a no-op.
+// Phase 8: AUTHENTICATED — requires a valid execution token.
+// The worker identity is verified cryptographically. Results are idempotent.
 export async function POST(req: Request) {
   try {
-    const { executionId, status, commitSha, results, errorMessage, workerId } = await req.json();
-
-    if (!executionId || !status) {
-      return NextResponse.json({ error: "executionId and status required" }, { status: 400 });
+    const token = getWorkerToken(req);
+    if (!token) {
+      return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }
 
-    // Complete the job (idempotent).
-    const completed = await completeExecutionJob(executionId, {
+    // For completion, the token must include executionId.
+    if (!token.executionId) {
+      return NextResponse.json({ error: "Execution token required for completion" }, { status: 403 });
+    }
+
+    const body = await req.json();
+    const { status, commitSha, results, errorMessage } = body;
+
+    if (!status) {
+      return NextResponse.json({ error: "status required" }, { status: 400 });
+    }
+
+    // Complete the job (idempotent — uses executionId from token).
+    const completed = await completeExecutionJob(token.executionId, {
       status,
       commitSha,
       results,
@@ -23,19 +35,17 @@ export async function POST(req: Request) {
     });
 
     // Update worker concurrency.
-    if (workerId) {
-      const worker = await db.workerRegistry.findUnique({ where: { workerId } });
-      if (worker) {
-        const newConcurrency = Math.max(0, worker.currentConcurrency - 1);
-        await db.workerRegistry.update({
-          where: { workerId },
-          data: {
-            currentConcurrency: newConcurrency,
-            status: newConcurrency === 0 ? "READY" : "BUSY",
-            currentJobId: null,
-          },
-        });
-      }
+    const worker = await db.workerRegistry.findUnique({ where: { workerId: token.workerId } });
+    if (worker) {
+      const newConcurrency = Math.max(0, worker.currentConcurrency - 1);
+      await db.workerRegistry.update({
+        where: { workerId: token.workerId },
+        data: {
+          currentConcurrency: newConcurrency,
+          status: newConcurrency === 0 ? "READY" : "BUSY",
+          currentJobId: null,
+        },
+      });
     }
 
     return NextResponse.json({ ok: completed });

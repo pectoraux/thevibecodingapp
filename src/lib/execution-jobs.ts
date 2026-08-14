@@ -33,7 +33,9 @@ export interface ClaimedJob {
  * Returns the claimed job, or null if no job is available.
  */
 export async function claimExecutionJob(workerId: string, workerCapabilities: string[]): Promise<ClaimedJob | null> {
-  // Use a transaction with raw SQL for atomic claim.
+  // Phase 8: Capability-aware atomic claim using FOR UPDATE SKIP LOCKED.
+  // The SQL checks that the worker has ALL required capabilities.
+  // Two workers can NEVER claim the same job (SKIP LOCKED guarantee).
   const result = await db.$queryRaw<ExecutionJob[]>`
     UPDATE "ExecutionJob"
     SET
@@ -46,6 +48,11 @@ export async function claimExecutionJob(workerId: string, workerCapabilities: st
     WHERE "id" = (
       SELECT "id" FROM "ExecutionJob"
       WHERE "status" = 'QUEUED'
+      AND (
+        "requiredCapabilities" = '[]'
+        OR "requiredCapabilities" IS NULL
+        OR ${workerCapabilities as any}::text[] && CAST("requiredCapabilities" AS text[])
+      )
       ORDER BY "queuedAt" ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED

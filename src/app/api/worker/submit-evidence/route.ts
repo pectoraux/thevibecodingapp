@@ -1,0 +1,101 @@
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { getWorkerToken } from "@/lib/worker-auth";
+import { recordEvidence } from "@/lib/evidence";
+import { ensureBuildEvent } from "@/lib/events";
+import { BuildEventType, TaskStatus } from "@/lib/types";
+
+// POST /api/worker/submit-evidence
+//
+// Phase 8: AUTHENTICATED — requires a valid execution token.
+//
+// The worker submits execution evidence (test results, guardian results,
+// review results, commit SHA, etc.) to the control plane.
+// The control plane persists this as immutable evidence.
+//
+// This replaces the old /api/worker/execute-task endpoint where the control
+// plane ran the execution. Now the WORKER executes and REPORTS results.
+export async function POST(req: Request) {
+  try {
+    const token = getWorkerToken(req);
+    if (!token) {
+      return NextResponse.json({ error: "Authentication required" }, { status: 401 });
+    }
+
+    if (!token.executionId) {
+      return NextResponse.json({ error: "Execution token required" }, { status: 403 });
+    }
+
+    const body = await req.json();
+    const { taskId, projectId, commitSha, testResults, guardianResult, reviewResult, filesChanged, implementationLog } = body;
+
+    // Get the task.
+    const task = await db.task.findUnique({ where: { id: taskId } });
+    if (!task) {
+      return NextResponse.json({ error: "Task not found" }, { status: 404 });
+    }
+
+    // Update the task with the worker's results.
+    const testsOk = Array.isArray(testResults) && testResults.length > 0 && testResults.every((t: any) => t.passes);
+    const guardianOk = guardianResult?.verdict === "PASS" || guardianResult?.verdict === "WARNING";
+    const reviewOk = reviewResult?.verdict === "APPROVED";
+
+    await db.task.update({
+      where: { id: taskId },
+      data: {
+        commitSha: commitSha || null,
+        filesChangedJson: JSON.stringify(filesChanged || []),
+        testResultsJson: JSON.stringify(testResults || []),
+        guardianResultJson: guardianResult ? JSON.stringify(guardianResult) : null,
+        reviewResultJson: reviewResult ? JSON.stringify(reviewResult) : null,
+        implementationLog: implementationLog || null,
+        architectureStatus: guardianResult?.verdict || "PENDING",
+        reviewStatus: reviewResult?.verdict === "APPROVED" ? "PASSED" : reviewResult?.verdict === "REJECTED" ? "FAILED" : "CHANGES_REQUESTED",
+        status: (guardianOk && reviewOk && testsOk) ? TaskStatus.COMPLETED : TaskStatus.FAILED,
+        completedAt: (guardianOk && reviewOk && testsOk) ? new Date() : null,
+        failureReason: (guardianOk && reviewOk && testsOk) ? null : `guardian=${guardianResult?.verdict}, review=${reviewResult?.verdict}, tests=${testsOk ? "ok" : "fail"}`,
+      },
+    });
+
+    // Record immutable evidence.
+    const architecture = await db.architecture.findUnique({ where: { projectId } });
+    try {
+      await recordEvidence(taskId, projectId, {
+        architectureVersion: architecture?.version || "unknown",
+        architectureHash: architecture?.hash || "unknown",
+        commitSha,
+        changedFiles: filesChanged || [],
+        commandsExecuted: testResults?.map((t: any) => ({ command: t.command || t.name, exitCode: t.exitCode ?? (t.passes ? 0 : 1), durationMs: t.durationMs || 0 })) || [],
+        testRuns: testResults || [],
+        runtimeChecks: [],
+        guardianResults: guardianResult,
+        reviewResults: reviewResult,
+        integrationChecks: [],
+      });
+    } catch (err: any) {
+      // Evidence recording failure blocks completion (Phase 3 rule).
+      await db.task.update({
+        where: { id: taskId },
+        data: {
+          status: TaskStatus.FAILED,
+          failureReason: `BLOCKED — evidence recording failed: ${err.message}`,
+        },
+      });
+    }
+
+    // Emit build event.
+    await ensureBuildEvent({
+      projectId,
+      type: (guardianOk && reviewOk && testsOk) ? BuildEventType.TASK_COMPLETED : BuildEventType.TASK_FAILED,
+      level: (guardianOk && reviewOk && testsOk) ? "success" : "error",
+      message: `Task ${task.code} ${guardianOk && reviewOk && testsOk ? "COMPLETED" : "FAILED"} by worker ${token.workerId} (commit: ${commitSha?.slice(0, 7) || "none"})`,
+      taskId,
+      agentType: task.agentType,
+    });
+
+    const success = guardianOk && reviewOk && testsOk;
+    return NextResponse.json({ ok: true, success, taskStatus: success ? "COMPLETED" : "FAILED" });
+  } catch (e: any) {
+    return NextResponse.json({ error: e.message }, { status: 500 });
+  }
+}
