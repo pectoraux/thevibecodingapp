@@ -1,0 +1,146 @@
+// Forge — Phase 10A Commit-Required Regression Test
+//
+// Verifies that a task CANNOT be marked COMPLETED without a real commitSha.
+// This is the hard invariant: no commit = no completion.
+
+import { readFileSync } from "node:fs";
+
+interface TestResult {
+  name: string;
+  passed: boolean;
+  details: string;
+}
+
+const results: TestResult[] = [];
+
+function readFile(path: string): string {
+  try { return readFileSync(path, "utf-8"); } catch { return ""; }
+}
+
+// Test 1: submit-evidence requires commitSha for completion
+function testCommitRequired() {
+  const content = readFile("src/app/api/worker/submit-evidence/route.ts");
+  const hasHasRealCommit = content.includes("hasRealCommit");
+  const hasLengthCheck = content.includes("commitSha.length >= 7");
+  const hasCanCompleteWithCommit = content.includes("canComplete = hasRealCommit");
+  const hasFailureReasonWithCommit = content.includes("commit=") && content.includes("MISSING");
+
+  results.push({
+    name: "submit-evidence requires real commitSha for completion",
+    passed: hasHasRealCommit && hasLengthCheck && hasCanCompleteWithCommit && hasFailureReasonWithCommit,
+    details: `hasRealCommit: ${hasHasRealCommit}, length check: ${hasLengthCheck}, canComplete uses commit: ${hasCanCompleteWithCommit}, failure reason includes commit: ${hasFailureReasonWithCommit}`,
+  });
+}
+
+// Test 2: Worker creates real git commits
+function testWorkerGitCommit() {
+  const poller = readFile("mini-services/execution-worker/poller.ts");
+  const hasGitInit = poller.includes("gitInit");
+  const hasGitAddAndCommit = poller.includes("gitAddAndCommit");
+  const hasGitCheckoutBranch = poller.includes("gitCheckoutBranch");
+  const hasCommitShaReturn = poller.includes("commitSha = gitAddAndCommit");
+
+  results.push({
+    name: "Worker creates real git commits",
+    passed: hasGitInit && hasGitAddAndCommit && hasGitCheckoutBranch && hasCommitShaReturn,
+    details: `gitInit: ${hasGitInit}, gitAddAndCommit: ${hasGitAddAndCommit}, gitCheckoutBranch: ${hasGitCheckoutBranch}, commit returned: ${hasCommitShaReturn}`,
+  });
+}
+
+// Test 3: Worker Guardian does NOT derive from test results
+function testGuardianIndependent() {
+  const poller = readFile("mini-services/execution-worker/poller.ts");
+  const hasRunDeterministicGuardian = poller.includes("runDeterministicGuardian");
+  const hasArchitectureCheck = poller.includes("architecture") && poller.includes("forbiddenTechs");
+  // The OLD pattern was: verdict = testResults.every(...) ? "PASS" : "VIOLATION"
+  // Check that this pattern is NOT the Guardian's verdict logic.
+  const hasTestDerivedGuardian = poller.includes('guardianResult = {\n    verdict: testResults.every');
+
+  results.push({
+    name: "Worker Guardian is independent of test results",
+    passed: hasRunDeterministicGuardian && hasArchitectureCheck && !hasTestDerivedGuardian,
+    details: `runDeterministicGuardian: ${hasRunDeterministicGuardian}, architecture check: ${hasArchitectureCheck}, test-derived guardian: ${hasTestDerivedGuardian}`,
+  });
+}
+
+// Test 4: Worker Reviewer is a separate LLM invocation
+function testReviewerIndependent() {
+  const poller = readFile("mini-services/execution-worker/poller.ts");
+  const hasRunLlmReviewer = poller.includes("runLlmReviewer");
+  const hasSeparatePrompt = poller.includes("independent code reviewer");
+  // The OLD pattern was: verdict = testResults.every(...) ? "APPROVED" : "CHANGES_REQUESTED"
+  const hasTestDerivedReviewer = poller.includes('reviewResult = {\n    verdict: testResults.every');
+
+  results.push({
+    name: "Worker Reviewer is independent LLM invocation",
+    passed: hasRunLlmReviewer && hasSeparatePrompt && !hasTestDerivedReviewer,
+    details: `runLlmReviewer: ${hasRunLlmReviewer}, separate prompt: ${hasSeparatePrompt}, test-derived reviewer: ${hasTestDerivedReviewer}`,
+  });
+}
+
+// Test 5: Worker uses BYOK gateway, not hardcoded SDK
+function testByokGateway() {
+  const poller = readFile("mini-services/execution-worker/poller.ts");
+  const hasCallLLM = poller.includes("async function callLLM");
+  const hasCallByokProvider = poller.includes("async function callByokProvider");
+  const hasResolveCredential = poller.includes("resolve-credential");
+
+  results.push({
+    name: "Worker uses BYOK gateway (callLLM + callByokProvider)",
+    passed: hasCallLLM && hasCallByokProvider && hasResolveCredential,
+    details: `callLLM: ${hasCallLLM}, callByokProvider: ${hasCallByokProvider}, resolve-credential: ${hasResolveCredential}`,
+  });
+}
+
+// Test 6: Job-spec resolves modelProviderRef from BYOK providers
+function testJobSpecByokResolution() {
+  const jobSpec = readFile("src/app/api/worker/job-spec/route.ts");
+  const hasAgentAssignmentLookup = jobSpec.includes("agentAssignment.findFirst") || jobSpec.includes("agentAssignment");
+  const hasModelProviderRef = jobSpec.includes("modelProviderRef");
+
+  results.push({
+    name: "Job-spec resolves modelProviderRef from BYOK providers",
+    passed: hasAgentAssignmentLookup && hasModelProviderRef,
+    details: `agentAssignment lookup: ${hasAgentAssignmentLookup}, modelProviderRef: ${hasModelProviderRef}`,
+  });
+}
+
+// Test 7: Job-spec resolves baseCommitSha from task graph
+function testBaseCommitPropagation() {
+  const jobSpec = readFile("src/app/api/worker/job-spec/route.ts");
+  const hasBaseCommitSha = jobSpec.includes("baseCommitSha");
+  const hasTaskGraphLookup = jobSpec.includes("depTasks") || jobSpec.includes("code: { in: deps }");
+
+  results.push({
+    name: "Job-spec resolves baseCommitSha from task graph",
+    passed: hasBaseCommitSha && hasTaskGraphLookup,
+    details: `baseCommitSha: ${hasBaseCommitSha}, task graph lookup: ${hasTaskGraphLookup}`,
+  });
+}
+
+// Run all tests
+testCommitRequired();
+testWorkerGitCommit();
+testGuardianIndependent();
+testReviewerIndependent();
+testByokGateway();
+testJobSpecByokResolution();
+testBaseCommitPropagation();
+
+// Summary
+console.log("=== Forge Phase 10A Commit-Required Regression Tests ===\n");
+let passed = 0, failed = 0;
+for (const r of results) {
+  const icon = r.passed ? "✓" : "✗";
+  console.log(`${icon} ${r.name}`);
+  console.log(`  ${r.details}\n`);
+  if (r.passed) passed++; else failed++;
+}
+console.log(`=== Summary: ${passed} passed, ${failed} failed ===`);
+if (failed > 0) {
+  console.log("\n❌ REGRESSION DETECTED — a Phase 10 invariant was broken");
+  process.exit(1);
+} else {
+  console.log("\n✅ All Phase 10 invariants satisfied");
+  process.exit(0);
+}

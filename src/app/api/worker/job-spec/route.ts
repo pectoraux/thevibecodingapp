@@ -104,14 +104,30 @@ export async function POST(req: Request) {
       } : null,
 
       // P10-2: BYOK model provider reference.
+      // Resolve the project's configured BYOK provider for this task's agent type.
       // The worker resolves credentials via /api/worker/resolve-credential.
       // The control plane sends only the reference, never the plaintext key.
-      modelProviderRef: (() => {
-        // Check if the project has a BYOK provider assigned for this agent type.
-        // For now, default to zai (sandbox LLM). The worker will use the gateway.
+      modelProviderRef: await (async () => {
+        // Look up the agent assignment for this task's agent type.
+        const assignment = await db.agentAssignment.findFirst({
+          where: { projectId: job.projectId, agentType: task.agentType },
+          include: { provider: true },
+        });
+
+        if (assignment?.provider) {
+          // Use the BYOK provider configured for this agent.
+          return {
+            provider: assignment.provider.provider,
+            providerId: assignment.provider.id,
+            model: assignment.provider.model,
+          };
+        }
+
+        // No BYOK provider configured — use zai (sandbox LLM).
+        // The worker will use the z-ai-web-dev-sdk as the default provider.
         return {
           provider: "zai",
-          providerId: null, // null = use default sandbox LLM
+          providerId: null,
           model: "glm-4.6",
         };
       })(),
@@ -139,14 +155,27 @@ export async function POST(req: Request) {
       })(),
 
       // P10-1: Base commit SHA for dependent tasks.
-      // If this task depends on a completed task, use that task's commit as the base.
-      baseCommitSha: (() => {
+      // Resolve from the task graph: find the latest completed dependency's commit.
+      baseCommitSha: await (async () => {
         const deps = JSON.parse(task.dependencies || "[]") as string[];
         if (deps.length === 0) return null;
-        // Find the last completed dependency's commit.
-        // For now, return null — the worker will start fresh.
-        // In a full implementation, this would query the task graph for the
-        // latest completed dependency's commitSha.
+
+        // Find all completed dependency tasks.
+        const depTasks = await db.task.findMany({
+          where: {
+            projectId: job.projectId,
+            code: { in: deps },
+            status: "COMPLETED",
+            commitSha: { not: null },
+          },
+          orderBy: { completedAt: "desc" },
+        });
+
+        // Return the most recent completed dependency's commit SHA.
+        if (depTasks.length > 0 && depTasks[0].commitSha) {
+          return depTasks[0].commitSha;
+        }
+
         return null;
       })(),
 
