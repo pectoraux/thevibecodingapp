@@ -646,3 +646,65 @@ Stage Summary:
 - Vercel deployment: https://thevibecodingapp.vercel.app (READY)
 - GitHub repo: https://github.com/pectoraux/thevibecodingapp
 - Lint: 0 errors
+
+---
+Task ID: phase4
+Agent: orchestrator (main) — Phase 4 secure execution infrastructure
+Task: Fix critical security vulnerabilities in execution worker + durable job system
+
+Work Log:
+- FIXED CRITICAL: Worker was unauthenticated RCE endpoint
+  - Implemented HMAC-SHA256 signed job tokens (FORGE_WORKER_SECRET)
+  - Every /execute requires valid signed token (jobId, projectId, attempt, issuedAt, expiresAt, nonce)
+  - Unauthenticated → 401, invalid signature → 403, expired → 403
+- FIXED: Removed CORS wildcard (Access-Control-Allow-Origin: *)
+  - Worker is backend service only, browser clients cannot call it
+- FIXED: Server-controlled workspaces (was client-supplied worktreePath)
+  - Client sends sandboxId, not filesystem path
+  - Worker generates workspace path internally via POST /sandbox
+- FIXED: Path containment (was no containment check)
+  - Reject absolute paths, path traversal (../), null bytes, symlink escapes
+  - realpath() check on existing files
+- ADDED: Command policy (defense in depth)
+  - Blocklist: shutdown, reboot, mount, dd, sysctl, modprobe, chmod
+  - Pattern matching: fork bombs (:(){:|:&};:), /dev/sd*, /proc/sys, rm -rf /
+- ADDED: Cross-tenant isolation
+  - Sandbox belongs to specific projectId
+  - Tenant B cannot access tenant A's sandbox → 403
+- ADDED: Durable job leases
+  - BuildJob model: workerId, leaseId, leaseExpiresAt, heartbeatAt, idempotencyKey
+  - claimNextJob() with lease expiry + recovery
+  - heartbeat() extends lease
+  - recoverExpiredJobs() requeues stale jobs
+  - Idempotency: projectId+taskId+attempt
+- ADDED: Hostile security test suite (18 tests, all pass)
+  - Authentication tests (unauth, invalid sig, expired)
+  - Path containment tests (traversal, absolute, null byte)
+  - Command policy tests (shutdown, fork bomb)
+  - Cross-tenant isolation test
+  - Environment isolation tests (6 platform secrets)
+  - CORS test
+  - Server-controlled workspace test
+- UPDATED: README — removed "Virtual GitHub", "template fallback", demo credentials
+- Deployed to Vercel: https://thevibecodingapp.vercel.app (READY)
+- Added FORGE_WORKER_SECRET env var to Vercel
+
+Security test results: 18/18 PASSED
+
+Critical vulnerabilities fixed:
+1. ✓ Unauthenticated /execute → now requires HMAC token
+2. ✓ Client-supplied worktreePath → now server-controlled sandboxId
+3. ✓ No path containment → now rejects traversal/absolute/symlink
+4. ✓ CORS wildcard → now no CORS (backend only)
+5. ✓ No command policy → now blocklist + pattern matching
+6. ✓ No cross-tenant check → now projectId-scoped sandboxes
+7. ✓ DB persistence only → now leases + heartbeats + recovery
+
+Stage Summary:
+- Worker is no longer an unauthenticated RCE endpoint
+- Execution plane is properly authenticated and isolated
+- All four Phase 3 blockers addressed
+- Vercel deployment: https://thevibecodingapp.vercel.app (READY)
+- GitHub repo: https://github.com/pectoraux/thevibecodingapp
+- Lint: 0 errors
+- Known limitation: process-level isolation (not container/microVM) — documented honestly
