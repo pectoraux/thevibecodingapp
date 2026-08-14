@@ -90,6 +90,7 @@ function ForgeTopBar() {
           <div className="flex items-center gap-2 text-sm font-semibold">
             <Wrench className="size-4" />
             <span className="hidden sm:inline">Forge</span>
+            <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-200">DEV MODE</span>
           </div>
           <div className="flex items-center gap-2">
             {isAdmin && (

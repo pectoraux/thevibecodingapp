@@ -97,7 +97,7 @@ export function CredentialsTab({ projectId }: { projectId: string }) {
         <ShieldCheck className="size-4" />
         <AlertTitle>Secret handling</AlertTitle>
         <AlertDescription>
-          Secrets are obfuscated at rest and never sent to LLMs as plaintext.
+          Secrets are encrypted at rest (AES-256-GCM) and never sent to LLMs as plaintext.
           The UI never displays secret values — only whether each is configured
           and validated.
         </AlertDescription>
@@ -321,7 +321,7 @@ function SetCredentialDialog({
         { value, environment: env }
       ),
     onSuccess: () => {
-      toast({ title: "Credential saved", description: "Stored obfuscated, validated." });
+      toast({ title: "Credential saved", description: "Stored encrypted, validated." });
       qc.invalidateQueries({ queryKey: ["credentials", projectId] });
       onOpenChange(false);
     },
@@ -389,7 +389,7 @@ function SetCredentialDialog({
             onClick={() => mut.mutate()}
           >
             {mut.isPending && <Loader2 className="size-4 animate-spin" />}
-            Save (obfuscated)
+            Save (encrypted)
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -17,11 +17,19 @@
 //   14. Continue until PRODUCTION_READY or HUMAN_REVIEW_REQUIRED
 
 import { db } from "@/lib/db";
-import { deobfuscate, shortSha } from "@/lib/crypto";
+import { decryptSecretOrNull, shortSha } from "@/lib/crypto";
 import { buildAdapter, extractJson, type ChatMessage } from "@/lib/llm";
 import { buildPrompt } from "@/lib/prompts";
 import { ensureBuildEvent } from "@/lib/events";
-import { createCommit, ensureBranch, createPullRequest, mergePullRequest, writeFileToRepo } from "@/lib/repo";
+// Phase 2: real systems replace the DB-backed repo simulation.
+import * as gitEngine from "@/lib/git-engine";
+import { runTests, runBuild, runLint, runTypeCheck, installDependencies } from "@/lib/test-runner";
+import { runDeterministicGuardian } from "@/lib/guardian-deterministic";
+import { recordEvidence, hasSufficientEvidence } from "@/lib/evidence";
+import * as github from "@/lib/github";
+// Keep the old repo.ts for backward-compatible DB metadata (branch/commit/PR records).
+// The canonical source of truth is now real Git; DB rows are metadata shadows.
+import { createCommit, ensureBranch, createPullRequest, mergePullRequest, writeFileToRepo, initRepository } from "@/lib/repo";
 import { runReadinessGate, runPreflight } from "@/lib/readiness";
 import {
   AgentType,
@@ -46,7 +54,13 @@ async function resolveAdapterForAgent(
   });
   if (assignment?.provider) {
     const prov = assignment.provider;
-    const apiKey = deobfuscate(prov.apiKey);
+    // Decrypt the stored API key via the real AES-256-GCM secret store. If
+    // decryption fails (wrong master key, tampered ciphertext, or legacy
+    // XOR-obfuscated value from before the v1 envelope migration), treat the
+    // key as missing — the buildAdapter call returns a BLOCKED adapter and
+    // the execution is recorded as a failure rather than crashing the
+    // orchestrator.
+    const apiKey = decryptSecretOrNull(prov.apiKey) ?? undefined;
     return {
       adapter: buildAdapter({
         provider: prov.provider,
@@ -363,7 +377,8 @@ export async function freezeArchitecture(projectId: string): Promise<Architectur
 export async function startBuild(projectId: string): Promise<void> {
   const project = await db.project.findUnique({ where: { id: projectId } });
   if (!project) throw new Error("Project not found");
-  if (!project.githubConnected) throw new Error("Connect GitHub first");
+  // GitHub connection is optional in dev mode — we can use a local repo.
+  // In production, GitHub should be connected for canonical source-of-truth.
 
   const architecture = await db.architecture.findUnique({ where: { projectId } });
   if (!architecture?.frozen) throw new Error("Architecture must be frozen first");
@@ -481,6 +496,8 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
   if (!task) return;
   const architecture = await db.architecture.findUnique({ where: { projectId } });
   if (!architecture) throw new Error("Architecture missing");
+  const project = await db.project.findUnique({ where: { id: projectId } });
+  if (!project) throw new Error("Project not found");
 
   await db.task.update({
     where: { id: taskId },
@@ -499,30 +516,94 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
     agentType: task.agentType as AT,
   });
 
-  // Create task branch.
+  // --- Phase 2: Real Git Worktree ---
+  // Each task gets its own worktree. Agents write to the real filesystem.
+  // Git is canonical; DB rows are metadata shadows.
   const branchName = `task/${task.code.toLowerCase()}`;
+  const repoPath = gitEngine.getRepoPath(projectId);
+
+  // Ensure the project's local repo exists (clone from GitHub or init).
+  try {
+    if (project.githubConnected && project.githubRepo) {
+      const [owner, name] = project.githubRepo.split("/");
+      const cloneUrl = github.getCloneUrl(owner, name);
+      await gitEngine.cloneRepo(projectId, cloneUrl);
+    } else {
+      await gitEngine.initRepo(projectId, project.name);
+    }
+  } catch (err: any) {
+    // Repo may already exist — that's fine.
+    await ensureBuildEvent({
+      projectId, type: BuildEventType.TASK_STARTED, level: "info",
+      message: `Repo already initialized at ${repoPath}`,
+      taskId,
+    });
+  }
+
+  // Create an isolated worktree for this task attempt.
+  const worktreePath = gitEngine.getWorktreePath(projectId, `${task.code.toLowerCase()}-${task.attempts}`);
+  let worktreeCreated = false;
+  try {
+    await gitEngine.createWorktree(projectId, `${task.code.toLowerCase()}-${task.attempts}`, "main");
+    worktreeCreated = true;
+  } catch (err: any) {
+    await ensureBuildEvent({
+      projectId, type: BuildEventType.TASK_FAILED, level: "error",
+      message: `Failed to create worktree: ${err.message}`,
+      taskId,
+    });
+  }
+
+  // Also create a DB branch record (metadata shadow).
   await ensureBranch(projectId, branchName, "main");
 
-  // 1. Implementation agent.
+  // 1. Implementation agent — calls the real LLM (no template fallback in prod).
   const implResult = await runImplementationAgent(projectId, task, architecture, branchName);
   if (!implResult.ok) {
     await db.task.update({
       where: { id: taskId },
-      data: { status: TaskStatus.FAILED, failureReason: implResult.error ?? "implementation failed" },
+      data: { status: TaskStatus.FAILED, failureReason: implResult.error ?? "implementation failed (no LLM output)" },
     });
     await ensureBuildEvent({
       projectId,
       type: BuildEventType.TASK_FAILED,
       level: "error",
-      message: `Task ${task.code} failed during implementation: ${implResult.error}`,
+      message: `Task ${task.code} BLOCKED — ${implResult.error ?? "no implementation produced"}`,
       taskId,
     });
+    if (worktreeCreated) await gitEngine.removeWorktree(projectId, `${task.code.toLowerCase()}-${task.attempts}`).catch(() => {});
     return;
   }
 
-  // 2. Commit changes.
+  // 2. Write files to the real worktree + commit.
   const files = implResult.parsed?.files || [];
-  const commitInput = {
+  let realCommitSha: string | null = null;
+
+  if (worktreeCreated) {
+    for (const f of files) {
+      try {
+        await gitEngine.writeToFile(worktreePath, f.path, f.content || "");
+      } catch (err: any) {
+        await ensureBuildEvent({
+          projectId, type: BuildEventType.TASK_FAILED, level: "error",
+          message: `Failed to write ${f.path}: ${err.message}`,
+          taskId,
+        });
+      }
+    }
+    try {
+      realCommitSha = await gitEngine.commitAll(worktreePath, `feat(${task.code}): ${task.title}`);
+    } catch (err: any) {
+      await ensureBuildEvent({
+        projectId, type: BuildEventType.TASK_FAILED, level: "error",
+        message: `Failed to commit: ${err.message}`,
+        taskId,
+      });
+    }
+  }
+
+  // Also record in DB (metadata shadow for the repository view).
+  const dbCommitInput = {
     projectId,
     branchName,
     message: `feat(${task.code}): ${task.title}`,
@@ -534,7 +615,9 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
       language: f.language,
     })),
   };
-  const { sha } = await createCommit(commitInput);
+  const { sha: dbSha } = await createCommit(dbCommitInput);
+  const sha = realCommitSha || dbSha;
+
   await db.task.update({
     where: { id: taskId },
     data: {
@@ -548,13 +631,62 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
     projectId,
     type: BuildEventType.COMMIT,
     level: "success",
-    message: `Commit ${sha.slice(0, 7)} on ${branchName} — ${files.length} file(s)`,
+    message: `Commit ${sha.slice(0, 7)} on ${branchName} — ${files.length} file(s)${realCommitSha ? " [real git]" : " [db shadow]"}`,
     taskId,
-    payload: JSON.stringify({ sha, files: files.map((f: any) => f.path) }),
+    payload: JSON.stringify({ sha, files: files.map((f: any) => f.path), worktree: worktreePath }),
   });
 
-  // 3. Run tests (evidence-based).
-  const testResults = await runTaskTests(projectId, task, files);
+  // 3. --- Phase 2: Real Test Execution ---
+  // Actually run tests in the worktree. No more heuristic keyword matching.
+  let testResults: any[] = [];
+  let testsOk = false;
+  if (worktreeCreated && realCommitSha) {
+    try {
+      // Install dependencies first.
+      await installDependencies(worktreePath);
+      // Run real tests.
+      const testRun = await runTests({ cwd: worktreePath, timeoutMs: 120000 });
+      testResults = [{
+        name: testRun.framework,
+        type: "real",
+        target: task.code,
+        passes: testRun.success,
+        evidence: `exitCode=${testRun.exitCode}, passed=${testRun.passed}, failed=${testRun.failed}, skipped=${testRun.skipped}, duration=${testRun.durationMs}ms`,
+        command: testRun.command,
+        exitCode: testRun.exitCode,
+        stdout: testRun.stdout.slice(0, 5000),
+        stderr: testRun.stderr.slice(0, 5000),
+        passed: testRun.passed,
+        failed: testRun.failed,
+        skipped: testRun.skipped,
+        total: testRun.total,
+        framework: testRun.framework,
+        durationMs: testRun.durationMs,
+        timedOut: testRun.timedOut,
+      }];
+      testsOk = testRun.success;
+    } catch (err: any) {
+      testResults = [{
+        name: "test-runner",
+        type: "real",
+        target: task.code,
+        passes: false,
+        evidence: `Test execution failed: ${err.message}`,
+        error: err.message,
+      }];
+      testsOk = false;
+    }
+  } else {
+    // No worktree — can't run real tests. This is a BLOCKED state, not a pass.
+    testResults = [{
+      name: "worktree",
+      type: "real",
+      target: task.code,
+      passes: false,
+      evidence: "No worktree available — tests could not be executed (BLOCKED)",
+    }];
+    testsOk = false;
+  }
   await db.task.update({
     where: { id: taskId },
     data: { testResultsJson: JSON.stringify(testResults) },
@@ -562,34 +694,77 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
   await ensureBuildEvent({
     projectId,
     type: BuildEventType.TESTS_RUN,
-    level: testResults.every((t) => t.passes) ? "success" : "warn",
-    message: `Tests for ${task.code}: ${testResults.filter((t) => t.passes).length}/${testResults.length} passed`,
+    level: testsOk ? "success" : "warn",
+    message: `Tests for ${task.code}: ${testsOk ? "PASSED" : "FAILED"} (real execution)`,
     taskId,
     payload: JSON.stringify(testResults),
   });
 
-  // 4. Architecture Guardian.
-  const guardianResult = await runGuardian(projectId, task, architecture, files);
+  // 4. --- Phase 2: Deterministic Guardian (Layer 1) ---
+  // Mechanical checks BEFORE the LLM Guardian. Catches real violations.
+  let deterministicResult: any = null;
+  if (worktreeCreated && realCommitSha) {
+    try {
+      const diff = await gitEngine.getDiff(worktreePath, "main");
+      const archParsed = {
+        version: architecture.version,
+        hash: architecture.hash,
+        components: JSON.parse(architecture.components || "[]"),
+        dataModels: JSON.parse(architecture.dataModels || "[]"),
+        apiContracts: JSON.parse(architecture.apiContracts || "[]"),
+        invariants: JSON.parse(architecture.invariants || "[]"),
+        constraints: JSON.parse(architecture.constraints || "[]"),
+        deploymentModel: JSON.parse(architecture.deploymentModel || "{}"),
+      };
+      deterministicResult = await runDeterministicGuardian({
+        architecture: archParsed,
+        changedFiles: files.map((f: any) => ({ path: f.path, content: f.content || "" })),
+        diff,
+      });
+    } catch (err: any) {
+      deterministicResult = {
+        verdict: "WARNING",
+        violations: [],
+        warnings: [{ check: "deterministic-guardian", invariant: "Guardian execution failed", evidence: err.message, files: [], severity: "medium", remediation: "Manual review" }],
+        checks: [],
+        summary: `Deterministic Guardian failed: ${err.message}`,
+      };
+    }
+  }
+
+  // 4b. LLM Guardian (Layer 2) — semantic checks with minimal context.
+  const llmGuardianResult = await runGuardian(projectId, task, architecture, files);
+
+  // Combine: deterministic verdict takes precedence for violations.
+  const combinedGuardian = {
+    deterministic: deterministicResult,
+    llm: llmGuardianResult,
+    verdict: deterministicResult?.verdict === "VIOLATION" ? "VIOLATION" :
+             llmGuardianResult.verdict === "VIOLATION" ? "VIOLATION" :
+             deterministicResult?.verdict === "WARNING" || llmGuardianResult.verdict === "WARNING" ? "WARNING" : "PASS",
+    summary: `${deterministicResult?.summary || ""} | LLM: ${llmGuardianResult.summary}`,
+  };
+
   await db.task.update({
     where: { id: taskId },
     data: {
-      architectureStatus: guardianResult.verdict,
-      guardianResultJson: JSON.stringify(guardianResult),
+      architectureStatus: combinedGuardian.verdict,
+      guardianResultJson: JSON.stringify(combinedGuardian),
     },
   });
   await ensureBuildEvent({
     projectId,
     type:
-      guardianResult.verdict === "PASS"
+      combinedGuardian.verdict === "PASS"
         ? BuildEventType.GUARDIAN_PASS
-        : guardianResult.verdict === "WARNING"
+        : combinedGuardian.verdict === "WARNING"
         ? BuildEventType.GUARDIAN_WARNING
         : BuildEventType.GUARDIAN_VIOLATION,
-    level: guardianResult.verdict === "PASS" ? "success" : guardianResult.verdict === "WARNING" ? "warn" : "error",
-    message: `Guardian ${guardianResult.verdict} for ${task.code} — ${guardianResult.summary}`,
+    level: combinedGuardian.verdict === "PASS" ? "success" : combinedGuardian.verdict === "WARNING" ? "warn" : "error",
+    message: `Guardian ${combinedGuardian.verdict} for ${task.code} — ${combinedGuardian.summary}`,
     taskId,
     agentType: AgentType.ARCHITECTURE_GUARDIAN,
-    payload: JSON.stringify(guardianResult),
+    payload: JSON.stringify(combinedGuardian),
   });
 
   // 5. Independent code review.
@@ -611,21 +786,90 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
     payload: JSON.stringify(reviewResult),
   });
 
-  // 6. Decide outcome.
-  const guardianOk = guardianResult.verdict === "PASS" || guardianResult.verdict === "WARNING";
-  const reviewOk = reviewResult.verdict === "APPROVED";
-  const testsOk = testResults.every((t) => t.passes);
+  // 6. --- Phase 2: Evidence Ledger ---
+  // Record immutable evidence for this attempt. A task can only transition
+  // to COMPLETED if the evidence ledger proves: real commit + real passing
+  // tests + Guardian PASS + review APPROVED.
+  let evidenceRecord: any = null;
+  try {
+    evidenceRecord = await recordEvidence(taskId, projectId, {
+      architectureVersion: architecture.version,
+      architectureHash: architecture.hash,
+      commitSha: sha,
+      changedFiles: files.map((f: any) => f.path),
+      commandsExecuted: testResults.map((t) => ({ command: t.command || t.name, exitCode: t.exitCode ?? (t.passes ? 0 : 1), durationMs: t.durationMs || 0 })),
+      testRuns: testResults,
+      runtimeChecks: [],
+      guardianResults: combinedGuardian,
+      reviewResults: reviewResult,
+      integrationChecks: [],
+    });
+  } catch (err: any) {
+    // Evidence recording failure should not block the task, but should be logged.
+    await ensureBuildEvent({
+      projectId, type: BuildEventType.TASK_FAILED, level: "error",
+      message: `Evidence recording failed: ${err.message}`,
+      taskId,
+    });
+  }
 
-  if (guardianOk && reviewOk && testsOk) {
-    // Create PR + merge.
+  // 7. Decide outcome — evidence-based, not LLM-assertion-based.
+  const guardianOk = combinedGuardian.verdict === "PASS" || combinedGuardian.verdict === "WARNING";
+  const reviewOk = reviewResult.verdict === "APPROVED";
+
+  // Check evidence sufficiency — the platform's own verification, not the LLM's claim.
+  const evidenceOk = evidenceRecord ? hasSufficientEvidence(evidenceRecord) : false;
+
+  if (guardianOk && reviewOk && testsOk && evidenceOk) {
+    // Push to GitHub if connected.
+    if (project.githubConnected && project.githubRepo && worktreeCreated && realCommitSha) {
+      try {
+        const pushResult = await gitEngine.pushBranch(worktreePath, branchName);
+        if (!pushResult.ok) {
+          await ensureBuildEvent({
+            projectId, type: BuildEventType.COMMIT, level: "warn",
+            message: `Git push failed: ${pushResult.error || "unknown"}`,
+            taskId,
+          });
+        }
+      } catch (err: any) {
+        await ensureBuildEvent({
+          projectId, type: BuildEventType.COMMIT, level: "warn",
+          message: `Git push error: ${err.message}`,
+          taskId,
+        });
+      }
+    }
+
+    // Create PR + merge (DB shadow + real GitHub if connected).
     const pr = await createPullRequest({
       projectId,
       title: `[${task.code}] ${task.title}`,
       branchName,
       taskId,
-      body: `Implementation of ${task.title}.\n\nAcceptance criteria:\n${(JSON.parse(task.acceptanceCriteria || "[]") as string[]).map((c) => `- ${c}`).join("\n")}`,
+      body: `Implementation of ${task.title}.\n\nAcceptance criteria:\n${(JSON.parse(task.acceptanceCriteria || "[]") as string[]).map((c) => `- ${c}`).join("\n")}\n\nEvidence: ${sha.slice(0, 7)}, tests ${testsOk ? "passed" : "failed"}, guardian ${combinedGuardian.verdict}, review ${reviewResult.verdict}`,
     });
     await mergePullRequest(projectId, pr.number);
+
+    // Real GitHub PR if connected.
+    if (project.githubConnected && project.githubRepo) {
+      try {
+        const [owner, name] = project.githubRepo.split("/");
+        await github.createPullRequest(owner, name, {
+          title: `[${task.code}] ${task.title}`,
+          head: branchName,
+          base: "main",
+          body: `Implementation of ${task.title}.\n\nEvidence: commit ${sha.slice(0,7)}, tests ${testsOk ? "passed" : "failed"}, guardian ${combinedGuardian.verdict}, review ${reviewResult.verdict}`,
+        });
+      } catch (err: any) {
+        await ensureBuildEvent({
+          projectId, type: BuildEventType.COMMIT, level: "warn",
+          message: `GitHub PR creation failed: ${err.message}`,
+          taskId,
+        });
+      }
+    }
+
     await db.task.update({
       where: { id: taskId },
       data: { status: TaskStatus.COMPLETED, completedAt: new Date() },
@@ -634,36 +878,42 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
       projectId,
       type: BuildEventType.TASK_COMPLETED,
       level: "success",
-      message: `Task ${task.code} COMPLETED — merged PR #${pr.number}`,
+      message: `Task ${task.code} COMPLETED — merged PR #${pr.number} (evidence: real commit + real tests + guardian PASS + review APPROVED)`,
       taskId,
     });
   } else {
     // Failed — either retry or escalate.
+    const reason = `guardian=${combinedGuardian.verdict}, review=${reviewResult.verdict}, tests=${testsOk ? "ok" : "fail"}, evidence=${evidenceOk ? "sufficient" : "insufficient"}`;
     if (task.attempts >= task.maxAttempts) {
       await db.task.update({
         where: { id: taskId },
-        data: { status: TaskStatus.FAILED, failureReason: `Exhausted retries (guardian=${guardianResult.verdict}, review=${reviewResult.verdict}, tests=${testsOk ? "ok" : "fail"})` },
+        data: { status: TaskStatus.FAILED, failureReason: `Exhausted retries (${reason})` },
       });
       await ensureBuildEvent({
         projectId,
         type: BuildEventType.TASK_FAILED,
         level: "error",
-        message: `Task ${task.code} FAILED after ${task.attempts} attempts`,
+        message: `Task ${task.code} FAILED after ${task.attempts} attempts (${reason})`,
         taskId,
       });
     } else {
       await db.task.update({
         where: { id: taskId },
-        data: { status: TaskStatus.PLANNED, failureReason: `Retry needed (guardian=${guardianResult.verdict}, review=${reviewResult.verdict}, tests=${testsOk ? "ok" : "fail"})` },
+        data: { status: TaskStatus.PLANNED, failureReason: `Retry needed (${reason})` },
       });
       await ensureBuildEvent({
         projectId,
         type: BuildEventType.REPAIR_TASK_CREATED,
         level: "warn",
-        message: `Task ${task.code} scheduled for retry (attempt ${task.attempts}/${task.maxAttempts})`,
+        message: `Task ${task.code} scheduled for retry (attempt ${task.attempts}/${task.maxAttempts}) — ${reason}`,
         taskId,
       });
     }
+  }
+
+  // Cleanup worktree.
+  if (worktreeCreated) {
+    await gitEngine.removeWorktree(projectId, `${task.code.toLowerCase()}-${task.attempts}`).catch(() => {});
   }
 }
 
@@ -835,79 +1085,21 @@ async function runCodeReview(
 }
 
 // ---------------------------------------------------------------------------
-// Test runner — produces real evidence based on file content.
+// DEPRECATED: Old heuristic test runner.
+// REPLACED by src/lib/test-runner.ts which executes real tests.
+// This function is kept only for reference and is NOT called in production.
 // ---------------------------------------------------------------------------
 
-async function runTaskTests(
+async function runTaskTests_DEPRECATED(
   projectId: string,
   task: Task,
   files: any[]
 ): Promise<any[]> {
-  // We can't actually execute arbitrary code in this sandbox safely.
-  // Instead, produce evidence-based test results derived from the file
-  // contents and the task's declared requiredTests. A test "passes" when:
-  //   - the file declares a real implementation (not a stub)
-  //   - the task's acceptance criteria keywords appear in the code
-  const requiredTests = JSON.parse(task.requiredTests || "[]") as string[];
-  const acceptanceCriteria = JSON.parse(task.acceptanceCriteria || "[]") as string[];
-  const allContent = files.map((f) => f.content || "").join("\n");
-  const allPaths = files.map((f) => f.path).join(" ");
-
-  const tests: any[] = [];
-
-  // Test 1: files are not empty / not stubs.
-  for (const f of files) {
-    const content = f.content || "";
-    const isEmpty = content.trim().length < 20;
-    const hasStub = /not implemented|coming soon|placeholder/i.test(content);
-    tests.push({
-      name: `${f.path} is non-trivial`,
-      type: "static",
-      target: f.path,
-      passes: !isEmpty && !hasStub,
-      evidence: isEmpty ? "file content < 20 chars" : hasStub ? "contains stub/placeholder marker" : `${content.length} chars, no stub markers`,
-    });
-  }
-
-  // Test 2: required tests declared in the architecture are present.
-  if (requiredTests.length === 0) {
-    tests.push({
-      name: `${task.code} produces output`,
-      type: "unit",
-      target: task.code,
-      passes: files.length > 0,
-      evidence: `${files.length} file(s) produced`,
-    });
-  } else {
-    for (const rt of requiredTests) {
-      // A required test "passes" if the implementation files reference the
-      // concept mentioned in the test description.
-      const keyword = (rt.split(/[\s:,-]+/).filter((w) => w.length > 3)[0] || rt).toLowerCase();
-      const found = allContent.toLowerCase().includes(keyword) || allPaths.toLowerCase().includes(keyword);
-      tests.push({
-        name: rt,
-        type: "unit",
-        target: task.code,
-        passes: found,
-        evidence: found ? `keyword "${keyword}" found in implementation` : `keyword "${keyword}" not found`,
-      });
-    }
-  }
-
-  // Test 3: acceptance criteria are reflected in the code.
-  for (const ac of acceptanceCriteria.slice(0, 3)) {
-    const keyword = (ac.split(/[\s,.\-:]+/).filter((w) => w.length > 4)[0] || ac).toLowerCase();
-    const found = allContent.toLowerCase().includes(keyword);
-    tests.push({
-      name: `AC: ${ac.slice(0, 60)}${ac.length > 60 ? "…" : ""}`,
-      type: "integration",
-      target: task.code,
-      passes: found,
-      evidence: found ? `criterion keyword present` : `criterion keyword absent`,
-    });
-  }
-
-  return tests;
+  // DO NOT USE — this was the Phase 1 heuristic that matched keywords in
+  // file content. Phase 2 replaces it with real test execution via
+  // test-runner.ts runTests(). Kept here only to avoid breaking imports
+  // during the transition. Will be removed once all callers are verified.
+  return [];
 }
 
 // ---------------------------------------------------------------------------

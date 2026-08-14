@@ -22,7 +22,7 @@ model LlmProvider {
   name        String                   // user-facing label e.g. "OpenAI Primary"
   provider    String                   // "zai" | "openai" | "anthropic" | "google" | "xai" | "local"
   model       String                   // e.g. "glm-4.6"
-  apiKey      String                   // obfuscated at rest (XOR+base64)
+  apiKey      String                   // encrypted at rest (AES-256-GCM, v1: envelope)
   capabilities String                  // JSON array: ["coding","reasoning","long_context"]
   contextWindow Int      @default(128000)
   pricingPer1kInput  Float @default(0)
@@ -189,6 +189,7 @@ model Task {
   completedAt        DateTime?
 
   executions         AgentExecution[]
+  evidence           TaskEvidence[]
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +251,44 @@ model AgentExecution {
 }
 
 // ---------------------------------------------------------------------------
+// Task Evidence Ledger (immutable, one record per attempt)
+// Records REAL execution evidence: changed files, commands, test runs,
+// guardian verdicts, review verdicts, integration checks. A task may have
+// multiple evidence records (one per retry). The ledger is append-only —
+// never UPDATE; only CREATE.
+// ---------------------------------------------------------------------------
+
+model TaskEvidence {
+  id            String   @id @default(cuid())
+  taskId        String
+  task          Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  projectId     String
+
+  architectureVersion String
+  architectureHash    String
+  commitSha           String?
+
+  // Real execution evidence (JSON-encoded arrays/objects)
+  changedFiles        String   @default("[]")  // JSON array of file paths
+  commandsExecuted    String   @default("[]")  // JSON array of {command, exitCode, durationMs}
+  testRuns            String   @default("[]")  // JSON array of TestResult objects
+  runtimeChecks       String   @default("[]")  // JSON array of runtime check results
+  guardianResults     String?                  // JSON: deterministic + LLM guardian results
+  reviewResults       String?                  // JSON: review results
+  integrationChecks   String   @default("[]")  // JSON array of integration check results
+
+  // Summary counts for fast dashboard queries
+  totalChecks         Int      @default(0)
+  passedChecks        Int      @default(0)
+  failedChecks        Int      @default(0)
+
+  createdAt     DateTime @default(now())
+
+  @@index([taskId])
+  @@index([projectId])
+}
+
+// ---------------------------------------------------------------------------
 // Credentials / Secrets Manifest
 // ---------------------------------------------------------------------------
 
@@ -266,7 +305,7 @@ model Credential {
   validationMethod String?
   testSandboxSupport Boolean @default(false)
   whenRequired  String?
-  // value is stored obfuscated; never sent to LLMs as plaintext
+  // value is stored encrypted (AES-256-GCM, v1: envelope); never sent to LLMs as plaintext
   value         String?
   configured    Boolean  @default(false)
   validated     Boolean  @default(false)

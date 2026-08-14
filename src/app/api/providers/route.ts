@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { obfuscate } from "@/lib/crypto";
+import { encryptSecret } from "@/lib/crypto";
 import { requireUserId } from "@/lib/auth";
 import { stripProvider, readJsonBody } from "../_lib";
 
@@ -20,7 +20,7 @@ export async function GET() {
   }
 }
 
-// POST /api/providers — create a new LLM provider (obfuscate apiKey before storing)
+// POST /api/providers — create a new LLM provider (encrypt apiKey before storing)
 export async function POST(req: Request) {
   try {
     const userId = await requireUserId();
@@ -47,7 +47,7 @@ export async function POST(req: Request) {
         name,
         provider,
         model,
-        apiKey: obfuscate(apiKey),
+        apiKey: encryptSecret(apiKey),
         capabilities: JSON.stringify(Array.isArray(capabilities) ? capabilities : []),
         contextWindow: typeof contextWindow === "number" ? contextWindow : 128000,
         pricingPer1kInput: typeof pricingPer1kInput === "number" ? pricingPer1kInput : 0,

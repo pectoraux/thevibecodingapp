@@ -195,7 +195,10 @@ export function AuthScreen() {
               <Wrench className="size-7 text-foreground" />
             </div>
             <div className="space-y-1">
-              <h1 className="text-3xl font-bold tracking-tight">Forge</h1>
+              <div className="flex items-center justify-center gap-2">
+                <h1 className="text-3xl font-bold tracking-tight">Forge</h1>
+                <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-200">DEV MODE</span>
+              </div>
               <p className="text-sm text-muted-foreground max-w-sm mx-auto">
                 An autonomous multi-agent software factory. Spin up a project,
                 freeze an architecture, and let agents build it end-to-end.

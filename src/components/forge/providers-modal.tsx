@@ -101,7 +101,7 @@ export function ProvidersModal() {
       apiPost<{ provider: LlmProvider }>("/api/providers", body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["providers"] });
-      toast({ title: "Provider added", description: "Credentials stored obfuscated." });
+      toast({ title: "Provider added", description: "Credentials stored encrypted (AES-256-GCM)." });
       setForm(EMPTY_FORM);
       setShowForm(false);
     },
@@ -181,7 +181,7 @@ export function ProvidersModal() {
             LLM Providers (BYOK)
           </DialogTitle>
           <DialogDescription>
-            Bring your own model. Keys are obfuscated at rest and never exposed
+            Bring your own model. Keys are encrypted at rest and never exposed
             to the UI or sent to other LLMs.
           </DialogDescription>
         </DialogHeader>
@@ -427,7 +427,7 @@ export function ProvidersModal() {
         <DialogFooter className="flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-xs text-muted-foreground flex items-center gap-1.5">
             <ShieldCheck className="size-3.5" />
-            Secrets are obfuscated at rest and never sent to LLMs as plaintext.
+            Secrets are encrypted at rest (AES-256-GCM) and never sent to LLMs as plaintext.
             {totalCost > 0 && ` ${totalCost} provider(s) registered.`}
           </p>
           <Button variant="outline" onClick={() => setOpen(false)}>

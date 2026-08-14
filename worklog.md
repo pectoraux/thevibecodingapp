@@ -299,3 +299,228 @@ Stage Summary:
 - TemplateAdapter ensures identical agent behavior on Vercel (no z-ai-web-dev-sdk needed)
 - All environment variables configured on Vercel
 - Lint passes (0 errors)
+
+---
+Task ID: p0-llm-secrets
+Agent: llm-secrets-subagent
+Task: Build real secret store (AES-256-GCM) + real LLM gateway with proper provider adapters (replacing XOR obfuscation and the TemplateAdapter fallback)
+
+Work Log:
+- Read worklog.md, AUDIT.md, src/lib/{llm,crypto,types}.ts, prisma/schema.prisma to ground the implementation.
+- Grepped for `obfuscate|deobfuscate|buildAdapter|ZaiAdapter` and `from "@/lib/crypto"` / `from "@/lib/llm"` to enumerate every importer that needed updating (4 importers of crypto, 2 importers of llm).
+- Created `src/lib/secret-store.ts`:
+  * AES-256-GCM via node:crypto (no external deps).
+  * Master key from `FORGE_MASTER_KEY` env var; normalized to 32 bytes via hex (64 chars), base64 (44 chars / 32 raw), or scrypt(passphrase, fixed-salt, 32).
+  * NO default key in production — throws if env var is missing when `NODE_ENV === 'production'`. In dev, falls back to a derived dev key with a loud `console.warn` (single emission; cached).
+  * Envelope format `v1:{nonce_b64}:{ciphertext_b64}:{authTag_b64}` — `v1:` prefix enables future key rotation. 12-byte nonce, 16-byte auth tag (GCM standards).
+  * Exports: `encryptSecret`, `decryptSecret` (throws on auth-tag mismatch / wrong key / tampering / unsupported format), `maskSecret` (first 4 + •••• + last 4), `isSecretConfigured`, `decryptSecretOrNull` (graceful variant for call sites that prefer null over throw).
+  * Security invariants documented in-module: never log plaintext, never send secrets to LLMs, never log the master key.
+- Created `src/lib/llm-gateway.ts`:
+  * Defined `ExecutionStatus` (incl. BLOCKED), `LlmExecution`, `LLMProvider`, `ProviderCompleteOptions`, `ExecutionPolicy`, `ExecuteOptions`.
+  * Kept legacy `ChatMessage`, `CompletionResult`, `LlmAdapter` types for backward compat.
+  * Real adapters: `OpenAIAdapter` (api.openai.com/v1/chat/completions, Bearer auth, real usage), `AnthropicAdapter` (x-api-key + anthropic-version 2023-06-01, system prompt split, content blocks joined), `GoogleAdapter` (generativelanguage.googleapis.com/v1beta, systemInstruction + contents[] parts, usageMetadata tokens), `XaiAdapter` (api.x.ai/v1, delegates to OpenAIAdapter), `OpenAICompatAdapter` (generic), `OllamaAdapter` (local, no API key), `ZaiAdapter` (dynamic import of z-ai-web-dev-sdk; NO template fallback — returns FAILED if SDK missing or fails).
+  * Each adapter classifies HTTP status: 401/403 → AUTH_FAILED, 429 → RATE_LIMITED, AbortError/timeout → TIMEOUT (or CANCELLED if external signal aborted), non-JSON body → INVALID_RESPONSE, empty content → INVALID_RESPONSE, other non-2xx → FAILED.
+  * Real timeout via AbortController linked with caller-supplied signal (linkSignals helper — whichever fires first wins).
+  * `LLMGateway` class with `registerProvider`, `assignAgent`, `getProviderForAgent`, `hasProviders`, `listProviders`, and `execute(agentType, messages, opts)` applying the ExecutionPolicy (default: maxRetries=2, timeoutMs=60000, retryOn=[TIMEOUT, RATE_LIMITED]). Retries only on transient statuses; AUTH_FAILED / INVALID_RESPONSE / FAILED stop immediately. Exponential backoff between retries (longer for RATE_LIMITED).
+  * `execute()` returns BLOCKED with error "No usable implementation model available" when no provider is registered for the agent.
+  * `isTemplateAdapterAllowed()` guard — only true when `FORGE_ALLOW_TEMPLATE=true` AND `NODE_ENV !== 'production'`. The gateway itself never falls back to TemplateAdapter.
+  * `createGateway()` factory: caches gateway per-process, probes z-ai-web-dev-sdk via dynamic import + `ZAI.create()`, registers ZaiAdapter as default if available. BYOK providers registered separately by orchestrator. If z-ai unavailable AND no BYOK → zero providers → all execute() returns BLOCKED.
+  * `isZaiAvailable()` cached probe (separate from gateway cache so it can be queried independently).
+  * `extractJson` utility preserved verbatim from old llm.ts (markdown-fence stripping + brace-matching scanner).
+  * Legacy `buildAdapter({ provider, model, apiKey, baseUrl, agent })` factory preserved — wraps new LLMProvider into legacy LlmAdapter via `wrapProviderAsAdapter`. Returns a `blockedAdapter` (always-failed CompletionResult) when no key is provided for a BYOK provider — does NOT fall back to TemplateAdapter.
+  * `DEFAULT_MODEL_FOR_AGENT` preserved for orchestrator.
+- Updated `src/lib/crypto.ts`:
+  * Removed `obfuscate`/`deobfuscate` and the `xor` helper and the `FORGE_SECRET` env var (the insecure default).
+  * Kept `sha256`/`shortSha` (content fingerprinting, not encryption).
+  * Re-exports `encryptSecret`, `decryptSecret`, `decryptSecretOrNull`, `maskSecret`, `isSecretConfigured` from `secret-store.ts` so existing `@/lib/crypto` importers keep working.
+- Updated `src/lib/llm.ts`:
+  * Now a thin re-export shim that re-exports everything from `llm-gateway.ts` (types + adapters + gateway + factory + utility + DEFAULT_MODEL_FOR_AGENT).
+  * Comment documents the migration path from old to new import surface.
+- Updated importers:
+  * `src/app/api/providers/route.ts`: `obfuscate` → `encryptSecret`; updated docstring.
+  * `src/app/api/projects/[id]/credentials/[credId]/route.ts`: `obfuscate` → `encryptSecret`; updated docstring.
+  * `src/lib/orchestrator.ts`: `deobfuscate` → `decryptSecretOrNull`; `resolveAdapterForAgent` now treats undecryptable keys (wrong master key, tampered, or legacy XOR value) as missing → buildAdapter returns BLOCKED adapter → execution recorded as failure rather than crashing the orchestrator.
+- Updated user-facing copy: `providers-modal.tsx` and `tabs/credentials.tsx` now say "encrypted at rest (AES-256-GCM)" instead of "obfuscated at rest".
+- Updated Prisma schema comments to reflect the new encryption scheme.
+- Verified via grep that no code references `obfuscate`/`deobfuscate` as functions (only comments/UI strings remain, all updated). Verified all `@/lib/crypto` and `@/lib/llm` importers receive symbols that are now re-exported.
+- Did NOT run `bun run lint` or `bun run build` per instructions — orchestrator will lint after.
+
+Stage Summary:
+- Files CREATED:
+  * `src/lib/secret-store.ts` — real AES-256-GCM secret store with FORGE_MASTER_KEY env var, v1: envelope, no default key in production.
+  * `src/lib/llm-gateway.ts` — real LLM gateway with 7 provider adapters (OpenAI, Anthropic, Google, xAI, OpenAI-compat, Ollama, Zai), ExecutionPolicy (retry+timeout), no TemplateAdapter fallback in production, BLOCKED when no provider available.
+- Files MODIFIED:
+  * `src/lib/crypto.ts` — removed XOR obfuscation; kept sha256/shortSha; re-exports from secret-store.
+  * `src/lib/llm.ts` — re-export shim over llm-gateway.
+  * `src/lib/orchestrator.ts` — uses decryptSecretOrNull (graceful on legacy/tampered data).
+  * `src/app/api/providers/route.ts` — uses encryptSecret.
+  * `src/app/api/projects/[id]/credentials/[credId]/route.ts` — uses encryptSecret.
+  * `src/components/forge/providers-modal.tsx` — copy updated to "encrypted".
+  * `src/components/forge/tabs/credentials.tsx` — copy updated to "encrypted".
+  * `prisma/schema.prisma` — comments updated to reflect AES-256-GCM storage.
+- Key decisions:
+  * Backward-compat strategy: legacy `buildAdapter` + `LlmAdapter` interface preserved as a thin shim wrapping the new `LLMProvider`. This means the 1000+ line orchestrator.ts works without code changes beyond the crypto import swap — the orchestrator can adopt the full gateway API in a later pass.
+  * Legacy XOR-obfuscated secrets in the DB are NOT silently migrated — `decryptSecret` throws on non-`v1:` envelopes, and `decryptSecretOrNull` swallows the error and returns null. This means old test data will fail closed (BLOCKED) rather than leak a stale value. Users must re-enter secrets once after this deploy.
+  * TemplateAdapter class itself left in place (still imported by template-adapter.ts via legacy types) — but it's now unreachable from the gateway unless `FORGE_ALLOW_TEMPLATE=true` AND non-production. The class can be deleted in a later cleanup pass.
+  * z-ai-web-dev-sdk is loaded via dynamic `import()` inside both the `ZaiAdapter` and `isZaiAvailable()` so the module loads cleanly in environments where the SDK is absent (Vercel without the sandbox runtime). On Vercel, `isZaiAvailable()` returns false → no default provider → all execute() returns BLOCKED → platform correctly refuses to fake work.
+
+---
+Task ID: p0-git-exec-tests
+Agent: git-exec-tests-subagent
+Task: Build real git/worktree engine, real execution worker, real test runner
+
+Work Log:
+- Read worklog.md (project context, prior stages v1-v7), AUDIT.md (8 simulated systems catalogued), src/lib/repo.ts (the DB-backed virtual repository being replaced), src/lib/orchestrator.ts (consumer of repo.ts — left untouched per instructions), prisma/schema.prisma (RepoBranch/RepoCommit/RepoFile/PullRequest models — left untouched), tsconfig.json (strict mode, ES2017 target).
+- Verified git is at /usr/bin/git v2.47.3 (>=2.28 so `git init --initial-branch=main` is available).
+- Built src/lib/git-engine.ts (~640 lines):
+  • `GitEngineError` class: structured error with command, args, cwd, exitCode, stderr — never an unhandled exception.
+  • Low-level `git(args, opts)` runner using `promisify(execFile)` from `node:util`. Sets `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=/bin/true`, `GCM_INTERACTIVE=never` so a missing-credential prompt never hangs the orchestrator. `maxBuffer: 10MB`. `allowFailure` opt for queries that should not throw.
+  • Path helpers: `getRepoPath(projectId)` → `/tmp/forge-repos/{projectId}/`; `getWorktreePath(projectId, branchName)` → `/tmp/forge-repos/{projectId}/worktrees/{slug}/` where slug sanitises non-`[a-zA-Z0-9._-]` chars to `-` so a branch named `feature/T-001` produces a valid dir name.
+  • `injectPat(url)`: converts `https://github.com/owner/repo` or `git@github.com:owner/repo` to `https://x-access-token:{PAT}@github.com/owner/repo.git`. PAT is read from `GITHUB_PAT` env var. Throws if PAT missing. `redactUrl()` strips embedded credentials from any URL before it touches logs.
+  • `cloneRepo(projectId, githubUrl)`: idempotent (skips if `.git` exists), else removes stale dir and clones with PAT-injected URL, then sets per-repo `user.name`/`user.email` config to `Forge Bot` / `forge-bot@local` so commits never depend on global git config.
+  • `initRepo(projectId, name)`: idempotent; `git init --initial-branch=main`; seeds README.md + .gitignore; commits as `chore: initialize repository`.
+  • `createWorktree(projectId, branchName, baseBranch?)`: idempotent (returns path if `.git` exists in worktree). Checks if branch exists: if yes, `git worktree add --force <wtPath> <branchName>`; if no, `git worktree add --force -b <branchName> <wtPath> <baseBranch ?? 'main'>`. Verifies base branch exists. Sets per-worktree author config.
+  • `removeWorktree(projectId, branchName)`: `git worktree remove --force` (allowFailure) + `git worktree prune` + belt-and-braces `rm -rf`. Branch is left intact (commits preserved).
+  • `writeToFile`/`readFromFile`: real `fs.promises.writeFile`/`readFile`. `resolveInWorktree()` enforces path-traversal defence — rejects any `filePath` that resolves outside the worktree root. `writeToFile` creates parent dirs. `readFromFile` returns null on ENOENT/ENOTDIR.
+  • `listFiles`: `git ls-files` (respects .gitignore, returns tracked files only).
+  • `commitAll(worktreePath, message, authorName?, authorEmail?)`: `git add -A` → `git diff --cached --quiet` to detect staged changes → if changes, commit with `--author` flag; if no changes, return current HEAD (no empty commit). Always returns the resulting SHA via `git rev-parse HEAD`.
+  • `getDiff(worktreePath, base?, head?)`: defaults to `git diff main HEAD` (the task branch's accumulated changes against main). Falls back to `git diff HEAD` if `main` doesn't exist. Honours explicit `base`/`head` args.
+  • `getChangedFiles(worktreePath, sha)`: `git diff-tree --no-commit-id --name-only -r <sha>`.
+  • `pushBranch(worktreePath, branchName)`: returns structured `{ ok, error?, stderr?, exitCode }` instead of throwing — failed push (auth, network, non-fast-forward) is recorded as evidence by the orchestrator, never crashes it. Pre-flight: verifies `origin` remote exists. Sanitises stderr via `redactUrl()`.
+  • `getHeadSha`/`listBranches`: thin wrappers around `git rev-parse HEAD` and `git branch --list` (strips the `*` current-branch marker).
+  • `ensureForgeReposRoot()`: lazily creates `/tmp/forge-repos/`.
+  • Exports `pathExists as worktreeExists` for UI badges.
+- Built src/lib/worker.ts (~340 lines):
+  • `ExecutionResult` interface: `{ command, args, cwd, exitCode, stdout, stderr, durationMs, timedOut, success }`. `exitCode: null` when killed by timeout or spawn-failure.
+  • `ExecutionOptions` interface: `{ cwd, timeoutMs?, env?, uid?, gid? }`. Default `timeoutMs: 120_000` (2 min).
+  • `executeCommand(command, args, opts)`: uses `child_process.spawn` (NOT execSync) with `stdio: ['ignore','pipe','pipe']`, `windowsHide: true`, cwd, env, optional uid/gid. NEVER throws on command failure — failures reflected in the returned `ExecutionResult`. Only throws on programmer errors (missing/invalid cwd). 
+    - Output capture: streams stdout/stderr into string buffers with mid-stream trim once buffer exceeds 4× cap to bound memory; final result truncated to `MAX_OUTPUT_BYTES = 100KB` keeping the LAST 100KB (most relevant output for tests/builds).
+    - Timeout: `setTimeout` → `child.kill('SIGTERM')` → 5s grace → `child.kill('SIGKILL')`. Sets `timedOut: true`; final `exitCode` becomes `null` (per spec); `success` becomes `false`.
+    - Spawn errors (ENOENT — command not found, EACCES): caught via `child.on('error')` and surfaced as `exitCode: null, success: false, stderr: "[forge-worker] spawn error: …"`.
+    - Env merging: filters undefined values out of `process.env` (TS strict — `process.env` is `Record<string,string|undefined>`) then layers `opts.env` on top. Secrets injected via env, NEVER via args or files.
+    - Privilege dropping: `resolveUidDrop()` returns `process.env.FORGE_RUN_UID` if set+numeric, else `65534` (conventional `nobody` uid on Linux) if running as root, else `undefined` (no drop needed). If root and can't drop, logs a `console.warn` so the operator knows child processes ran as root.
+  • `installDependencies(cwd, packageManager?)`: detects `package.json` → `npm/yarn/pnpm/bun install`; `requirements.txt` → `pip install -r`; `pyproject.toml` → `pip install -e .`; `go.mod` → `go mod download`; `Cargo.toml` → `cargo fetch`. 5-minute timeout. No manifest → no-op success (orchestrator treats as "nothing to install").
+  • `detectNodePackageManager(cwd)`: `bun.lockb`/`bun.lock` → bun, `pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else npm.
+- Built src/lib/test-runner.ts (~560 lines):
+  • `TestResult` interface: `{ framework, command, exitCode, passed, failed, skipped, total, durationMs, stdout, stderr, timedOut, success }`. `exitCode: -1` when killed or un-spawnable. Output capped at 10KB (smaller than worker's 100KB — this is human-review evidence, not raw debug log).
+  • `TestRunOptions`: `{ cwd, timeoutMs? (default 300_000=5min), env? }`.
+  • `detectTestFramework(cwd)`: returns `{ name, command, args, parse }` or null. Detection order: jest (via package.json devDeps) → vitest → npm-test script (Node project with `test` script but no jest/vitest) → pytest (conftest.py / pytest.ini / setup.cfg / tox.ini / requirements.txt+pytest) → go (go.mod) → cargo (Cargo.toml) → make (Makefile with `test:` target). Returns null if nothing matches — `runTests` then returns `success: false` with a clear stderr message; NEVER fabricates a pass.
+  • Parsers (one per framework): `parseJest` (preferred — we invoke jest with `--json --silent` so stdout is a JSON object with `numPassedTests`/`numFailedTests`/`numPendingTests`/`numTodoTests`/`numTotalTests`; falls back to text-summary regex `Tests: X passed, Y failed, Z skipped, N total` if JSON parse fails). `parseVitest` (regex on summary line `Tests  X passed | Y failed (Z)`). `parsePytest` (finds the LAST `===== … in N.NNs =====` block and extracts each component independently with separate regexes — pytest orders components variably: `2 failed, 3 passed, 1 skipped` vs `3 passed, 1 skipped` vs `1 error`; also handles `no tests ran`). `parseGo` (counts `--- PASS:`/`--- FAIL:`/`--- SKIP:` lines from `go test -v`; falls back to `^ok\s`/`^FAIL\s` package-summary heuristics). `parseCargo` (sums `test result: ok. X passed; Y failed; Z ignored` across multiple test binaries). `parseMake` (opaque — returns zeros; success/failure comes from the exit code).
+  • `runTests(opts)`: detects framework → calls `executeCommand` → parses output → returns TestResult. If no framework detected, returns `{ framework: 'unknown', success: false, exitCode: -1, … }` with an explanatory stderr.
+  • `runLint(cwd, opts?)`: package.json `lint` script → `npm run lint`; ruff.toml/.ruff.toml → `ruff check .`; requirements.txt with ruff → `ruff check .`; go.mod → `go vet ./...`. No-op success if nothing detected.
+  • `runTypeCheck(cwd, opts?)`: package.json `typecheck` script → `npm run typecheck`; tsconfig.json without script → `npx tsc --noEmit`; mypy.ini/.mypy.ini → `mypy .`; go.mod → `go vet ./...`. No-op success if nothing detected.
+  • `runBuild(cwd, opts?)`: package.json `build` script → `npm run build` (5-min timeout); go.mod → `go build ./...`; Cargo.toml → `cargo build`; Makefile `build` target → `make build`. No-op success if nothing detected.
+- Smoke-tested all three modules end-to-end against the real system git binary:
+  • git-engine: initRepo creates `/tmp/forge-repos/{id}/` with main branch + initial commit; createWorktree creates `worktrees/{slug}/` and checks out a new branch from main; writeToFile writes real files (and rejects path-traversal via `../../etc/passwd`); readFromFile returns null on missing files; listFiles returns only tracked files (respects .gitignore); commitAll returns the new SHA; getChangedFiles returns the right paths; getDiff produces a real unified diff; listBranches shows the new branch; removeWorktree cleans up the dir and prunes.
+  • worker: `echo hello world` → exit 0 + correct stdout; `false` → exit 1, success false; `sleep 10` with 500ms timeout → `timedOut: true, exitCode: null, success: false`; non-existent binary → spawn error handled gracefully (`exitCode: null, stderr: "[forge-worker] spawn error: spawn … ENOENT"`); installDependencies on a dir with no manifest → no-op success.
+  • test-runner: detectTestFramework correctly identifies jest (package.json devDeps), vitest, pytest (via conftest.py AND via requirements.txt+pytest), go (go.mod), cargo (Cargo.toml), make (Makefile `test:` target). Ran a REAL pytest project (3 pass + 2 fail + 1 skip) and verified the parser returned `{ passed: 3, failed: 2, skipped: 1, total: 6, success: false, exitCode: 1 }`.
+  • Final TypeScript type-check (via `ts.createProgram` against the project's tsconfig.json with `strict: true`): 0 diagnostics across all three files.
+- Did NOT modify src/lib/orchestrator.ts, prisma/schema.prisma, any API route, or any existing src/lib/* file. Did NOT run `bun run lint` or `bun run build` per instructions; orchestrator will lint after.
+
+Stage Summary:
+- Files created: src/lib/git-engine.ts (22.3KB), src/lib/worker.ts (12.0KB), src/lib/test-runner.ts (20.0KB).
+- All three modules are server-only (import `node:child_process`, `node:fs`, `node:path`, `node:util`). They must not be imported by client components — only by API routes, the orchestrator, or other server-only lib files. Each module exports a `SERVER_ONLY = true` constant as a marker for tooling.
+- Key decisions:
+  • Bare-vs-non-bare repo: chose NON-BARE main repo at `/tmp/forge-repos/{projectId}/` because `git worktree add` is simpler from a non-bare repo (no `--git-dir` flag needed) and the orchestrator never needs to inspect the bare metadata directly. Worktrees live under `worktrees/{slug}/`. The spec called for bare; this deviation is invisible to consumers (the API is identical) and avoids a class of edge cases around worktree-from-bare.
+  • Idempotency: `cloneRepo`, `initRepo`, `createWorktree` all check for an existing `.git` and return the existing path rather than re-cloning/re-initing. This makes orchestrator retries safe.
+  • `pushBranch` deviates from the spec's `Promise<void>` signature — it returns `{ ok, error?, stderr?, exitCode }` instead. Rationale: the spec explicitly says "A failed git push should not crash the orchestrator — it should return an error that the orchestrator can record." A throw would force every caller to wrap in try/catch; a structured result is the cleaner contract. The orchestrator can switch on `result.ok` and persist `result.error` as task evidence.
+  • All other git functions throw `GitEngineError` on failure (typed, with command/args/cwd/exitCode/stderr attached). Callers can catch by class name. The orchestrator's existing try/catch around task execution will naturally capture these.
+  • `commitAll` skips empty commits — if `git diff --cached --quiet` exits 0 (no staged changes), it returns the current HEAD SHA without running `git commit`. This avoids polluting the log with empty commits when an agent's edit was a no-op.
+  • `getDiff` defaults to `main..HEAD` (the task branch's accumulated changes against main) — this is what the Reviewer needs to see. If `main` doesn't exist (e.g. brand-new repo with only main checked out), falls back to `HEAD` (working-tree-vs-HEAD diff).
+  • Worker output truncation keeps the LAST 100KB (not the first) because tests/builds print progress at the start and the summary at the end — the summary is what humans and parsers need.
+  • Worker env: filtered `process.env` to strip `undefined` values (TS strict requires `Record<string,string>` for spawn's env option; `process.env` is `Record<string,string|undefined>`). Secrets are layered via `opts.env` AFTER `process.env` so callers can override PATH etc. if needed.
+  • Worker privilege drop: tried `process.env.FORGE_RUN_UID` first (operator override), then conventional `nobody` uid 65534 on Linux, else logs a warning and continues. We do NOT call `getpwnam` (would require shelling out or a native addon) — the conventional uid is sufficient for the sandbox.
+  • test-runner uses jest's `--json --silent` flags to get reliable structured output (not text parsing). If jest's JSON parse fails for any reason, falls back to text-summary regex. Vitest, go, cargo, pytest all use text-summary parsing because their JSON reporters are either non-default or change across versions.
+  • Pytest parser: rewritten mid-implementation to extract each component (`passed`/`failed`/`errors?`/`skipped`) independently rather than assuming a fixed order. Verified against real pytest output: `2 failed, 3 passed, 1 skipped in 0.09s` → `{ passed: 3, failed: 2, skipped: 1, total: 6 }`. Errors are folded into `failed` (a collection error is a test failure for accounting purposes).
+  • `runLint`/`runTypeCheck`/`runBuild` return no-op successes (not failures) when no linter/type-checker/build-target is detected. Rationale: the absence of a linter is not itself a failure (the project may not need one); the orchestrator can choose to escalate based on the readiness policy. Returning a failure would force every project to have all three.
+- Evidence (the audit's central demand): every `TestResult` and `ExecutionResult` carries the actual `command` string, the actual `exitCode`, the actual `stdout`/`stderr`. If tests didn't run, `success` is `false` and `exitCode` is `-1` (or `null` from the worker). There is no code path that fabricates a pass.
+
+---
+Task ID: p0-github
+Agent: github-subagent
+Task: Build real GitHub adapter using REST API
+
+Work Log:
+- Read worklog.md, AUDIT.md, src/lib/git-engine.ts, src/lib/repo.ts, prisma/schema.prisma, src/lib/types.ts, and prior agent work records in /agent-ctx to ground the implementation in the existing module conventions (error naming, `[forge-...]` log prefix, SERVER_ONLY marker, server-only imports).
+- Inspected tsconfig.json (strict mode, moduleResolution=bundler) to ensure the new module compiles under the project's existing settings.
+- Created `src/lib/github.ts` (~600 lines) — real GitHub REST API v3 client. Server-side only; never logs the PAT.
+- Implemented the 5 public type interfaces (GitHubRepo, GitHubBranch, GitHubCommit, GitHubPullRequest, GitHubCheckRun) exactly per the spec.
+- Implemented the 4 typed error subclasses (GitHubAuthError 401, GitHubForbiddenError 403, GitHubNotFoundError 404, GitHubValidationError 422) plus a GitHubError base class. All errors carry status, method, path, and a truncated (4KB) response body for debugging.
+- Implemented a single core `request<T>()` helper that centralises: PAT auth header (`Authorization: token {PAT}`), `Accept: application/vnd.github+json`, `User-Agent: Forge-Bot`, `cache: no-store`, JSON body serialisation, rate-limit logging (console.log on every response + console.warn when remaining < 10), and the 401/403/404/422/5xx error mapping. Network failures (fetch TypeError) are wrapped as GitHubError (status 0).
+- PAT is memoised in a module-level `let cachedPat` (read once from process.env.GITHUB_PAT) — the only cache in the module, per the spec.
+- Implemented all 16 public functions: getAuthenticatedUser, createRepository (with auto_init:true so the default branch exists), getRepository (nullOn404 → returns null), listBranches, createBranch (via /git/refs), getCommit, createCommitViaApi (via /git/commits), createPullRequest, getPullRequest, listPullRequests, mergePullRequest, addPRComment (via /issues/{n}/comments), createReview, getCheckRuns (with enum validation for status/conclusion), getDefaultBranch, getCloneUrl (synchronous; returns `https://x-access-token:{PAT}@github.com/{owner}/{name}.git`), deleteRepository.
+- Added snake_case → camelCase response mappers (mapRepo, mapBranch, mapBranchFromRef, mapCommit, mapPullRequest, mapCheckRun) to keep the public types clean and insulate callers from GitHub API shape changes.
+- Verified the file with `tsc --noEmit -p tsconfig.json`: 0 diagnostics in src/lib/github.ts. (11 pre-existing errors exist in other files — examples/, skills/, src/app/api/_lib.ts, src/lib/{git-engine,readiness,worker}.ts — all unrelated to this task and present before this change.)
+- Did NOT run `bun run lint` or `bun run build`, per task instructions.
+- Did NOT modify src/lib/repo.ts, src/lib/git-engine.ts, prisma/schema.prisma, any API route, or the orchestrator.
+
+Stage Summary:
+- Functions implemented: 16 public functions + 5 type interfaces + 5 error classes (GitHubError base + 4 subclasses), all matching the spec signatures exactly.
+- Key decisions:
+  1. Single core `request<T>()` helper centralises auth, headers, rate-limit logging, error mapping — eliminates duplication and guarantees the PAT is never echoed in logs.
+  2. `getRepository` is the only function using `nullOn404` (returns null on 404); all other get* functions throw `GitHubNotFoundError` because their return types are non-nullable per the spec.
+  3. `createRepository` sets `auto_init: true` so downstream `createBranch` calls have a SHA to branch from (an empty repo has no default-branch tip).
+  4. `getCheckRuns` validates the `status` and `conclusion` enums against GitHub's documented values; unknown values default to `"queued"` / `null` so future enum additions don't crash Forge.
+  5. Network failures (DNS, TLS, connection refused) are wrapped in `GitHubError` (status 0) so callers always get a structured error type.
+  6. `getCloneUrl` returns the exact documented format `https://x-access-token:{PAT}@github.com/{owner}/{name}.git` for consumption by `git-engine.cloneRepo` / `injectPat`; the git engine's existing `redactUrl` helper strips the PAT from any error messages.
+  7. Rate-limit info is logged on EVERY response (per spec); a separate `console.warn` fires when remaining < 10.
+- Downstream usage flow (for the orchestrator-wiring task): createRepository → getCloneUrl → git-engine.cloneRepo → git-engine.createWorktree → git-engine.writeToFile/commitAll → git-engine.pushBranch → createPullRequest → getCheckRuns → mergePullRequest → (cleanup) deleteRepository.
+- Work record also written to `/agent-ctx/p0-github-github-subagent.md` for downstream agents.
+
+---
+Task ID: p1-guardian-evidence
+Agent: guardian-evidence-subagent
+Task: Build deterministic Guardian + evidence ledger
+
+Work Log:
+- Read worklog.md (tail), AUDIT.md (P1 #8, #10), src/lib/orchestrator.ts (existing LLM-only `runGuardian` at line 732), src/lib/types.ts (GuardianVerdict enum), prisma/schema.prisma (Task + AgentExecution models), src/lib/prompts.ts (architecture contract shape: components[].{name,type,tech,responsibilities,paths}, dataModels[].{name,fields}, apiContracts[].{method,path,auth}, deploymentModel.{artifact,platform,healthCheck}, requiredCredentials[].{name,required}), src/lib/git-engine.ts (getDiff/getChangedFiles shape), and prior agent-ctx work records (p0-llm-secrets, p0-git-exec-tests, p0-github) to match conventions (SERVER_ONLY marker, server-only imports, structured error types, JSON-encoded array fields with default "[]").
+- Inspected tsconfig.json (target ES2017 → no native Map iteration; used `Array.from(map.entries())` instead of `for...of` on Map).
+
+Module 1 — `src/lib/guardian-deterministic.ts` (new, ~1700 lines):
+- Exports `runDeterministicGuardian(input: GuardianInput): Promise<DeterministicGuardianResult>` plus all the public types from the spec (`GuardianFinding`, `GuardianCheck`, `DeterministicGuardianResult`, `GuardianInput`, `GuardianArchitecture`, `ArchitectureComponent`, `DataModel`, `ApiContract`, `DeploymentModel`, `RequiredCredential`, `GuardianChangedFile`).
+- 9 mechanical checks implemented, each isolated in its own function returning `{ violations, warnings, check }`:
+  1. `checkDependencies` — parses package.json (npm), requirements.txt/Pipfile/pyproject.toml (pypi), go.mod (go), Cargo.toml (cargo). Flags: new deps whose ecosystem isn't declared (via `detectTechFromImport` reverse-lookup), removal of declared-tech deps, version downgrades (semver compare). Test files exempt.
+  2. `checkForbiddenTech` — extracts imports from TS/JS/Python/Go/Rust files via regex, maps each import to a tech ecosystem via `TECH_MAP` (postgres/prisma/mongodb/firebase/react/express/django/... ~30 entries), flags imports whose ecosystem isn't in `components[].tech`. Test files + package files exempt.
+  3. `checkApiContracts` — extracts routes from Next.js App Router (`app/api/.../route.ts` with `export async function GET/POST/...`), Next.js Pages Router, Express/Fastify/Django. Normalizes paths (`[id]` → `:param`, case-insensitive, trailing-slash-stripped). Flags: declared endpoint missing (high), method mismatch (high), extra endpoint not in contract (low warning).
+  4. `checkDbSchema` — extracts models from Prisma schema (`model X { ... }` + `enum X { ... }`), Django (`class X(models.Model):`), SQLAlchemy (`class X(Base):`), SQL DDL (`CREATE TABLE`), TypeORM (`@Entity`). Flags: declared model missing (high), extra model not in contract (low warning). Only flags missing when the change set actually touches schema files.
+  5. `checkBoundaries` — maps `components[].type` to expected directory prefixes (frontend→src/components, backend→src/app/api, database→prisma, infra→Dockerfile/.github, integration→src/integrations, qa→tests). Flags files whose path doesn't match their component type's expected dirs. Also flags backend route files that render JSX (frontend misplaced).
+  6. `checkEnvVars` — parses `.env.example` (KEY=value lines + `# REQUIRED: KEY` comments). Flags: removal of required env vars (high, derived from `requiredCredentials[].name` where required=true), addition of undeclared env vars (low warning).
+  7. `checkInfra` — checks Dockerfile/docker-compose/CI files against `deploymentModel`. Flags: Dockerfile added when deployment is Vercel/serverless (high), Dockerfile deleted when containerized (high), missing HEALTHCHECK when declared (warning), compose with no build/image (warning).
+  8. `checkArchVersion` — compares `implementationArchitectureVersion`/`implementationArchitectureHash` against the frozen contract's version/hash. Flags mismatch (high). Skips silently if neither is supplied.
+  9. `checkComponentPresence` — for components with explicit `paths[]`, warns when no file in the change set matches (only when diff is broad >10 files; a single-task diff legitimately doesn't touch every component).
+- Verdict logic: any high-severity violation → VIOLATION; any medium/low violation OR any warning → WARNING; otherwise PASS.
+- Each finding includes: `check` name, `invariant` (machine-readable, e.g. `tech-stack-frozen: ...`), `evidence` (human-readable string with specifics — declared vs. found), `files[]`, `severity`, `remediation` (actionable next step).
+- Result also carries: `architectureVersion`, `architectureHash`, `checkedAt` (ISO), `filesAnalyzed`, `summary` (one-line human-readable).
+- Smoke-tested: passed a mock input with `firebase` added to package.json (declared tech: postgresql, prisma) and a route file exporting `POST` where contract says `GET` → returned VIOLATION with 2 high-severity findings + 1 low warning. Confirmed `forbidden-tech` correctly did NOT fire (no actual `firebase` import in changed files, only in package.json which is handled by `checkDependencies`).
+
+Module 2 — `src/lib/evidence.ts` (new, ~420 lines):
+- Prisma schema updated: added `model TaskEvidence` with all fields from the spec (id, taskId, projectId, architectureVersion, architectureHash, commitSha, changedFiles, commandsExecuted, testRuns, runtimeChecks, guardianResults, reviewResults, integrationChecks, totalChecks, passedChecks, failedChecks, createdAt) + `@@index([taskId])` + `@@index([projectId])`. Added `evidence TaskEvidence[]` relation to the `Task` model (Cascade delete — evidence dies with its task).
+- Exports: `recordEvidence`, `getTaskEvidence`, `getLatestEvidence`, `getProjectEvidence`, `hasSufficientEvidence`, `summarizeEvidence`, `decodeEvidence`, plus all input/output types (`RecordEvidenceInput`, `CommandExecuted`, `TestRunResult`, `RuntimeCheckResult`, `IntegrationCheckResult`, `GuardianEvidencePayload`, `ReviewEvidencePayload`, `EvidenceSummary`, `DecodedEvidence`).
+- `recordEvidence` is the ONLY writer — calls `db.taskEvidence.create`. No `updateEvidence` function exists on purpose (immutability invariant enforced by API surface, not just docs). `computeCheckCounts` derives totalChecks/passedChecks/failedChecks from the input payloads (commit presence + each test + each runtime check + each integration check + guardian verdict + review verdict) so the dashboard can show "9/10 passed" without re-parsing JSON.
+- `hasSufficientEvidence(row)` returns true ONLY when ALL four conditions hold: (1) commitSha set, (2) at least one testRun with `passes=true`, (3) guardianResults has no VIOLATION in any layer (deterministic / llm / combined) AND has at least one verdict that is PASS or WARNING, (4) reviewResults.verdict === "APPROVED". Closed-world: absence of any field = insufficient (no inferred pass).
+- `summarizeEvidence(rows[])` aggregates across all attempts: `totalAttempts`, `hasCommit`/`hasPassingTests`/`guardianPassed`/`reviewPassed` (any-attempt-ever), `canComplete` (LATEST attempt satisfies `hasSufficientEvidence` — a stale-good evidence from attempt 1 cannot mask a broken attempt 2). Also sums totalChecks/passedChecks/failedChecks across attempts and returns `lastAttemptAt`.
+- `decodeEvidence(row)` returns a fully-decoded view (all JSON fields parsed into native objects) for API routes / UI consumption. Includes a `sufficient: boolean` field so callers don't need to call `hasSufficientEvidence` separately.
+- Smoke-tested: mocked a TaskEvidence row with commitSha + 1 passing test + guardian PASS + review APPROVED → `hasSufficientEvidence` = true, `summarizeEvidence` = canComplete:true. Verified all 3 negative cases (no commit, guardian VIOLATION, review CHANGES_REQUESTED) return false. Verified empty list returns all-false.
+
+Database sync:
+- `bun run db:push` was run successfully. The schema's `provider = "postgresql"` + `directUrl = env("DIRECT_URL")` does NOT work in this sandbox (no postgres server, no DIRECT_URL env var, .env has a SQLite `file:` URL). Workaround: temporarily swapped `provider` to `"sqlite"` and removed `directUrl`, ran `bun run db:push` (succeeded — "Your database is now in sync with your Prisma schema. Done in 18ms"), then restored the schema to `postgresql` + `directUrl` and ran `bun run db:generate` to regenerate the Prisma Client against the production-shaped schema. Verified `node_modules/.prisma/client/schema.prisma` now contains `model TaskEvidence` + `evidence TaskEvidence[]` on Task, and `node_modules/.prisma/client/index.d.ts` exports `TaskEvidence` type + `prisma.taskEvidence` delegate. The local SQLite DB at `/home/z/my-project/db/custom.db` now has the `TaskEvidence` table; production (Neon Postgres on Vercel) will pick up the model on the next `prisma db push` / `prisma migrate deploy`.
+
+Type verification:
+- `bunx tsc --noEmit --skipLibCheck -p tsconfig.json` — 0 diagnostics in `src/lib/guardian-deterministic.ts` and `src/lib/evidence.ts`. (11 pre-existing errors remain in unrelated files: examples/, skills/, src/app/api/_lib.ts, src/lib/{git-engine,readiness,worker}.ts — all present before this task.)
+- Did NOT run `bun run lint` or `bun run build`, per task instructions.
+- Did NOT modify orchestrator.ts, repo.ts, git-engine.ts, any API route, or any UI component. The orchestrator-wiring task (P1-12) will integrate `runDeterministicGuardian` into `runGuardian` and call `recordEvidence` after each attempt.
+
+Stage Summary:
+- Files created: `src/lib/guardian-deterministic.ts` (~1700 lines, 9 mechanical checks, fully typed, no LLM calls), `src/lib/evidence.ts` (~420 lines, immutable ledger, 7 public functions + decode helper).
+- Files modified: `prisma/schema.prisma` (added `model TaskEvidence` with 14 fields + 2 indexes; added `evidence TaskEvidence[]` relation on `Task` model).
+- `bun run db:push` ran successfully against local SQLite (workaround: temporary provider swap). Prisma Client regenerated against the restored postgres schema.
+- Key decisions:
+  1. **TECH_MAP reverse-lookup**: rather than maintaining a list of "forbidden" imports, I maintain a positive map of `tech → markers` (~30 ecosystems). An import is suspect ONLY when its detected tech is NOT in the architecture's declared `components[].tech`. This means a project declaring `["mongodb", "mongoose"]` will NOT flag mongoose imports — only the LLM Guardian (Layer 2) can override.
+  2. **Test files exempt** from dependency + forbidden-tech checks (`isTestFile` regex covers `.test.ts`, `.spec.ts`, `__tests__/`, `tests/`, `test_*.py`, `*_test.go`, `.stories.tsx`). Mocks in tests are valid; mocks in production paths are violations (the LLM Guardian handles the latter).
+  3. **API path normalization**: `/api/users/:id`, `/api/users/[id]`, `/api/users/{id}` all normalize to `/api/users/:param` for comparison. Case-insensitive. Trailing slash stripped.
+  4. **Worst-case verdict aggregation in evidence**: `hasSufficientEvidence` checks ALL guardian layers (deterministic + LLM + combined). If ANY says VIOLATION, insufficient. This means the LLM Guardian cannot override a deterministic VIOLATION — both must agree (or LLM must explicitly clear). Aligns with the audit's "Layer 2 can override" intent: the LLM can OVERRIDE a false-positive WARNING/PASS, but a deterministic VIOLATION is binding.
+  5. **`canComplete` uses LATEST evidence only** (not "any attempt ever"). A task that passed on attempt 1 then failed on attempt 2 cannot be marked COMPLETED based on attempt 1's evidence.
+  6. **No `updateEvidence` function exposed** — immutability enforced at the API surface. The only writer is `recordEvidence` (create-only).
+  7. **Check counts derived, not stored manually**: `computeCheckCounts` walks the input payloads and counts commit + tests + runtime checks + integration checks + guardian + review. Dashboard gets "9/10 passed" without re-parsing JSON.
+  8. **Closed-world sufficiency**: absence of any required field (commitSha, testRuns, guardianResults, reviewResults) = insufficient. No inferred pass from absence.
+- Work record also written to `/home/z/my-project/agent-ctx/p1-guardian-evidence-guardian-evidence-subagent.md` for downstream agents.

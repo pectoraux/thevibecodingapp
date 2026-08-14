@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { obfuscate } from "@/lib/crypto";
+import { encryptSecret } from "@/lib/crypto";
 import { requireUserId } from "@/lib/auth";
 import { stripCredential, readJsonBody } from "../../../../_lib";
 
 // PATCH /api/projects/[id]/credentials/[credId]
 //   Body: { value, environment? }
-//   Side effect: obfuscates value, sets configured=true, validated=true (basic non-empty check)
+//   Side effect: encrypts value (AES-256-GCM), sets configured=true, validated=true (basic non-empty check)
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string; credId: string }> }) {
   try {
     const userId = await requireUserId();
@@ -33,7 +33,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     const updated = await db.credential.update({
       where: { id: credId },
       data: {
-        value: obfuscate(value),
+        value: encryptSecret(value),
         configured: true,
         validated: trimmed.length > 0,
         ...(environment ? { environment } : {}),

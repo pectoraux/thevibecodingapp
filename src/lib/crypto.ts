@@ -1,39 +1,27 @@
-// Forge — secret obfuscation helper.
-// NOT real encryption. Rotating XOR + base64 so secrets are not stored as
-// plaintext in the SQLite DB and never accidentally logged. Swap for a real
-// KMS in production.
+// Forge — content hashing helpers.
+//
+// The reversible XOR obfuscation that used to live here has been replaced by
+// the real AES-256-GCM secret store in `./secret-store.ts`. This module now
+// only contains:
+//   - sha256 / shortSha   — content fingerprinting (NOT cryptographic; used
+//                            for architecture version hashes)
+//   - re-exports of encryptSecret / decryptSecret / maskSecret /
+//     isSecretConfigured / decryptSecretOrNull for backward compatibility
+//     with callers that import from "@/lib/crypto".
+//
+// All real secret storage MUST go through `encryptSecret` / `decryptSecret`.
 
-const SECRET = process.env.FORGE_SECRET || "forge-local-dev-secret-rotate-key";
+export {
+  encryptSecret,
+  decryptSecret,
+  decryptSecretOrNull,
+  maskSecret,
+  isSecretConfigured,
+} from "@/lib/secret-store";
 
-function xor(input: string, key: string): string {
-  let out = "";
-  for (let i = 0; i < input.length; i++) {
-    out += String.fromCharCode(input.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-  }
-  return out;
-}
-
-export function obfuscate(plain: string): string {
-  try {
-    return Buffer.from(xor(plain, SECRET), "binary").toString("base64");
-  } catch {
-    return "";
-  }
-}
-
-export function deobfuscate(stored: string): string {
-  try {
-    return xor(Buffer.from(stored, "base64").toString("binary"), SECRET);
-  } catch {
-    return "";
-  }
-}
-
-export function maskSecret(value: string | null | undefined): string {
-  if (!value) return "";
-  if (value.length <= 8) return "•".repeat(value.length);
-  return value.slice(0, 4) + "•".repeat(Math.max(4, value.length - 8)) + value.slice(-4);
-}
+// ---------------------------------------------------------------------------
+// Content fingerprinting (NOT cryptographic — used for architecture versions)
+// ---------------------------------------------------------------------------
 
 export function sha256(input: string): string {
   // Lightweight FNV-1a + djb2 hybrid hash for content fingerprinting.

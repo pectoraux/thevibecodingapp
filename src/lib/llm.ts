@@ -1,285 +1,47 @@
-// Forge — LLM provider abstraction.
+// Forge — LLM provider abstraction (re-export shim).
 //
-// All agent execution flows through this module so we can swap providers
-// (OpenAI, Anthropic, Google, xAI, local) without touching the orchestration
-// engine. The default adapter uses z-ai-web-dev-sdk which is the in-process
-// LLM available in this sandbox.
+// The real LLM gateway now lives in `./llm-gateway.ts`. This file re-exports
+// the public API so existing callers that import from "@/lib/llm" keep
+// working without code changes.
+//
+// Migration path:
+//   - Old: `import { buildAdapter, ZaiAdapter, extractJson, type ChatMessage } from "@/lib/llm"`
+//   - New: `import { LLMGateway, createGateway, extractJson, type LLMProvider } from "@/lib/llm-gateway"`
+//
+// The legacy `buildAdapter` + `LlmAdapter` interface are kept here for
+// backward compatibility with the orchestrator.
 
-import ZAI from "z-ai-web-dev-sdk";
-import type { AgentType } from "@/lib/types";
-
-// ---------------------------------------------------------------------------
-// Provider registry
-// ---------------------------------------------------------------------------
-
-export interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
-}
-
-export interface CompletionResult {
-  content: string;
-  tokensInput: number;
-  tokensOutput: number;
-  model: string;
-  durationMs: number;
-  success: boolean;
-  error?: string;
-}
-
-export interface LlmAdapter {
-  kind: string;
-  model: string;
-  complete(messages: ChatMessage[]): Promise<CompletionResult>;
-}
-
-// z-ai-web-dev-sdk is the in-process LLM available in the space-z.ai sandbox.
-// On Vercel (or any non-sandbox environment) it is unavailable, so we fall
-// back to the TemplateAdapter which produces equivalent structured outputs
-// deterministically. This ensures the app behaves identically everywhere.
-let _zai: any = null;
-let _zaiChecked = false;
-let _zaiAvailable = false;
-
-async function getZai() {
-  if (!_zaiChecked) {
-    _zaiChecked = true;
-    try {
-      _zai = await ZAI.create();
-      _zaiAvailable = true;
-    } catch {
-      _zai = null;
-      _zaiAvailable = false;
-    }
-  }
-  return _zai;
-}
-
-// Rough token estimate (~4 chars/token).
-function estimateTokens(text: string): number {
-  return Math.ceil((text || "").length / 4);
-}
-
-// ---------------------------------------------------------------------------
-// z-ai adapter (default; uses sandbox LLM, falls back to TemplateAdapter)
-// ---------------------------------------------------------------------------
-
-export class ZaiAdapter implements LlmAdapter {
-  kind = "zai";
-  private fallback: TemplateAdapter | null = null;
-  private fallbackInit = false;
-
-  constructor(public model = "glm-4.6") {}
-
-  private async getFallback(): Promise<TemplateAdapter> {
-    if (!this.fallbackInit) {
-      this.fallbackInit = true;
-      const { TemplateAdapter } = await import("@/lib/template-adapter");
-      this.fallback = new TemplateAdapter("template-v1");
-    }
-    return this.fallback!;
-  }
-
-  async complete(messages: ChatMessage[]): Promise<CompletionResult> {
-    const start = Date.now();
-
-    // Try z-ai first (available in space-z.ai sandbox).
-    const zai = await getZai();
-    if (_zaiAvailable && zai) {
-      try {
-        const adapted = messages.map((m) => ({
-          role: m.role === "system" ? ("assistant" as const) : m.role,
-          content: m.content,
-        }));
-        const completion = await zai.chat.completions.create({
-          messages: adapted,
-          thinking: { type: "disabled" },
-        });
-        const content = completion.choices?.[0]?.message?.content ?? "";
-        const tokensInput = estimateTokens(
-          messages.map((m) => m.content).join("\n")
-        );
-        const tokensOutput = estimateTokens(content);
-        return {
-          content,
-          tokensInput,
-          tokensOutput,
-          model: this.model,
-          durationMs: Date.now() - start,
-          success: true,
-        };
-      } catch {
-        // Fall through to template adapter.
-      }
-    }
-
-    // Fallback: TemplateAdapter (used on Vercel or when z-ai fails).
-    const fallback = await this.getFallback();
-    const result = await fallback.complete(messages);
-    // Override the model name so the UI shows which backend was used.
-    return { ...result, model: result.success ? "template-v1" : this.model };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Generic OpenAI-compatible adapter (used when BYOK supplies a real key+baseURL)
-// ---------------------------------------------------------------------------
-
-export class OpenAICompatAdapter implements LlmAdapter {
-  kind = "openai-compat";
-  constructor(
-    public model: string,
-    private apiKey: string,
-    private baseUrl: string
-  ) {}
-
-  async complete(messages: ChatMessage[]): Promise<CompletionResult> {
-    const start = Date.now();
-    try {
-      const res = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          messages,
-          temperature: 0.2,
-        }),
-      });
-      if (!res.ok) {
-        return {
-          content: "",
-          tokensInput: 0,
-          tokensOutput: 0,
-          model: this.model,
-          durationMs: Date.now() - start,
-          success: false,
-          error: `HTTP ${res.status}: ${await res.text()}`,
-        };
-      }
-      const data = await res.json();
-      const content = data?.choices?.[0]?.message?.content ?? "";
-      return {
-        content,
-        tokensInput: data?.usage?.prompt_tokens ?? estimateTokens(messages.map((m) => m.content).join("\n")),
-        tokensOutput: data?.usage?.completion_tokens ?? estimateTokens(content),
-        model: this.model,
-        durationMs: Date.now() - start,
-        success: true,
-      };
-    } catch (err: any) {
-      return {
-        content: "",
-        tokensInput: 0,
-        tokensOutput: 0,
-        model: this.model,
-        durationMs: Date.now() - start,
-        success: false,
-        error: err?.message ?? String(err),
-      };
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Adapter factory
-// ---------------------------------------------------------------------------
-
-export function buildAdapter(opts: {
-  provider: string;
-  model: string;
-  apiKey?: string;
-  baseUrl?: string;
-}): LlmAdapter {
-  const { provider, model, apiKey, baseUrl } = opts;
-  if (provider === "zai") {
-    return new ZaiAdapter(model || "glm-4.6");
-  }
-  // All BYOK providers route through OpenAI-compatible adapter.
-  if (apiKey) {
-    const urls: Record<string, string> = {
-      openai: "https://api.openai.com/v1",
-      anthropic: "https://api.anthropic.com/v1",
-      google: "https://generativelanguage.googleapis.com/v1beta/openai",
-      xai: "https://api.x.ai/v1",
-      local: baseUrl || "http://localhost:11434/v1",
-    };
-    return new OpenAICompatAdapter(model, apiKey, baseUrl || urls[provider] || urls.openai);
-  }
-  // Fallback to z-ai sandbox LLM (single-LLM mode).
-  return new ZaiAdapter("glm-4.6");
-}
-
-// ---------------------------------------------------------------------------
-// JSON extraction helper (robust against markdown fences)
-// ---------------------------------------------------------------------------
-
-export function extractJson<T = any>(text: string): T | null {
-  if (!text) return null;
-  // Strip markdown fences.
-  let t = text.trim();
-  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fence) t = fence[1].trim();
-  // Find the first { or [ and try to parse from there.
-  const firstObj = t.indexOf("{");
-  const firstArr = t.indexOf("[");
-  let start = -1;
-  if (firstObj >= 0 && firstArr >= 0) start = Math.min(firstObj, firstArr);
-  else if (firstObj >= 0) start = firstObj;
-  else if (firstArr >= 0) start = firstArr;
-  if (start < 0) return null;
-  // Find matching close by scanning from start.
-  const open = t[start];
-  const close = open === "{" ? "}" : "]";
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-  for (let i = start; i < t.length; i++) {
-    const ch = t[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') inStr = true;
-    else if (ch === open) depth++;
-    else if (ch === close) {
-      depth--;
-      if (depth === 0) {
-        const slice = t.slice(start, i + 1);
-        try {
-          return JSON.parse(slice) as T;
-        } catch {
-          return null;
-        }
-      }
-    }
-  }
-  // Last-ditch: try parsing the whole trimmed text.
-  try {
-    return JSON.parse(t) as T;
-  } catch {
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Default model per agent role (single-LLM mode). When BYOK providers are
-// configured the orchestrator will prefer them by capability, but these are
-// the fallbacks.
-// ---------------------------------------------------------------------------
-
-export const DEFAULT_MODEL_FOR_AGENT: Record<AgentType, string> = {
-  ARCHITECT: "glm-4.6",
-  ARCHITECTURE_GUARDIAN: "glm-4.6",
-  CODE_REVIEWER: "glm-4.6",
-  FRONTEND: "glm-4.6",
-  BACKEND: "glm-4.6",
-  DATABASE: "glm-4.6",
-  INFRASTRUCTURE: "glm-4.6",
-  INTEGRATION: "glm-4.6",
-  QA: "glm-4.6",
-};
+export {
+  // Types
+  type ChatMessage,
+  type CompletionResult,
+  type LlmAdapter,
+  type LlmExecution,
+  type ExecutionStatus,
+  type LLMProvider,
+  type ProviderCompleteOptions,
+  type ExecutionPolicy,
+  type ExecuteOptions,
+  // Adapters
+  OpenAIAdapter,
+  AnthropicAdapter,
+  GoogleAdapter,
+  XaiAdapter,
+  OpenAICompatAdapter,
+  OllamaAdapter,
+  ZaiAdapter,
+  // Gateway
+  LLMGateway,
+  createGateway,
+  resetGateway,
+  isZaiAvailable,
+  isTemplateAdapterAllowed,
+  // Policy
+  DEFAULT_EXECUTION_POLICY,
+  // Legacy factory
+  buildAdapter,
+  // Utility
+  extractJson,
+  // Default models
+  DEFAULT_MODEL_FOR_AGENT,
+} from "@/lib/llm-gateway";
