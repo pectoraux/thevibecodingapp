@@ -376,6 +376,14 @@ async function workerLoop(): Promise<void> {
           clearInterval(heartbeatInterval);
         }
       } else {
+        // No ExecutionJob available — trigger the scheduler to create
+        // ExecutionJobs from queued BuildJobs. This ensures the worker
+        // drives the entire pipeline without browser/admin intervention.
+        try {
+          await apiCall("/api/scheduler/tick", "POST", {}, sessionToken!);
+        } catch {
+          // Scheduler tick is best-effort — might fail if not admin.
+        }
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       }
     } catch (err: any) {
