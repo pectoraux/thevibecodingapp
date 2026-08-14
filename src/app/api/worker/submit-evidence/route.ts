@@ -92,18 +92,19 @@ export async function POST(req: Request) {
       });
     }
 
-    // Emit build event.
+    // Emit build event — uses the SAME canComplete expression (with hasRealCommit).
     await ensureBuildEvent({
       projectId,
-      type: (guardianOk && reviewOk && testsOk) ? BuildEventType.TASK_COMPLETED : BuildEventType.TASK_FAILED,
-      level: (guardianOk && reviewOk && testsOk) ? "success" : "error",
-      message: `Task ${task.code} ${guardianOk && reviewOk && testsOk ? "COMPLETED" : "FAILED"} by worker ${token.workerId} (commit: ${commitSha?.slice(0, 7) || "none"})`,
+      type: canComplete ? BuildEventType.TASK_COMPLETED : BuildEventType.TASK_FAILED,
+      level: canComplete ? "success" : "error",
+      message: `Task ${task.code} ${canComplete ? "COMPLETED" : "FAILED"} by worker ${token.workerId} (commit: ${commitSha?.slice(0, 7) || "none"})`,
       taskId,
       agentType: task.agentType,
     });
 
-    const success = guardianOk && reviewOk && testsOk;
-    return NextResponse.json({ ok: true, success, taskStatus: success ? "COMPLETED" : "FAILED" });
+    // Phase 10B: success uses the SAME canComplete expression everywhere.
+    // No second definition of success — hasRealCommit is always required.
+    return NextResponse.json({ ok: true, success: canComplete, taskStatus: canComplete ? "COMPLETED" : "FAILED" });
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 });
   }

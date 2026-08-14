@@ -1,0 +1,50 @@
+{
+  "architectureVersion": "phase10",
+  "description": "Phase 10 — Complete Frozen Execution Architecture with real Git, BYOK, independent Guardian/Reviewer, and commit-required completion",
+  "requiredFiles": [
+    "mini-services/execution-worker/poller.ts",
+    "src/app/api/worker/job-spec/route.ts",
+    "src/app/api/worker/submit-evidence/route.ts",
+    "src/app/api/worker/resolve-credential/route.ts",
+    "src/app/api/version/route.ts",
+    "src/lib/worker-auth.ts",
+    "src/lib/execution-jobs.ts",
+    "src/lib/scheduler.ts",
+    "src/lib/orchestrator.ts",
+    "tests/architecture-invariants.ts",
+    "tests/phase10-invariants.ts"
+  ],
+  "requiredInvariants": {
+    "workerVersion": "phase10",
+    "versionEndpoint": "phase10",
+    "realGit": true,
+    "realCommit": true,
+    "baseCommitPropagation": true,
+    "byokGateway": true,
+    "deterministicGuardian": true,
+    "deterministicGuardianIndependentOfTests": true,
+    "independentReviewer": true,
+    "reviewerIndependentOfTests": true,
+    "verificationPlanFromArchitecture": true,
+    "commitRequiredForCompletion": true,
+    "successExpressionConsistent": true,
+    "executeTaskDeleted": true,
+    "workerEndpointsAuthenticated": true,
+    "controlPlaneDoesNotExecute": true
+  },
+  "forbiddenPatterns": {
+    "workerDirectlyImportsZaiSdk": "Worker must use callLLM gateway, not directly import z-ai-web-dev-sdk as the primary path",
+    "guardianDerivesFromTests": "Guardian verdict must NOT be derived from test results",
+    "reviewerDerivesFromTests": "Reviewer verdict must NOT be derived from test results",
+    "successWithoutCommit": "success = guardianOk && reviewOk && testsOk (missing hasRealCommit)",
+    "executeTaskEndpoint": "/api/worker/execute-task must not exist",
+    "versionPhase5": "Version endpoint must not report phase5",
+    "versionPhase8": "Version endpoint must not report phase8"
+  },
+  "tests": [
+    "tests/architecture-invariants.ts",
+    "tests/phase10-invariants.ts",
+    "tests/worker-security-test.ts",
+    "tests/hostile-security-test.ts"
+  ]
+}
