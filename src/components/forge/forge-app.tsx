@@ -58,6 +58,30 @@ function ForgeFooter() {
   );
 }
 
+// Execution mode badge — shows whether generated code runs in an isolated
+// worker (SANDBOXED) or locally in the Next.js process (LOCAL UNSANDBOXED).
+function ExecutionModeBadge() {
+  const { data } = useQuery({
+    queryKey: ["execution-mode"],
+    queryFn: () => apiGet<{ mode: string; label: string; sandboxed: boolean; workerAvailable: boolean }>("/api/execution-mode"),
+    staleTime: 30_000,
+  });
+  if (!data) return null;
+  const isSandboxed = data.sandboxed && data.workerAvailable;
+  return (
+    <span
+      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+        isSandboxed
+          ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200"
+          : "bg-orange-100 text-orange-800 dark:bg-orange-950 dark:text-orange-200"
+      }`}
+      title={data.description || ""}
+    >
+      {isSandboxed ? "SANDBOXED" : "LOCAL UNSANDBOXED"}
+    </span>
+  );
+}
+
 // Sticky top bar with auth context: brand + (admin) Waitlist button +
 // user email/role badge + Logout button. Rendered above the project list /
 // dashboard so it is always visible while authenticated.
@@ -91,6 +115,7 @@ function ForgeTopBar() {
             <Wrench className="size-4" />
             <span className="hidden sm:inline">Forge</span>
             <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-200">DEV MODE</span>
+            <ExecutionModeBadge />
           </div>
           <div className="flex items-center gap-2">
             {isAdmin && (

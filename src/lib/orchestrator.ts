@@ -21,17 +21,17 @@ import { decryptSecretOrNull, shortSha } from "@/lib/crypto";
 import { buildAdapter, extractJson, type ChatMessage } from "@/lib/llm";
 import { buildPrompt } from "@/lib/prompts";
 import { ensureBuildEvent } from "@/lib/events";
-// Phase 2: real systems replace the DB-backed repo simulation.
+// Phase 3: execution plane separation — tests run in the isolated worker, NOT in-process.
 import * as gitEngine from "@/lib/git-engine";
-import { runTests, runBuild, runLint, runTypeCheck } from "@/lib/test-runner";
-import { installDependencies } from "@/lib/worker";
+import { submitExecutionJob, isExecutionWorkerAvailable } from "@/lib/execution-client";
+import { FORGE_EXECUTION_MODE } from "@/lib/execution-mode";
 import { runDeterministicGuardian } from "@/lib/guardian-deterministic";
 import { recordEvidence, hasSufficientEvidence } from "@/lib/evidence";
 import * as github from "@/lib/github";
-// Keep the old repo.ts for backward-compatible DB metadata (branch/commit/PR records).
-// The canonical source of truth is now real Git; DB rows are metadata shadows.
-import { createCommit, ensureBranch, createPullRequest, mergePullRequest, writeFileToRepo, initRepository } from "@/lib/repo";
+// repo.ts is now metadata-only (SHA, branch, PR number). No file contents in DB.
+import { ensureBranch, createPullRequest, mergePullRequest } from "@/lib/repo";
 import { runReadinessGate, runPreflight } from "@/lib/readiness";
+import { createJob, updateJobStatus } from "@/lib/job-queue";
 import {
   AgentType,
   BuildEventType,
@@ -603,21 +603,44 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
     }
   }
 
-  // Also record in DB (metadata shadow for the repository view).
-  const dbCommitInput = {
-    projectId,
-    branchName,
-    message: `feat(${task.code}): ${task.title}`,
-    taskId,
-    files: files.map((f: any) => ({
-      path: f.path,
-      action: "create" as const,
-      content: f.content,
-      language: f.language,
-    })),
-  };
-  const { sha: dbSha } = await createCommit(dbCommitInput);
-  const sha = realCommitSha || dbSha;
+  // --- Phase 3: NO DB SHADOW COMMIT ---
+  // A task is BLOCKED if there is no real git commit. We do NOT create a
+  // fake DB SHA. The DB may store metadata (SHA, branch) but only if there
+  // is a real commit to reference. No real commit = BLOCKED.
+  if (!realCommitSha) {
+    await db.task.update({
+      where: { id: taskId },
+      data: {
+        status: TaskStatus.FAILED,
+        failureReason: "BLOCKED: No real git commit — cannot proceed without real commit (Phase 3 rule: no DB shadow commits)",
+      },
+    });
+    await ensureBuildEvent({
+      projectId,
+      type: BuildEventType.TASK_FAILED,
+      level: "error",
+      message: `Task ${task.code} BLOCKED — no real git commit (worktree=${worktreeCreated}, files=${files.length})`,
+      taskId,
+    });
+    if (worktreeCreated) await gitEngine.removeWorktree(projectId, `${task.code.toLowerCase()}-${task.attempts}`).catch(() => {});
+    return;
+  }
+
+  const sha = realCommitSha;
+
+  // Record metadata in DB (SHA + branch only, NOT file contents).
+  // Git is canonical. DB is metadata only.
+  await db.repoCommit.create({
+    data: {
+      projectId,
+      sha,
+      branchName,
+      parentSha: null,
+      message: `feat(${task.code}): ${task.title}`,
+      filesChangedJson: JSON.stringify(files.map((f: any) => f.path)),
+      taskId,
+    },
+  });
 
   await db.task.update({
     where: { id: taskId },
@@ -637,42 +660,103 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
     payload: JSON.stringify({ sha, files: files.map((f: any) => f.path), worktree: worktreePath }),
   });
 
-  // 3. --- Phase 2: Real Test Execution ---
-  // Actually run tests in the worktree. No more heuristic keyword matching.
+  // 3. --- Phase 3: Real Test Execution via ISOLATED EXECUTION WORKER ---
+  // Tests are NOT executed inside the Next.js process. They are sent to the
+  // execution worker (separate process, isolated environment). If the worker
+  // is unavailable, the task is BLOCKED — never silently run locally.
   let testResults: any[] = [];
   let testsOk = false;
   if (worktreeCreated && realCommitSha) {
     try {
-      // Install dependencies first.
-      await installDependencies(worktreePath);
-      // Run real tests.
-      const testRun = await runTests({ cwd: worktreePath, timeoutMs: 120000 });
-      testResults = [{
-        name: testRun.framework,
-        type: "real",
-        target: task.code,
-        passes: testRun.success,
-        evidence: `exitCode=${testRun.exitCode}, passed=${testRun.passed}, failed=${testRun.failed}, skipped=${testRun.skipped}, duration=${testRun.durationMs}ms`,
-        command: testRun.command,
-        exitCode: testRun.exitCode,
-        stdout: testRun.stdout.slice(0, 5000),
-        stderr: testRun.stderr.slice(0, 5000),
-        passed: testRun.passed,
-        failed: testRun.failed,
-        skipped: testRun.skipped,
-        total: testRun.total,
-        framework: testRun.framework,
-        durationMs: testRun.durationMs,
-        timedOut: testRun.timedOut,
-      }];
-      testsOk = testRun.success;
+      // Submit the test execution job to the isolated worker.
+      // The worker receives ONLY the worktree path and an explicit env allowlist.
+      // It does NOT inherit FORGE_MASTER_KEY, DATABASE_URL, NEXTAUTH_SECRET, etc.
+      const jobResponse = await submitExecutionJob({
+        jobId: `${task.code}-${task.attempts}-test`,
+        projectId,
+        worktreePath,
+        commands: [
+          { command: "npm", args: ["install", "--silent"], timeoutMs: 120000 },
+          { command: "npm", args: ["test", "--", "--json", "--silent"], timeoutMs: 120000 },
+        ],
+        env: {
+          // Only project-scoped test credentials, never platform secrets.
+          NODE_ENV: "test",
+        },
+        timeoutMs: 300000,
+      });
+
+      // Parse test results from the worker response.
+      const installResult = jobResponse.results[0];
+      const testResult = jobResponse.results[1];
+
+      if (testResult) {
+        // Try to parse Jest JSON output.
+        let parsed: any = null;
+        try { parsed = JSON.parse(testResult.stdout); } catch {}
+
+        if (parsed && parsed.numTotalTests !== undefined) {
+          testResults = [{
+            name: "jest",
+            type: "real",
+            target: task.code,
+            passes: testResult.success,
+            evidence: `exitCode=${testResult.exitCode}, passed=${parsed.numPassedTests}, failed=${parsed.numFailedTests}, skipped=${parsed.numPendingTests}, duration=${testResult.durationMs}ms`,
+            command: "npm test",
+            exitCode: testResult.exitCode,
+            stdout: (testResult.stdout || "").slice(0, 5000),
+            stderr: (testResult.stderr || "").slice(0, 5000),
+            passed: parsed.numPassedTests,
+            failed: parsed.numFailedTests,
+            skipped: parsed.numPendingTests,
+            total: parsed.numTotalTests,
+            framework: "jest",
+            durationMs: testResult.durationMs,
+            timedOut: testResult.timedOut,
+            sandboxId: "execution-worker",
+          }];
+          testsOk = testResult.success;
+        } else {
+          // Non-Jest or unparseable output — still record real evidence.
+          testResults = [{
+            name: "test-runner",
+            type: "real",
+            target: task.code,
+            passes: testResult.success,
+            evidence: `exitCode=${testResult.exitCode}, duration=${testResult.durationMs}ms (output not parsed as JSON)`,
+            command: "npm test",
+            exitCode: testResult.exitCode,
+            stdout: (testResult.stdout || "").slice(0, 5000),
+            stderr: (testResult.stderr || "").slice(0, 5000),
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            total: 0,
+            framework: "unknown",
+            durationMs: testResult.durationMs,
+            timedOut: testResult.timedOut,
+            sandboxId: "execution-worker",
+          }];
+          testsOk = testResult.success;
+        }
+      } else {
+        testResults = [{
+          name: "execution-worker",
+          type: "real",
+          target: task.code,
+          passes: false,
+          evidence: `No test result returned from worker. Install result: exitCode=${installResult?.exitCode}`,
+          error: "No test result",
+        }];
+        testsOk = false;
+      }
     } catch (err: any) {
       testResults = [{
-        name: "test-runner",
+        name: "execution-worker",
         type: "real",
         target: task.code,
         passes: false,
-        evidence: `Test execution failed: ${err.message}`,
+        evidence: `Execution worker failed: ${err.message}`,
         error: err.message,
       }];
       testsOk = false;
@@ -723,12 +807,14 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
         diff,
       });
     } catch (err: any) {
+      // Phase 3: Guardian execution failure is UNVERIFIED, not WARNING.
+      // Infrastructure failure must NOT be downgraded to a warning.
       deterministicResult = {
-        verdict: "WARNING",
-        violations: [],
-        warnings: [{ check: "deterministic-guardian", invariant: "Guardian execution failed", evidence: err.message, files: [], severity: "medium", remediation: "Manual review" }],
+        verdict: "VIOLATION",
+        violations: [{ check: "deterministic-guardian", invariant: "Guardian must execute", evidence: err.message, files: [], severity: "high", remediation: "Fix Guardian execution and retry" }],
+        warnings: [],
         checks: [],
-        summary: `Deterministic Guardian failed: ${err.message}`,
+        summary: `UNVERIFIED: Deterministic Guardian failed to execute: ${err.message}`,
       };
     }
   }
@@ -806,10 +892,12 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
       integrationChecks: [],
     });
   } catch (err: any) {
-    // Evidence recording failure should not block the task, but should be logged.
+    // Phase 3: Evidence recording failure BLOCKS completion.
+    // The platform cannot prove the task completed without evidence.
+    // BLOCKED is correct, not COMPLETED with missing evidence.
     await ensureBuildEvent({
       projectId, type: BuildEventType.TASK_FAILED, level: "error",
-      message: `Evidence recording failed: ${err.message}`,
+      message: `BLOCKED — evidence recording failed: ${err.message}`,
       taskId,
     });
   }
@@ -842,33 +930,62 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
       }
     }
 
-    // Create PR + merge (DB shadow + real GitHub if connected).
-    const pr = await createPullRequest({
-      projectId,
-      title: `[${task.code}] ${task.title}`,
-      branchName,
-      taskId,
-      body: `Implementation of ${task.title}.\n\nAcceptance criteria:\n${(JSON.parse(task.acceptanceCriteria || "[]") as string[]).map((c) => `- ${c}`).join("\n")}\n\nEvidence: ${sha.slice(0, 7)}, tests ${testsOk ? "passed" : "failed"}, guardian ${combinedGuardian.verdict}, review ${reviewResult.verdict}`,
-    });
-    await mergePullRequest(projectId, pr.number);
-
-    // Real GitHub PR if connected.
+    // --- Phase 3: NO DB SHADOW PR ---
+    // A PR is only real if it exists in actual GitHub. If GitHub is not
+    // connected, the project operates in LOCAL_ONLY mode — the UI clearly
+    // distinguishes this from GITHUB_BACKED.
+    let prNumber: number | null = null;
     if (project.githubConnected && project.githubRepo) {
+      // GITHUB_BACKED mode — create a real GitHub PR.
       try {
         const [owner, name] = project.githubRepo.split("/");
-        await github.createPullRequest(owner, name, {
+        const realPR = await github.createPullRequest(owner, name, {
           title: `[${task.code}] ${task.title}`,
           head: branchName,
           base: "main",
           body: `Implementation of ${task.title}.\n\nEvidence: commit ${sha.slice(0,7)}, tests ${testsOk ? "passed" : "failed"}, guardian ${combinedGuardian.verdict}, review ${reviewResult.verdict}`,
         });
-      } catch (err: any) {
+        prNumber = realPR.number;
+        // Merge the real PR.
+        await github.mergePullRequest(owner, name, realPR.number);
+        // Record metadata in DB.
+        await createPullRequest({
+          projectId,
+          title: `[${task.code}] ${task.title}`,
+          branchName,
+          taskId,
+          body: `Real GitHub PR #${realPR.number} — ${sha.slice(0,7)}`,
+        });
         await ensureBuildEvent({
-          projectId, type: BuildEventType.COMMIT, level: "warn",
-          message: `GitHub PR creation failed: ${err.message}`,
+          projectId, type: BuildEventType.TASK_COMPLETED, level: "success",
+          message: `Real GitHub PR #${realPR.number} created and merged`,
           taskId,
         });
+      } catch (err: any) {
+        // GitHub PR creation failed — task cannot complete in GITHUB_BACKED mode.
+        await db.task.update({
+          where: { id: taskId },
+          data: {
+            status: TaskStatus.FAILED,
+            failureReason: `BLOCKED: GitHub PR creation failed: ${err.message}`,
+          },
+        });
+        await ensureBuildEvent({
+          projectId, type: BuildEventType.TASK_FAILED, level: "error",
+          message: `Task ${task.code} BLOCKED — GitHub PR creation failed: ${err.message}`,
+          taskId,
+        });
+        if (worktreeCreated) await gitEngine.removeWorktree(projectId, `${task.code.toLowerCase()}-${task.attempts}`).catch(() => {});
+        return;
       }
+    } else {
+      // LOCAL_ONLY mode — no GitHub PR. Task can complete locally but
+      // readiness gate will know this is not GITHUB_BACKED.
+      await ensureBuildEvent({
+        projectId, type: BuildEventType.TASK_COMPLETED, level: "success",
+        message: `Task ${task.code} completed in LOCAL_ONLY mode (no GitHub PR)`,
+        taskId,
+      });
     }
 
     await db.task.update({
@@ -879,7 +996,7 @@ async function executeTask(projectId: string, taskId: string): Promise<void> {
       projectId,
       type: BuildEventType.TASK_COMPLETED,
       level: "success",
-      message: `Task ${task.code} COMPLETED — merged PR #${pr.number} (evidence: real commit + real tests + guardian PASS + review APPROVED)`,
+      message: `Task ${task.code} COMPLETED — ${prNumber ? `GitHub PR #${prNumber} merged` : "LOCAL_ONLY mode"} (evidence: real commit ${sha.slice(0,7)} + real tests + guardian PASS + review APPROVED)`,
       taskId,
     });
   } else {

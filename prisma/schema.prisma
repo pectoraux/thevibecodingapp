@@ -74,6 +74,7 @@ model Project {
   pullRequests      PullRequest[]
   readinessChecks   ReadinessCheck[]
   adrs              Adr[]
+  buildJobs         BuildJob[]
 }
 
 // ---------------------------------------------------------------------------
@@ -512,4 +513,39 @@ model WaitlistEntry {
   user        User?    @relation(fields: [convertedUserId], references: [id], onDelete: SetNull)
 
   @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Durable Build Jobs — survive server restarts
+// ---------------------------------------------------------------------------
+
+model BuildJob {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  type        String   // BUILD | EXECUTION | VERIFICATION
+  status      String   @default("QUEUED") // QUEUED | DISPATCHING | RUNNING | WAITING | SUCCEEDED | FAILED | CANCELLED | TIMED_OUT | BLOCKED
+  taskId      String?
+  attempt     Int      @default(0)
+
+  // Execution metadata
+  executionId String?  // sandbox/worker job ID
+  sandboxId   String?
+  workDir     String?
+  commitSha   String?
+  branch      String?
+
+  // Results
+  results     String?  // JSON: execution results
+  errorMessage String?
+
+  // Timing
+  queuedAt    DateTime @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  timeoutMs   Int      @default(300000)
+
+  @@index([projectId])
+  @@index([status])
+  @@index([type])
 }
