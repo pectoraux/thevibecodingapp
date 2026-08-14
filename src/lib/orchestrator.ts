@@ -23,7 +23,8 @@ import { buildPrompt } from "@/lib/prompts";
 import { ensureBuildEvent } from "@/lib/events";
 // Phase 2: real systems replace the DB-backed repo simulation.
 import * as gitEngine from "@/lib/git-engine";
-import { runTests, runBuild, runLint, runTypeCheck, installDependencies } from "@/lib/test-runner";
+import { runTests, runBuild, runLint, runTypeCheck } from "@/lib/test-runner";
+import { installDependencies } from "@/lib/worker";
 import { runDeterministicGuardian } from "@/lib/guardian-deterministic";
 import { recordEvidence, hasSufficientEvidence } from "@/lib/evidence";
 import * as github from "@/lib/github";
