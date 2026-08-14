@@ -1,0 +1,2262 @@
+# Master Build Prompt — Production-Grade Multi-LLM Vibe Coding Platform
+
+You are the lead product architect, principal engineer, and implementation agent for this project.
+
+Your task is to **design and fully build a production-grade multi-LLM software development platform** that turns a product idea/specification into a real, deployable, working software product.
+
+This is **not** an AI chat wrapper, prompt playground, code editor, or demo.
+
+The core product is an **AI software factory** in which multiple LLMs with different responsibilities collaborate through a controlled workflow, with GitHub as the source of truth, one frozen architecture as the governing contract, automated verification at every stage, and a final gate that proves the generated product is actually implemented rather than merely claimed to be complete.
+
+You must inspect the existing codebase before making architectural decisions and preserve anything that is already correct and reusable.
+
+---
+
+# 1. Product Vision
+
+The user should be able to do this:
+
+1. Create a project.
+2. Connect their own LLM API keys (BYOK).
+3. Connect GitHub.
+4. Give the system a product specification, requirements, constraints, and desired stack.
+5. Have an **Architect LLM** design the complete system.
+6. Have the user review and approve that architecture.
+7. Freeze the architecture.
+8. Press **Start Build**.
+9. The platform automatically delegates work to specialized LLM agents.
+10. Agents create and modify the actual repository.
+11. Every meaningful change is committed to Git.
+12. Multiple independent agents review the implementation.
+13. A dedicated Architecture Guardian continually checks that implementation remains consistent with the frozen architecture.
+14. Platform-specific implementation agents handle frontend/backend/database/mobile/cloud/etc. work.
+15. Automated tests, integration tests, static analysis, security checks, runtime checks, and end-to-end tests are executed continuously.
+16. Missing production credentials are detected before they become blockers.
+17. The user is asked for required credentials/API keys **upfront**, including the option to use test/sandbox credentials.
+18. The system continues autonomously until all defined production-readiness criteria are satisfied.
+19. The user receives a real repository containing a real deployable product—not a scaffold with simulated internals.
+
+The user should no longer need to manually copy prompts and outputs between ChatGPT, Z.ai, Claude, Gemini, etc.
+
+The platform itself should become the orchestration layer that does that work.
+
+---
+
+# 2. Core Principle
+
+The fundamental unit of the system is NOT the conversation.
+
+It is the:
+
+**Project → Architecture Contract → Tasks → Repository Changes → Verification → Production Readiness**
+
+The LLMs are workers inside this system.
+
+The platform, repository, architecture contract, task graph, test results, and verification state are the source of truth.
+
+Do NOT allow the system to become dependent on conversational context as the primary state mechanism.
+
+---
+
+# 3. Multi-Agent Architecture
+
+Implement the following logical agent roles.
+
+## 3.1 Architect Agent
+
+The Architect is responsible for designing the complete system before implementation begins.
+
+Responsibilities:
+
+* Understand product requirements.
+* Identify functional requirements.
+* Identify non-functional requirements.
+* Design system architecture.
+* Select technology stack.
+* Define services/modules.
+* Define data models.
+* Define APIs.
+* Define external integrations.
+* Define authentication/authorization.
+* Define infrastructure.
+* Define deployment architecture.
+* Define observability.
+* Define testing strategy.
+* Define security requirements.
+* Define scalability assumptions.
+* Define failure modes.
+* Define required secrets/API keys.
+* Define environment configuration.
+* Define acceptance criteria.
+* Identify areas where ambiguity exists.
+* Identify assumptions explicitly.
+
+The Architect must produce a formal **Architecture Contract**.
+
+The Architecture Contract must be structured machine-readable data, not merely prose.
+
+For example:
+
+```text
+architecture/
+    architecture.json
+    architecture.md
+    decisions/
+    contracts/
+    schemas/
+    api/
+    infrastructure/
+```
+
+The JSON representation should contain explicit components, dependencies, interfaces, technologies, constraints, invariants, and architectural decisions.
+
+---
+
+# 4. Architecture Freeze
+
+After the user approves the architecture, the system must allow the architecture to be **frozen**.
+
+Once frozen:
+
+### The architecture becomes an immutable contract.
+
+Implementation agents MUST NOT silently change:
+
+* technology choices
+* service boundaries
+* database architecture
+* API contracts
+* authentication model
+* event architecture
+* infrastructure architecture
+* major dependency decisions
+* data model structure
+* deployment model
+
+without an explicit architecture change process.
+
+Implement an **Architecture Change Request** workflow.
+
+If an implementation agent believes the architecture is insufficient, it must create:
+
+```text
+ArchitectureChangeRequest
+```
+
+containing:
+
+* problem
+* affected components
+* proposed change
+* rationale
+* risks
+* migration requirements
+* affected tests
+* affected APIs
+* affected dependencies
+* estimated implementation impact
+
+The Architect Agent evaluates the request.
+
+No architecture change should be considered valid until it is approved by the appropriate architecture authority.
+
+The system must maintain:
+
+* architecture version
+* hash/version identifier
+* change history
+* approval history
+* affected tasks
+* affected files
+* migration requirements
+
+---
+
+# 5. Architecture Guardian
+
+Create a dedicated **Architecture Guardian Agent**.
+
+This agent has a fundamentally different purpose from the Architect.
+
+The Guardian's job is NOT to redesign the system.
+
+Its job is to prevent architecture drift.
+
+This distinction is critical.
+
+The Guardian should operate with a deliberately constrained context.
+
+It should NOT repeatedly ingest the entire project conversationally.
+
+Instead, give it access to:
+
+* frozen Architecture Contract
+* architecture hash/version
+* component dependency graph
+* service boundaries
+* API contracts
+* database schema contracts
+* coding/infrastructure constraints
+* recent Git diff
+* relevant changed files
+* test results
+* previous violations
+* previous Guardian decisions
+
+The Guardian should use targeted context retrieval rather than continually expanding context.
+
+Its output should be structured:
+
+```text
+PASS
+WARNING
+VIOLATION
+ARCHITECTURE_CHANGE_REQUIRED
+```
+
+A violation should include:
+
+* violated invariant
+* evidence
+* files
+* severity
+* recommended remediation
+
+The Guardian must NOT become another autonomous architect.
+
+Its primary goal is preserving the frozen architecture.
+
+---
+
+# 6. Independent Code Review Agent
+
+Create an independent **Code Review Agent**.
+
+This agent should have a different objective from the implementation agent.
+
+It should be skeptical and adversarial.
+
+It should review:
+
+* correctness
+* security
+* reliability
+* maintainability
+* edge cases
+* race conditions
+* error handling
+* data consistency
+* API correctness
+* performance
+* observability
+* testing quality
+* dependency risks
+* secrets handling
+* authorization
+* production failure modes
+
+The reviewer must not simply agree with generated code.
+
+The review process should be independent whenever possible.
+
+The reviewer receives:
+
+* task specification
+* intended behavior
+* changed files
+* relevant architecture contract
+* test results
+* previous review findings
+
+but should NOT simply inherit the implementation agent's conclusions.
+
+---
+
+# 7. Implementation Agents
+
+Implement specialized implementation agents.
+
+At minimum support:
+
+### Frontend Agent
+
+Responsible for:
+
+* web UI
+* frontend architecture
+* state management
+* API integration
+* accessibility
+* responsive behavior
+* frontend tests
+* frontend build
+* runtime behavior
+
+### Backend Agent
+
+Responsible for:
+
+* backend services
+* APIs
+* business logic
+* persistence
+* validation
+* authentication
+* authorization
+* background jobs
+* integrations
+* observability
+* backend testing
+
+### Database Agent
+
+Responsible for:
+
+* schemas
+* migrations
+* indexes
+* constraints
+* query correctness
+* data integrity
+* seeding
+* database tests
+
+### Infrastructure / DevOps Agent
+
+Responsible for:
+
+* Docker
+* deployment
+* infrastructure configuration
+* CI/CD
+* secrets configuration
+* environment management
+* logging
+* monitoring
+* health checks
+* scaling
+* backups
+* operational configuration
+
+### Integration Agent
+
+Responsible for:
+
+* payment providers
+* email
+* SMS
+* maps
+* authentication providers
+* cloud APIs
+* third-party APIs
+* webhooks
+* external services
+
+### Testing / QA Agent
+
+Responsible for:
+
+* unit tests
+* integration tests
+* API tests
+* end-to-end tests
+* failure tests
+* regression tests
+* production-readiness checks
+
+Do NOT hard-code this agent list as the only possible structure.
+
+The Architect should be able to declare additional specialized agents when a project requires them.
+
+---
+
+# 8. Agent Orchestration
+
+Build an actual orchestration engine.
+
+The system should convert the Architecture Contract into a **Task Graph**.
+
+A task should have:
+
+```text
+id
+title
+description
+component
+dependencies
+inputs
+outputs
+acceptanceCriteria
+requiredTests
+agentType
+priority
+risk
+status
+attempts
+assignedModel
+reviewStatus
+architectureStatus
+```
+
+Support dependency-aware execution.
+
+Example:
+
+```text
+database schema
+       ↓
+backend API
+       ↓
+frontend integration
+       ↓
+end-to-end tests
+```
+
+The system must not ask multiple agents to blindly modify the same part of the codebase simultaneously.
+
+Implement repository locking / task-level ownership where necessary.
+
+---
+
+# 9. GitHub as Source of Truth
+
+GitHub should be treated as the canonical source of project code.
+
+Support:
+
+* repository creation
+* repository connection
+* branch creation
+* commits
+* pull requests
+* diffs
+* merge status
+* branch protection
+* tags
+* releases
+* commit metadata
+
+Every meaningful agent change should be represented in Git.
+
+Prefer:
+
+```text
+task branch
+→ implementation
+→ tests
+→ Guardian review
+→ independent code review
+→ merge
+```
+
+rather than allowing an agent to continuously mutate main without traceability.
+
+The platform must maintain internal references between:
+
+```text
+Project
+Task
+Agent execution
+Git branch
+Commit
+Pull request
+Review
+Test run
+Architecture version
+```
+
+---
+
+# 10. BYOK
+
+The user must control their own LLM provider credentials.
+
+Support multiple providers.
+
+The system should use a provider abstraction such as:
+
+```text
+LLMProvider
+    provider
+    model
+    credentials
+    capabilities
+    contextWindow
+    pricing
+    rateLimits
+    reliability
+```
+
+Do not hard-code the orchestration engine around a single model provider.
+
+The system should support assigning different models to different roles.
+
+Example:
+
+```text
+Architect        → Model A
+Implementation   → Model B
+Architecture     → Model C
+Code Review      → Model D
+Testing          → Model E
+```
+
+Users should be able to override model assignments.
+
+---
+
+# 11. Capability-Based Model Routing
+
+Do not simply select models by name.
+
+Define model capabilities.
+
+For example:
+
+```text
+coding
+reasoning
+architecture
+long_context
+vision
+tool_use
+speed
+cost
+context_window
+structured_output
+```
+
+A task should request capabilities.
+
+The router chooses an appropriate model.
+
+Example:
+
+```text
+Task:
+"Review database migration for data-integrity failures"
+
+Required capabilities:
+- coding
+- reasoning
+- structured_output
+```
+
+This allows the platform to adapt to changing models/providers.
+
+---
+
+# 12. Single-LLM User
+
+A critical product requirement:
+
+The platform must remain useful even when the user has access to only one LLM.
+
+Support at least three modes.
+
+## Mode A — Multi-Key BYOK
+
+User supplies multiple providers/models.
+
+Use the best model for each role.
+
+## Mode B — Single-Key Multi-Agent
+
+The same LLM provider/model executes different logical roles.
+
+The prompts, context, permissions, and objectives remain isolated.
+
+For example:
+
+```text
+Architect instance
+Implementation instance
+Reviewer instance
+Guardian instance
+QA instance
+```
+
+Even if they use the same underlying model.
+
+## Mode C — Platform-Assisted Model Pool
+
+Where legally and technically appropriate, investigate whether the platform can provide a fallback pool of models/providers based on:
+
+* available free tiers
+* low-cost models
+* open-source models
+* local models
+* platform-owned credits
+* user-provided credentials
+
+Do NOT implement anything that violates provider terms of service.
+
+Create an abstraction allowing fallback routing without coupling the platform to one provider.
+
+---
+
+# 13. Context Management
+
+Context management is one of the most important architectural requirements.
+
+Do NOT simply dump the entire repository into every LLM.
+
+Implement contextual retrieval.
+
+Maintain:
+
+```text
+Project Context
+Architecture Context
+Task Context
+Component Context
+Repository Context
+Recent Change Context
+Test Context
+Review Context
+```
+
+Each agent receives only the context required for its responsibility.
+
+The Architecture Guardian should have especially strict context limits.
+
+Its canonical inputs should be:
+
+```text
+Frozen Architecture Contract
++
+Relevant dependency graph
++
+Changed files
++
+Relevant interfaces
++
+Recent tests
++
+Relevant history
+```
+
+not the entire conversation.
+
+Implement summarization / compaction where useful, but retain machine-readable source-of-truth artifacts so summaries never become authoritative over the actual code.
+
+---
+
+# 14. Production Credentials / Secrets
+
+The system must identify all external credentials required for a production deployment during architecture planning.
+
+Examples:
+
+* Stripe
+* Twilio
+* AWS
+* GCP
+* Azure
+* OpenAI
+* Anthropic
+* Google
+* OAuth credentials
+* email providers
+* database credentials
+* storage credentials
+* maps
+* analytics
+* blockchain RPC endpoints
+* webhook secrets
+
+The system should generate a:
+
+```text
+Required Credentials Manifest
+```
+
+Example:
+
+```text
+STRIPE_SECRET_KEY
+STRIPE_WEBHOOK_SECRET
+DATABASE_URL
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+```
+
+Each credential should include:
+
+* name
+* purpose
+* environment
+* required/optional
+* provider
+* validation method
+* test/sandbox support
+* when required
+
+---
+
+# 15. Ask for Credentials Upfront
+
+Before the user presses Start Build, run a **Preflight**.
+
+The system should say:
+
+```text
+Your architecture requires the following credentials:
+...
+```
+
+The user should be able to provide:
+
+* production keys
+* test keys
+* sandbox keys
+* placeholders for development-only services
+
+A test key must be explicitly marked as test/sandbox.
+
+Do not accidentally deploy a test credential into production.
+
+The system should validate provided credentials when safely possible.
+
+Do not expose secrets to LLM prompts unnecessarily.
+
+Secrets should remain in a secure credential store / secret-management subsystem.
+
+LLMs should receive references such as:
+
+```text
+STRIPE_SECRET_KEY is configured
+```
+
+rather than:
+
+```text
+sk_live_...
+```
+
+---
+
+# 16. Production Completion Definition
+
+This is one of the most important requirements in the entire system.
+
+The platform must NEVER claim that a product is production-ready simply because:
+
+* code compiles
+* tests pass
+* files exist
+* APIs are mocked
+* placeholders are present
+* TODOs exist
+* integrations are simulated
+* fake data is being used
+* functions merely return hardcoded values
+* UI flows stop after frontend actions
+* backend endpoints do not reach real persistence
+* webhooks are not actually processed
+* external services are mocked in the production path
+
+The platform needs a formal **Production Readiness Gate**.
+
+---
+
+# 17. Production Readiness Gate
+
+A product may only enter:
+
+```text
+PRODUCTION_READY
+```
+
+when all required checks pass.
+
+At minimum check:
+
+### Build
+
+* application builds successfully
+* production build succeeds
+* dependencies resolve
+* migrations succeed
+
+### Static checks
+
+* type checking
+* linting
+* static analysis
+* security scanning
+
+### Tests
+
+* unit tests
+* integration tests
+* API tests
+* end-to-end tests
+* regression tests
+
+### Runtime
+
+* application starts
+* health checks work
+* required services connect
+* database connects
+* migrations work
+* background jobs run
+* queues work where applicable
+
+### Integrations
+
+* real integration paths are implemented
+* credentials are configured
+* test/sandbox integrations work where production credentials are unavailable
+* webhooks are implemented
+* webhook verification works
+* retry behavior exists where necessary
+
+### Data
+
+* real database operations work
+* persistence is real
+* transactions work where necessary
+* constraints are enforced
+* migrations are reversible/managed appropriately
+
+### Authentication
+
+* login works
+* logout works
+* sessions/tokens work
+* authorization works
+* unauthorized access is blocked
+
+### Error handling
+
+* downstream failures are handled
+* timeouts are handled
+* retries exist where appropriate
+* invalid input is handled
+* failure states do not silently succeed
+
+### Observability
+
+* structured logging
+* error reporting
+* health checks
+* useful operational metrics
+
+### Security
+
+* no committed secrets
+* authentication reviewed
+* authorization reviewed
+* common injection risks checked
+* dependency vulnerabilities checked
+* sensitive data handling reviewed
+
+### Configuration
+
+* required environment variables identified
+* missing configuration fails clearly
+* production configuration documented
+
+### Deployment
+
+* reproducible deployment process exists
+* deployment artifact is generated
+* deployment configuration is valid
+* rollback strategy exists where appropriate
+
+---
+
+# 18. Fake / Placeholder Detection
+
+Implement an automated **Fake Implementation Detector**.
+
+Search the repository for suspicious patterns including:
+
+```text
+TODO
+FIXME
+coming soon
+not implemented
+placeholder
+mock
+stub
+dummy
+fake
+temporary
+hardcoded response
+return true
+return false
+return []
+return {}
+console.log
+pass
+throw new Error("not implemented")
+```
+
+Do not blindly reject legitimate occurrences.
+
+The detector should classify them and require review where they occur in production paths.
+
+Also detect:
+
+* frontend calling fake APIs
+* API endpoints returning static values
+* mock services accidentally enabled in production
+* databases never queried
+* integrations with no network calls
+* generated example data presented as real data
+* code paths never wired into application execution
+
+---
+
+# 19. Execution / Evidence Model
+
+Every agent action must generate evidence.
+
+For each task store:
+
+```text
+Task
+Agent
+Model
+Prompt version
+Input context
+Output
+Files changed
+Commit
+Tests executed
+Test results
+Review results
+Guardian result
+Architecture version
+```
+
+The platform should be able to answer:
+
+> "Why does the system believe this feature is complete?"
+
+The answer must be based on evidence, not an LLM assertion.
+
+---
+
+# 20. No "Trust Me" Completion
+
+LLMs are not authoritative about whether they have completed a task.
+
+An LLM may say:
+
+> "The Stripe integration is fully implemented."
+
+The platform should respond by checking:
+
+* required SDK dependency
+* configuration
+* real API invocation
+* webhook endpoint
+* webhook signature verification
+* persistence
+* error handling
+* tests
+* environment configuration
+* actual execution
+
+Only evidence can transition a task into completed state.
+
+---
+
+# 21. Verification Layers
+
+Implement multiple independent verification layers:
+
+```text
+Implementation Agent
+        ↓
+Tests
+        ↓
+Architecture Guardian
+        ↓
+Independent Code Review
+        ↓
+Integration Verification
+        ↓
+Production Readiness Gate
+```
+
+Do not allow the same agent to both implement and certify its own work wherever avoidable.
+
+---
+
+# 22. Automatic Repair Loop
+
+When verification fails, the system should automatically create a repair task.
+
+Example:
+
+```text
+Task 41
+↓
+Tests fail
+↓
+Create repair task
+↓
+Implementation agent fixes issue
+↓
+Tests rerun
+↓
+Guardian
+↓
+Reviewer
+```
+
+Set configurable maximum retry counts.
+
+Avoid infinite loops.
+
+When repeated failures occur, escalate to:
+
+```text
+Human Review Required
+```
+
+with:
+
+* failure summary
+* attempted fixes
+* affected files
+* relevant logs
+* model outputs
+* proposed next action
+
+---
+
+# 23. Human Intervention
+
+The platform should maximize autonomous execution while maintaining explicit human control at important boundaries.
+
+Human approval should be available for:
+
+* architecture freeze
+* architecture changes
+* destructive database migrations
+* production deployment
+* credential changes
+* major infrastructure changes
+* security exceptions
+
+The user should be able to inspect:
+
+* architecture
+* task graph
+* active agents
+* code changes
+* reviews
+* tests
+* blockers
+* production-readiness status
+
+---
+
+# 24. User Interface
+
+Build a real application dashboard.
+
+At minimum include:
+
+## Project Dashboard
+
+Shows:
+
+* project status
+* current architecture version
+* build progress
+* active agents
+* completed tasks
+* failed tasks
+* blockers
+* tests
+* production readiness
+
+## Architecture View
+
+Shows:
+
+* system components
+* dependencies
+* APIs
+* database
+* infrastructure
+* architecture decisions
+* frozen status
+* architecture version
+
+## Agent View
+
+Shows:
+
+* agent role
+* model
+* current task
+* state
+* recent activity
+* token/cost information where available
+* errors
+
+## Task Graph
+
+Visualize:
+
+```text
+planned
+queued
+running
+reviewing
+blocked
+failed
+completed
+```
+
+with dependencies.
+
+## Repository View
+
+Show:
+
+* branches
+* commits
+* pull requests
+* changed files
+* reviews
+
+## Verification View
+
+Show:
+
+* tests
+* lint
+* type checks
+* security
+* integrations
+* runtime validation
+* fake implementation detection
+* production readiness
+
+## Credentials View
+
+Show:
+
+* required credentials
+* configured/unconfigured
+* test/live
+* validation status
+
+Never display secret values.
+
+---
+
+# 25. Start Build Workflow
+
+The central UX should be extremely simple.
+
+The user should eventually be able to reach:
+
+```text
+Architecture Approved
+
+Architecture:
+v1.0 — FROZEN
+
+Required credentials:
+✓ configured
+✓ configured
+✓ configured
+
+GitHub:
+✓ connected
+
+Preflight:
+✓ passed
+
+               [ START BUILD ]
+```
+
+Once Start Build is pressed, the system should execute the task graph.
+
+---
+
+# 26. Build State Machine
+
+Implement explicit project states.
+
+For example:
+
+```text
+DRAFT
+ARCHITECTING
+AWAITING_ARCHITECTURE_APPROVAL
+ARCHITECTURE_FROZEN
+PREFLIGHT
+BUILDING
+VERIFYING
+BLOCKED
+HUMAN_REVIEW_REQUIRED
+PRODUCTION_READY
+DEPLOYED
+FAILED
+```
+
+Do not rely on free-form strings scattered through the codebase.
+
+Use a formal state machine / validated enum architecture.
+
+---
+
+# 27. Observability
+
+The platform itself must be observable.
+
+Track:
+
+* agent executions
+* latency
+* tokens
+* cost
+* failures
+* retries
+* model/provider failures
+* task durations
+* verification failures
+* architecture violations
+* repository changes
+
+Provide project-level and execution-level logs.
+
+---
+
+# 28. Cost Control
+
+Because users may use paid models, make model execution economically controllable.
+
+Support:
+
+* token budgets
+* project budgets
+* task budgets
+* model routing by cost
+* retries with cheaper models
+* context minimization
+* model fallback
+* caching where appropriate
+
+The user should be able to see estimated and actual LLM costs.
+
+---
+
+# 29. Reliability
+
+LLM providers fail.
+
+Support:
+
+* timeout handling
+* retry policies
+* exponential backoff
+* provider fallback
+* rate-limit handling
+* malformed response recovery
+* structured output validation
+* idempotent task execution
+
+A single failed model call should not corrupt the project state.
+
+---
+
+# 30. Structured Agent Outputs
+
+Whenever possible require agents to return structured outputs rather than arbitrary prose.
+
+Examples:
+
+```json
+{
+  "status": "completed",
+  "filesChanged": [],
+  "testsRequired": [],
+  "issuesFound": [],
+  "architectureImpact": "none"
+}
+```
+
+Use schema validation.
+
+Reject malformed agent outputs.
+
+---
+
+# 31. Security Architecture
+
+The platform handles:
+
+* GitHub credentials
+* LLM API keys
+* user source code
+* production API keys
+
+Therefore security must be treated as a first-class architecture concern.
+
+Implement:
+
+* encryption at rest where appropriate
+* secure secret storage
+* least privilege
+* scoped GitHub permissions
+* audit logging
+* credential isolation
+* tenant isolation
+* role-based access control
+* secure secret injection
+* no secrets in logs
+* no secrets sent to models unless absolutely required
+* webhook verification
+
+Do not expose repository secrets to implementation agents unless technically necessary.
+
+Prefer tooling where agents invoke secure operations without seeing the secret.
+
+---
+
+# 32. Multi-Tenant Architecture
+
+Design the platform so separate users/projects cannot access one another's:
+
+* repositories
+* credentials
+* project state
+* agent execution history
+* logs
+* generated artifacts
+
+Even if multi-tenancy is not fully exposed in the first UI, the internal architecture should support it.
+
+---
+
+# 33. Extensible Provider Architecture
+
+Build adapters around providers.
+
+Do not scatter provider-specific API calls throughout the codebase.
+
+Use interfaces such as:
+
+```text
+LLMProvider
+GitProvider
+CredentialProvider
+ExecutionProvider
+DeploymentProvider
+```
+
+This allows future support for:
+
+* GitHub
+* GitLab
+* Bitbucket
+* local Git
+* additional LLM providers
+* cloud providers
+* local models
+
+---
+
+# 34. Model Selection
+
+Do not hard-code today's models as architectural dependencies.
+
+Create a provider/model registry.
+
+The system should be able to discover/configure:
+
+```text
+provider
+model
+capabilities
+context window
+pricing
+rate limits
+structured output support
+tool support
+```
+
+The orchestration engine should work even as individual models disappear or are replaced.
+
+---
+
+# 35. Project Memory
+
+Do NOT let project memory become an endlessly growing chat transcript.
+
+Maintain durable project artifacts:
+
+```text
+requirements
+architecture
+architecture decisions
+constraints
+coding conventions
+product decisions
+task state
+known issues
+test evidence
+deployment configuration
+```
+
+Memory should be:
+
+* structured
+* versioned
+* searchable
+* scoped
+
+---
+
+# 36. Architecture Decision Records
+
+Every major architecture decision should become an ADR.
+
+Example:
+
+```text
+ADR-001
+Decision: PostgreSQL
+Status: accepted
+Reason: ...
+Alternatives considered: ...
+Consequences: ...
+```
+
+The Guardian can use these to understand intentional decisions without reconstructing history from thousands of messages.
+
+---
+
+# 37. Repository Instruction System
+
+Support project-level instructions such as:
+
+```text
+PROJECT.md
+ARCHITECTURE.md
+AGENTS.md
+CONTRIBUTING.md
+```
+
+Allow agents to consume these as scoped instructions.
+
+The platform should generate and maintain them where useful.
+
+---
+
+# 38. Generated Product Must Be Deployable
+
+At the end of a successful build, the repository must contain an actual deployment path.
+
+Examples:
+
+```text
+Dockerfile
+docker-compose.yml
+CI/CD configuration
+environment documentation
+database migrations
+deployment scripts/configuration
+health checks
+```
+
+depending on the selected architecture.
+
+Do not create infrastructure artifacts that are merely decorative.
+
+They must correspond to the actual application.
+
+---
+
+# 39. Real-World Integration Requirement
+
+When a project specifies an external service, the implementation should use the real service API.
+
+Mocks are acceptable only for:
+
+* isolated unit tests
+* local development
+* controlled test environments
+
+Mocks must never silently become the production implementation.
+
+---
+
+# 40. End-to-End Proof
+
+For every major user journey, create an end-to-end verification path.
+
+Example:
+
+```text
+User signs up
+↓
+authentication succeeds
+↓
+database record created
+↓
+dashboard loads
+↓
+user performs action
+↓
+backend processes action
+↓
+external service invoked
+↓
+result persisted
+↓
+UI reflects actual result
+```
+
+The verification system should prove the complete chain.
+
+---
+
+# 41. Completion Score
+
+Do not use a simplistic percentage like:
+
+```text
+87% built
+```
+
+unless that number is backed by actual evidence.
+
+Instead expose dimensions such as:
+
+```text
+Architecture: PASSED
+Implementation: PASSED
+Tests: PASSED
+Integration: PASSED
+Security: PASSED
+Runtime: PASSED
+Deployment: PASSED
+Production Readiness: PASSED
+```
+
+---
+
+# 42. Failure Transparency
+
+When the system cannot complete a project, it must state exactly why.
+
+Never claim:
+
+> "Production ready"
+
+when the actual state is:
+
+> "The payment provider integration could not be validated because a credential is missing."
+
+Instead say:
+
+```text
+BLOCKED
+
+Reason:
+STRIPE_WEBHOOK_SECRET has not been provided.
+
+Affected:
+Payment processing
+
+Required:
+Provide Stripe test or production webhook secret.
+```
+
+---
+
+# 43. MVP Scope
+
+Build the first version around:
+
+### Required
+
+* user authentication
+* project creation
+* BYOK LLM providers
+* GitHub connection
+* architecture generation
+* architecture approval
+* architecture freeze
+* task graph
+* multi-agent orchestration
+* implementation agents
+* Architecture Guardian
+* independent code review
+* automated tests
+* production readiness gate
+* credential manifest
+* project dashboard
+* repository synchronization
+* Git commits
+* agent execution history
+
+### Avoid initially unless necessary
+
+* full browser-based IDE
+* elaborate code editing
+* social features
+* marketplace
+* billing complexity
+* team collaboration
+* unnecessary visual polish
+
+The core value proposition is **autonomous software construction**, not being another code editor.
+
+---
+
+# 44. Recommended Internal Architecture
+
+You are free to improve this, but reason explicitly about a structure similar to:
+
+```text
+Frontend
+   ↓
+API / Control Plane
+   ↓
+Project Orchestrator
+   ↓
+Task Graph
+   ↓
+Agent Runtime
+   ├── Architect
+   ├── Architecture Guardian
+   ├── Code Reviewer
+   ├── Frontend Agent
+   ├── Backend Agent
+   ├── Database Agent
+   ├── Infrastructure Agent
+   ├── Integration Agent
+   └── QA Agent
+   ↓
+Tool Layer
+   ├── Git
+   ├── GitHub
+   ├── filesystem
+   ├── shell
+   ├── test runner
+   ├── package manager
+   ├── browser / E2E
+   └── deployment tools
+   ↓
+Verification Engine
+   ↓
+Production Readiness Gate
+```
+
+The actual implementation may differ if you can justify something superior.
+
+---
+
+# 45. Important Principle: Tools, Not Just Prompts
+
+Agents need tools.
+
+Do not build a system where every agent merely receives text and returns text.
+
+Implement controlled tool execution.
+
+Examples:
+
+```text
+read_file
+write_file
+edit_file
+search_repository
+run_command
+run_tests
+inspect_git
+create_branch
+commit
+create_pull_request
+inspect_logs
+inspect_database
+run_browser_test
+inspect_deployment
+```
+
+Tool permissions should be role-specific.
+
+For example:
+
+The Architecture Guardian should generally have read-only access.
+
+Implementation agents may have write access on assigned branches.
+
+Review agents should have read-only repository access.
+
+---
+
+# 46. Agent Permission Model
+
+Implement explicit permissions.
+
+Example:
+
+```text
+Architect:
+read repository
+write architecture artifacts
+no production deployment
+
+Implementation:
+read/write assigned branch
+run tests
+no production deployment
+
+Guardian:
+read-only
+
+Reviewer:
+read-only
+
+Deployment Agent:
+read infrastructure
+deploy only after approval
+```
+
+Do not allow agents unrestricted access simply because it is convenient.
+
+---
+
+# 47. Autonomous Build Loop
+
+The actual autonomous loop should resemble:
+
+```text
+1. Load frozen architecture
+2. Load task graph
+3. Select executable task
+4. Assign appropriate agent/model
+5. Retrieve minimal required context
+6. Execute implementation
+7. Run local tests
+8. Commit changes
+9. Run Architecture Guardian
+10. Run independent code review
+11. Run integration tests
+12. Mark task completed OR create repair task
+13. Recompute task graph
+14. Continue
+15. Run production readiness gate
+16. If failed, create remediation tasks
+17. Continue until:
+      PRODUCTION_READY
+      OR HUMAN_REVIEW_REQUIRED
+```
+
+This loop is the heart of the platform.
+
+---
+
+# 48. Never Let LLMs Modify the Definition of Done
+
+The system must define completion independently from agent claims.
+
+An implementation agent must not be allowed to say:
+
+```text
+"skip integration tests"
+```
+
+and thereby complete its task.
+
+Likewise:
+
+```text
+"this feature is production-ready"
+```
+
+is not evidence.
+
+The platform's verification engine is authoritative.
+
+---
+
+# 49. Prompt Engineering Architecture
+
+Do not put the entire system prompt into every agent.
+
+Build composable prompts:
+
+```text
+Base Agent Policy
++
+Role Policy
++
+Project Constraints
++
+Architecture Context
++
+Task Context
++
+Relevant Repository Context
++
+Verification Requirements
+```
+
+This will reduce context growth and improve reliability.
+
+Version prompts.
+
+Track:
+
+```text
+promptVersion
+agentVersion
+model
+task
+```
+
+for reproducibility.
+
+---
+
+# 50. Model Independence
+
+Do not design the architecture around a specific vendor.
+
+The platform should treat LLMs as interchangeable execution engines.
+
+The following should be replaceable:
+
+```text
+OpenAI
+Anthropic
+Google
+xAI
+open-source models
+local models
+future providers
+```
+
+Use adapters.
+
+---
+
+# 51. Build the Platform Itself to Production Quality
+
+This requirement applies recursively.
+
+The platform you are building must itself be:
+
+* tested
+* secure
+* observable
+* deployable
+* documented
+* production-ready
+
+Do not build a low-quality prototype while calling it the production platform.
+
+---
+
+# 52. Implementation Process You Must Follow
+
+Before writing code:
+
+## Phase 1 — Inspect
+
+Inspect the existing codebase deeply.
+
+Identify:
+
+* existing architecture
+* framework
+* database
+* services
+* authentication
+* APIs
+* Git integration
+* existing agent logic
+* test infrastructure
+* deployment configuration
+
+Do not assume the repository is empty.
+
+## Phase 2 — Architectural Review
+
+Create a concrete architecture for this platform itself.
+
+Identify:
+
+* components
+* services
+* database schema
+* data flow
+* agent runtime
+* task graph
+* provider abstraction
+* secret management
+* GitHub integration
+* verification engine
+
+## Phase 3 — Gap Analysis
+
+Compare the proposed architecture with the current codebase.
+
+Clearly classify:
+
+```text
+KEEP
+MODIFY
+REPLACE
+ADD
+```
+
+## Phase 4 — Implement Foundation
+
+Build:
+
+* project model
+* agent model
+* task model
+* architecture model
+* execution model
+* provider abstraction
+* GitHub integration
+* credential management
+
+## Phase 5 — Implement Orchestration
+
+Build the task graph and agent execution engine.
+
+## Phase 6 — Implement Verification
+
+Build:
+
+* tests
+* Guardian
+* independent reviewer
+* fake implementation detector
+* production readiness gate
+
+## Phase 7 — Implement UI
+
+Build the dashboard and core user workflow.
+
+## Phase 8 — End-to-End Validation
+
+Actually execute the platform against at least one realistic software project.
+
+Do not stop after implementing the framework.
+
+Use the platform to generate/build a real sample product and prove that the orchestration system works.
+
+---
+
+# 53. Dogfooding Requirement
+
+The strongest validation of this platform is to make it build something.
+
+After the platform is implemented sufficiently, use the platform itself to build a non-trivial sample application.
+
+The sample application should include:
+
+* authentication
+* database
+* API
+* frontend
+* one external integration
+* background processing where appropriate
+* deployment configuration
+* tests
+
+This must exercise:
+
+* Architect
+* implementation agent
+* Guardian
+* code reviewer
+* QA
+* task graph
+* GitHub
+* credential preflight
+* production readiness gate
+
+Fix the platform based on failures found during this dogfooding run.
+
+---
+
+# 54. Required Deliverables
+
+When finished, provide:
+
+1. Complete implementation.
+2. Database schema and migrations.
+3. API implementation.
+4. Frontend.
+5. Agent runtime.
+6. LLM provider abstraction.
+7. GitHub integration.
+8. Task graph.
+9. Architecture contract system.
+10. Architecture Guardian.
+11. Code review system.
+12. Verification system.
+13. Production readiness gate.
+14. Credential manifest/preflight.
+15. Security controls.
+16. Tests.
+17. Deployment configuration.
+18. Documentation.
+19. Example project.
+20. End-to-end proof that the system works.
+
+---
+
+# 55. Documentation Requirements
+
+Document:
+
+```text
+README.md
+ARCHITECTURE.md
+AGENTS.md
+SECURITY.md
+DEPLOYMENT.md
+DEVELOPMENT.md
+PRODUCTION_READINESS.md
+```
+
+Also document:
+
+* how to configure LLM providers
+* how BYOK works
+* how GitHub authentication works
+* how architecture freeze works
+* how agents are orchestrated
+* how the Guardian works
+* how credentials work
+* how production readiness is determined
+* how to add a new LLM provider
+* how to add a new agent type
+
+---
+
+# 56. Acceptance Criteria
+
+The project is NOT complete merely because the code has been written.
+
+It is complete only when the following are demonstrably true:
+
+### User Experience
+
+A user can:
+
+```text
+Create project
+→ connect GitHub
+→ configure LLM
+→ provide product specification
+→ generate architecture
+→ approve architecture
+→ freeze architecture
+→ provide required credentials
+→ press Start Build
+→ watch agents work
+→ inspect changes
+→ receive completed repository
+```
+
+### Engineering
+
+The platform actually:
+
+```text
+creates tasks
+assigns agents
+executes tools
+modifies repositories
+commits code
+runs tests
+reviews code
+checks architecture
+repairs failures
+tracks evidence
+determines readiness
+```
+
+### Production
+
+A generated project must contain:
+
+```text
+real implementations
+real persistence
+real APIs
+real integrations
+real error handling
+real authentication
+real tests
+real deployment configuration
+```
+
+and must not depend on hidden simulation.
+
+---
+
+# 57. Absolute Anti-Handwave Rule
+
+This rule overrides convenience:
+
+**Never claim something is implemented because the code looks like it should work.**
+
+Verify it.
+
+Never claim:
+
+```text
+"integrated"
+```
+
+without actually exercising the integration.
+
+Never claim:
+
+```text
+"production ready"
+```
+
+without passing the Production Readiness Gate.
+
+Never claim:
+
+```text
+"architecture compliant"
+```
+
+without passing Architecture Guardian verification.
+
+Never claim:
+
+```text
+"feature complete"
+```
+
+without passing its acceptance tests.
+
+Never hide incomplete work behind:
+
+```text
+TODO
+placeholder
+mock
+stub
+fake service
+static JSON
+temporary implementation
+```
+
+in production execution paths.
+
+---
+
+# 58. Your Operating Behavior as the Coding Agent
+
+Do not merely explain what you would build.
+
+Build it.
+
+Do not stop at architecture.
+
+Do not stop at database schemas.
+
+Do not stop at API definitions.
+
+Do not stop at UI scaffolding.
+
+Do not stop after tests compile.
+
+Do not stop after simulated integrations.
+
+Continue implementation until the defined acceptance criteria are satisfied.
+
+When something blocks implementation:
+
+1. diagnose it
+2. determine whether it is an architecture issue, implementation issue, infrastructure issue, or missing credential
+3. fix it autonomously where possible
+4. otherwise surface a concrete human action
+
+Do not produce vague statements such as:
+
+> "This should be production-ready after further testing."
+
+Instead either perform the testing or clearly identify the exact unresolved evidence.
+
+---
+
+# 59. First Action
+
+Before changing the codebase:
+
+1. Inspect the complete existing repository.
+2. Identify the current architecture.
+3. Identify existing reusable components.
+4. Identify architectural contradictions.
+5. Propose the target architecture for the platform.
+6. Map current code to target architecture.
+7. Identify the minimum sequence of implementation changes.
+8. Then begin implementation.
+
+Do not rewrite working components unnecessarily.
+
+Do not create duplicate systems when an existing subsystem can be upgraded.
+
+---
+
+# 60. Final Instruction
+
+Treat this project as the foundation of a **real autonomous software-building platform**.
+
+The goal is not:
+
+> "an AI that writes code."
+
+The goal is:
+
+> **a controlled multi-agent engineering system that can take an approved architecture, build an actual software product inside a real Git repository, independently verify the implementation, prevent architecture drift, and refuse to declare production readiness until the evidence proves the product is genuinely operational.**
+
+Build the system accordingly.
+
+When you finish each major phase, report:
+
+```text
+PHASE
+STATUS
+
+Implemented:
+...
+
+Verified:
+...
+
+Evidence:
+...
+
+Remaining blockers:
+...
+
+Next action:
+...
+```
+
+Do not fabricate evidence.
+
+Do not claim completion without verification.
+
+Begin by inspecting the existing codebase.

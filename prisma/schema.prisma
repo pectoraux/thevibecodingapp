@@ -1,0 +1,375 @@
+// Forge — Multi-LLM Vibe Coding Platform
+// Prisma schema for the autonomous software factory.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// LLM Providers (BYOK)
+// ---------------------------------------------------------------------------
+
+model LlmProvider {
+  id          String   @id @default(cuid())
+  name        String                 // user-facing label e.g. "OpenAI Primary"
+  provider    String                 // "zai" | "openai" | "anthropic" | "google" | "xai" | "local"
+  model       String                 // e.g. "glm-4.6"
+  apiKey      String                 // encrypted at rest (rotating XOR obfuscation for demo)
+  capabilities String                // JSON array: ["coding","reasoning","long_context"]
+  contextWindow Int      @default(128000)
+  pricingPer1kInput  Float @default(0)
+  pricingPer1kOutput Float @default(0)
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agentAssignments AgentAssignment[]
+  executions       AgentExecution[]
+}
+
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+model Project {
+  id            String   @id @default(cuid())
+  name          String
+  description   String
+  productSpec   String                 // user-provided product specification
+  requirements  String                 // functional + non-functional constraints
+  stack         String                 // desired tech stack (free text)
+  status        String   @default("DRAFT")  // ProjectStatus enum
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // GitHub connection (simulated, DB-backed virtual repo)
+  githubRepo        String?            // owner/name
+  githubConnected   Boolean  @default(false)
+  githubDefaultBranch String  @default("main")
+
+  // Architecture
+  architecture      Architecture?
+  changeRequests    ArchitectureChangeRequest[]
+  tasks             Task[]
+  agents            AgentAssignment[]
+  credentials       Credential[]
+  events            BuildEvent[]
+  files             RepoFile[]
+  branches          RepoBranch[]
+  commits           RepoCommit[]
+  pullRequests      PullRequest[]
+  readinessChecks   ReadinessCheck[]
+  adrs              Adr[]
+}
+
+// ---------------------------------------------------------------------------
+// Architecture Contract
+// ---------------------------------------------------------------------------
+
+model Architecture {
+  id           String   @id @default(cuid())
+  projectId    String   @unique
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  version      String   @default("v1.0")
+  hash         String                 // sha of canonical JSON
+  frozen       Boolean  @default(false)
+  frozenAt     DateTime?
+
+  // Machine-readable contract (JSON string)
+  contractJson String                 // full Architecture Contract
+  // Human-readable markdown
+  contractMd   String
+
+  // Derived structures (denormalized for fast UI)
+  components   String                 // JSON array of component descriptors
+  dataModels   String                 // JSON array of data model descriptors
+  apiContracts String                 // JSON array of API endpoint descriptors
+  integrations String                 // JSON array of external integrations
+  invariants   String                 // JSON array of invariants Guardian enforces
+  constraints  String                 // JSON array of coding/infra constraints
+  testingStrategy String             // JSON
+  deploymentModel  String             // JSON
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model ArchitectureChangeRequest {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  problem     String
+  affectedComponents String           // JSON array
+  proposedChange String
+  rationale   String
+  risks       String
+  migrationRequirements String
+  affectedTests String               // JSON array
+  affectedApis String                // JSON array
+  affectedDependencies String        // JSON array
+  estimatedImpact String
+  status      String   @default("OPEN") // OPEN | APPROVED | REJECTED | IMPLEMENTED
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Adr {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  number      Int
+  title       String
+  decision    String
+  status      String   @default("accepted") // proposed | accepted | deprecated
+  reason      String
+  alternatives String
+  consequences String
+  createdAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Task Graph
+// ---------------------------------------------------------------------------
+
+model Task {
+  id                 String   @id @default(cuid())
+  projectId          String
+  project            Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  code               String                 // e.g. "T-001"
+  title              String
+  description        String
+  component          String                 // which architecture component
+  agentType          String                 // AgentType enum
+  dependencies       String   @default("[]") // JSON array of task codes
+  inputs             String   @default("[]") // JSON array
+  outputs            String   @default("[]") // JSON array
+  acceptanceCriteria String   @default("[]") // JSON array
+  requiredTests      String   @default("[]") // JSON array
+  priority           Int      @default(5)    // 1 high → 10 low
+  risk               String   @default("MEDIUM") // LOW | MEDIUM | HIGH
+  status             String   @default("PLANNED") // TaskStatus enum
+  attempts           Int      @default(0)
+  maxAttempts        Int      @default(3)
+  assignedModel      String?
+  reviewStatus       String   @default("PENDING") // PENDING | PASSED | CHANGES_REQUESTED | FAILED
+  architectureStatus String   @default("PENDING") // PENDING | PASS | WARNING | VIOLATION
+  readinessStatus    String   @default("PENDING") // PENDING | PASSED | FAILED
+
+  branchName         String?
+  commitSha          String?
+  filesChangedJson   String   @default("[]") // JSON array of file paths
+  testResultsJson    String   @default("[]") // JSON array of test result objects
+  guardianResultJson String?               // JSON Guardian verdict
+  reviewResultJson   String?               // JSON Reviewer verdict
+  implementationLog  String?               // raw agent output
+
+  failureReason      String?
+  blockedReason      String?
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  startedAt          DateTime?
+  completedAt        DateTime?
+
+  executions         AgentExecution[]
+}
+
+// ---------------------------------------------------------------------------
+// Agent Assignments (which model serves which role for this project)
+// ---------------------------------------------------------------------------
+
+model AgentAssignment {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  agentType   String                  // AgentType enum
+  providerId  String?
+  provider    LlmProvider? @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  // last execution snapshot
+  currentTaskId String?
+  state        String   @default("IDLE") // IDLE | RUNNING | WAITING | ERROR
+  lastActivity String?
+  tokensUsed   Int      @default(0)
+  costUsd      Float    @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  executions   AgentExecution[]
+}
+
+// ---------------------------------------------------------------------------
+// Agent Executions (evidence ledger)
+// ---------------------------------------------------------------------------
+
+model AgentExecution {
+  id            String   @id @default(cuid())
+  projectId     String
+  taskId        String?
+  agentType     String                  // AgentType enum
+  providerId    String?
+  provider      LlmProvider? @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  model         String
+  promptVersion String
+  inputContext  String                 // JSON: what context was sent
+  output        String                 // raw LLM output
+  assignmentId  String?
+  outputJson    String?                // parsed structured output if any
+  filesChanged  String   @default("[]") // JSON array
+  commitSha     String?
+  testResults   String?                // JSON
+  reviewResult  String?                // JSON
+  guardianResult String?               // JSON
+  architectureVersion String?
+  tokensInput   Int      @default(0)
+  tokensOutput  Int      @default(0)
+  costUsd       Float    @default(0)
+  durationMs    Int      @default(0)
+  success       Boolean  @default(true)
+  errorMessage  String?
+  createdAt     DateTime @default(now())
+
+  task          Task?    @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  assignment    AgentAssignment? @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+}
+
+// ---------------------------------------------------------------------------
+// Credentials / Secrets Manifest
+// ---------------------------------------------------------------------------
+
+model Credential {
+  id            String   @id @default(cuid())
+  projectId     String
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name          String                 // e.g. STRIPE_SECRET_KEY
+  purpose       String
+  environment   String   @default("production") // production | test | sandbox | development
+  provider      String?
+  required      Boolean  @default(true)
+  optional      Boolean  @default(false)
+  validationMethod String?
+  testSandboxSupport Boolean @default(false)
+  whenRequired  String?
+  // value is stored obfuscated; never sent to LLMs as plaintext
+  value         String?
+  configured    Boolean  @default(false)
+  validated     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Repository (DB-backed GitHub simulation)
+// ---------------------------------------------------------------------------
+
+model RepoBranch {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name        String
+  fromBranch  String?
+  headSha     String?
+  protected   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@unique([projectId, name])
+}
+
+model RepoCommit {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sha         String
+  branchName  String
+  parentSha   String?
+  authorName  String   @default("forge-bot")
+  authorEmail String   @default("forge@local")
+  message     String
+  filesChangedJson String @default("[]") // JSON array of {path, action}
+  taskId      String?
+  createdAt   DateTime @default(now())
+}
+
+model RepoFile {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  path        String
+  content     String
+  language    String?
+  bytes       Int      @default(0)
+  // provenance
+  createdInCommit String?
+  taskId      String?
+  // fake-impl detector flags
+  suspiciousPatterns String @default("[]") // JSON array of patterns found
+  reviewed    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([projectId, path])
+}
+
+model PullRequest {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  number      Int
+  title       String
+  branchName  String
+  baseBranch  String   @default("main")
+  state       String   @default("OPEN") // OPEN | MERGED | CLOSED
+  body        String?
+  taskId      String?
+  commitsJson String   @default("[]")
+  filesJson   String   @default("[]")
+  mergedAt    DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([projectId, number])
+}
+
+// ---------------------------------------------------------------------------
+// Verification — Production Readiness Gate
+// ---------------------------------------------------------------------------
+
+model ReadinessCheck {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  category    String                  // BUILD | STATIC | TESTS | RUNTIME | INTEGRATIONS | DATA | AUTH | ERRORS | OBSERVABILITY | SECURITY | CONFIG | DEPLOYMENT
+  name        String
+  description String
+  required    Boolean  @default(true)
+  status      String   @default("PENDING") // PENDING | PASSED | FAILED | WARNING
+  evidence    String?                 // JSON evidence object
+  failureReason String?
+  checkedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Build Events (audit log / live feed)
+// ---------------------------------------------------------------------------
+
+model BuildEvent {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  type        String                  // e.g. ARCHITECTURE_FROZEN, TASK_STARTED, COMMIT, GUARDIAN_PASS, REVIEW_FAILED
+  level       String   @default("info") // info | warn | error | success
+  message     String
+  taskId      String?
+  agentType   String?
+  payload     String?                 // JSON
+  createdAt   DateTime @default(now())
+}
