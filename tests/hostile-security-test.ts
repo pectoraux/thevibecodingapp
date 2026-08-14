@@ -20,16 +20,27 @@ interface TestResult {
 // --- Token helpers ---
 
 function signToken(payload: any): string {
-  const data = `${payload.jobId}.${payload.projectId}.${payload.attempt}.${payload.issuedAt}.${payload.expiresAt}.${payload.nonce}`;
+  const data = [
+    payload.iss, payload.aud, payload.jobId, payload.executionId,
+    payload.projectId, payload.tenantId, payload.attempt,
+    JSON.stringify(payload.capabilities), payload.iat, payload.exp, payload.nonce,
+  ].join(".");
   return createHmac("sha256", WORKER_SECRET).update(data).digest("hex");
 }
 
-function createToken(jobId: string, projectId: string, attempt: number, expiresAt?: number): string {
+function createToken(jobId: string, projectId: string, attempt: number, opts?: { expiresAt?: number; iss?: string; aud?: string }): string {
   const now = Date.now();
   const payload = {
-    jobId, projectId, attempt,
-    issuedAt: now,
-    expiresAt: expiresAt || now + 300000,
+    iss: opts?.iss || "forge-control-plane",
+    aud: opts?.aud || "forge-worker",
+    jobId,
+    executionId: `${jobId}-${attempt}`,
+    projectId,
+    tenantId: projectId,
+    attempt,
+    capabilities: ["git", "node", "test", "build"],
+    iat: now,
+    exp: opts?.expiresAt || now + 300000,
     nonce: randomUUID(),
   };
   const token = { ...payload, signature: signToken(payload) };
@@ -38,8 +49,9 @@ function createToken(jobId: string, projectId: string, attempt: number, expiresA
 
 function createInvalidToken(): string {
   return `Bearer ${Buffer.from(JSON.stringify({
-    jobId: "fake", projectId: "fake", attempt: 0,
-    issuedAt: Date.now(), expiresAt: Date.now() + 300000,
+    iss: "forge-control-plane", aud: "forge-worker",
+    jobId: "fake", executionId: "fake-0", projectId: "fake", tenantId: "fake",
+    attempt: 0, capabilities: [], iat: Date.now(), exp: Date.now() + 300000,
     nonce: "fake", signature: "invalidsignature",
   })).toString("base64")}`;
 }
@@ -47,9 +59,9 @@ function createInvalidToken(): string {
 function createExpiredToken(): string {
   const now = Date.now();
   const payload = {
-    jobId: "expired", projectId: "test-project", attempt: 0,
-    issuedAt: now - 600000,
-    expiresAt: now - 300000, // expired 5 minutes ago
+    iss: "forge-control-plane", aud: "forge-worker",
+    jobId: "expired", executionId: "expired-0", projectId: "test-project", tenantId: "test-project",
+    attempt: 0, capabilities: ["git", "node"], iat: now - 600000, exp: now - 300000,
     nonce: randomUUID(),
   };
   const token = { ...payload, signature: signToken(payload) };
@@ -136,18 +148,58 @@ async function testUnauthenticatedAccess(): Promise<TestResult[]> {
     results.push({ name: "Unauthenticated /security-audit → 401", passed: false, details: err.message });
   }
 
+  // Test: wrong issuer → 403
+  try {
+    const token = createToken("wrong-iss", "test-project", 0, { iss: "wrong-issuer" });
+    const res = await fetchAuth("/sandbox", token, { projectId: "test-project" });
+    results.push({
+      name: "Wrong issuer → 403",
+      passed: res.status === 403,
+      details: `Got status ${res.status}: ${typeof res.body === 'object' ? res.body.error : res.body}`,
+    });
+  } catch (err: any) {
+    results.push({ name: "Wrong issuer → 403", passed: false, details: err.message });
+  }
+
+  // Test: wrong audience → 403
+  try {
+    const token = createToken("wrong-aud", "test-project", 0, { aud: "wrong-audience" });
+    const res = await fetchAuth("/sandbox", token, { projectId: "test-project" });
+    results.push({
+      name: "Wrong audience → 403",
+      passed: res.status === 403,
+      details: `Got status ${res.status}: ${typeof res.body === 'object' ? res.body.error : res.body}`,
+    });
+  } catch (err: any) {
+    results.push({ name: "Wrong audience → 403", passed: false, details: err.message });
+  }
+
+  // Test: replay attack (same nonce used twice) → second request 403
+  try {
+    const token = createToken("replay-test", "test-project", 0);
+    const res1 = await fetchAuth("/sandbox", token, { projectId: "test-project" });
+    // Reuse the same token (same nonce) — should be rejected.
+    const res2 = await fetchAuth("/sandbox", token, { projectId: "test-project" });
+    results.push({
+      name: "Replay attack (reused nonce) rejected",
+      passed: res2.status === 403,
+      details: `First: ${res1.status}, Second (replay): ${res2.status}: ${typeof res2.body === 'object' ? res2.body.error : res2.body}`,
+    });
+  } catch (err: any) {
+    results.push({ name: "Replay attack rejected", passed: false, details: err.message });
+  }
+
   return results;
 }
 
 async function testPathContainment(): Promise<TestResult[]> {
   const results: TestResult[] = [];
   const projectId = "path-test-project";
-  const token = createToken("path-test", projectId, 0);
 
-  // Create a sandbox first.
+  // Create a sandbox first (each request gets a fresh token to avoid replay).
   let sandboxId: string = "";
   try {
-    const res = await fetchAuth("/sandbox", token, { projectId });
+    const res = await fetchAuth("/sandbox", createToken("path-test-create", projectId, 0), { projectId });
     if (res.status === 200) sandboxId = res.body.sandboxId;
   } catch {}
 
@@ -158,7 +210,7 @@ async function testPathContainment(): Promise<TestResult[]> {
 
   // Test: path traversal in file write → 400
   try {
-    const res = await fetchAuth("/execute", token, {
+    const res = await fetchAuth("/execute", createToken("path-traversal-test", projectId, 0), {
       sandboxId,
       files: [{ path: "../../etc/passwd", content: "hacked" }],
       commands: [],
@@ -174,7 +226,7 @@ async function testPathContainment(): Promise<TestResult[]> {
 
   // Test: absolute path in file write → 400
   try {
-    const res = await fetchAuth("/execute", token, {
+    const res = await fetchAuth("/execute", createToken("abs-path-test", projectId, 0), {
       sandboxId,
       files: [{ path: "/etc/passwd", content: "hacked" }],
       commands: [],
@@ -190,7 +242,7 @@ async function testPathContainment(): Promise<TestResult[]> {
 
   // Test: null byte in path → 400
   try {
-    const res = await fetchAuth("/execute", token, {
+    const res = await fetchAuth("/execute", createToken("null-byte-test", projectId, 0), {
       sandboxId,
       files: [{ path: "safe\0../../etc/passwd", content: "hacked" }],
       commands: [],
@@ -204,8 +256,8 @@ async function testPathContainment(): Promise<TestResult[]> {
     results.push({ name: "Null byte rejected", passed: false, details: err.message });
   }
 
-  // Cleanup
-  await fetch(`${WORKER_URL}/sandbox/${sandboxId}`, { method: "DELETE", headers: { Authorization: token } });
+  // Cleanup (fresh token)
+  await fetch(`${WORKER_URL}/sandbox/${sandboxId}`, { method: "DELETE", headers: { Authorization: createToken("path-cleanup", projectId, 0) } });
 
   return results;
 }
@@ -213,12 +265,11 @@ async function testPathContainment(): Promise<TestResult[]> {
 async function testCommandPolicy(): Promise<TestResult[]> {
   const results: TestResult[] = [];
   const projectId = "cmd-test-project";
-  const token = createToken("cmd-test", projectId, 0);
 
-  // Create a sandbox.
+  // Create a sandbox (fresh token).
   let sandboxId: string = "";
   try {
-    const res = await fetchAuth("/sandbox", token, { projectId });
+    const res = await fetchAuth("/sandbox", createToken("cmd-create", projectId, 0), { projectId });
     if (res.status === 200) sandboxId = res.body.sandboxId;
   } catch {}
 
@@ -229,7 +280,7 @@ async function testCommandPolicy(): Promise<TestResult[]> {
 
   // Test: blocked command (shutdown) → command blocked
   try {
-    const res = await fetchAuth("/execute", token, {
+    const res = await fetchAuth("/execute", createToken("cmd-shutdown-test", projectId, 0), {
       sandboxId,
       commands: [{ command: "shutdown", args: ["-h", "now"] }],
     });
@@ -244,10 +295,8 @@ async function testCommandPolicy(): Promise<TestResult[]> {
   }
 
   // Test: fork bomb pattern in args → command blocked
-  // We test the pattern detection without actually executing a fork bomb.
-  // The pattern ":(){:|:&};:" should be detected by FORBIDDEN_ARG_PATTERNS.
   try {
-    const res = await fetchAuth("/execute", token, {
+    const res = await fetchAuth("/execute", createToken("cmd-fork-test", projectId, 0), {
       sandboxId,
       commands: [{ command: "bash", args: ["-c", ":(){ :|:& };:"] }],
     });
@@ -261,8 +310,8 @@ async function testCommandPolicy(): Promise<TestResult[]> {
     results.push({ name: "Fork bomb rejected", passed: false, details: err.message });
   }
 
-  // Cleanup
-  await fetch(`${WORKER_URL}/sandbox/${sandboxId}`, { method: "DELETE", headers: { Authorization: token } });
+  // Cleanup (fresh token)
+  await fetch(`${WORKER_URL}/sandbox/${sandboxId}`, { method: "DELETE", headers: { Authorization: createToken("cmd-cleanup", projectId, 0) } });
 
   return results;
 }
@@ -271,17 +320,15 @@ async function testCrossTenantIsolation(): Promise<TestResult[]> {
   const results: TestResult[] = [];
 
   // Tenant A creates a sandbox.
-  const tokenA = createToken("tenant-a-job", "tenant-a-project", 0);
   let sandboxIdA = "";
   try {
-    const res = await fetchAuth("/sandbox", tokenA, { projectId: "tenant-a-project" });
+    const res = await fetchAuth("/sandbox", createToken("tenant-a-create", "tenant-a-project", 0), { projectId: "tenant-a-project" });
     if (res.status === 200) sandboxIdA = res.body.sandboxId;
   } catch {}
 
-  // Tenant B tries to access tenant A's sandbox.
-  const tokenB = createToken("tenant-b-job", "tenant-b-project", 0);
+  // Tenant B tries to access tenant A's sandbox (fresh token for tenant B).
   try {
-    const res = await fetchAuth("/execute", tokenB, {
+    const res = await fetchAuth("/execute", createToken("tenant-b-intrusion", "tenant-b-project", 0), {
       sandboxId: sandboxIdA,
       commands: [{ command: "echo", args: ["intrusion"] }],
     });
@@ -294,9 +341,9 @@ async function testCrossTenantIsolation(): Promise<TestResult[]> {
     results.push({ name: "Cross-tenant sandbox access rejected", passed: false, details: err.message });
   }
 
-  // Cleanup
+  // Cleanup (fresh token for tenant A)
   if (sandboxIdA) {
-    await fetch(`${WORKER_URL}/sandbox/${sandboxIdA}`, { method: "DELETE", headers: { Authorization: tokenA } });
+    await fetch(`${WORKER_URL}/sandbox/${sandboxIdA}`, { method: "DELETE", headers: { Authorization: createToken("tenant-a-cleanup", "tenant-a-project", 0) } });
   }
 
   return results;
@@ -305,12 +352,11 @@ async function testCrossTenantIsolation(): Promise<TestResult[]> {
 async function testEnvironmentIsolation(): Promise<TestResult[]> {
   const results: TestResult[] = [];
   const projectId = "env-test-project";
-  const token = createToken("env-test", projectId, 0);
 
-  // Create a sandbox.
+  // Create a sandbox (fresh token).
   let sandboxId: string = "";
   try {
-    const res = await fetchAuth("/sandbox", token, { projectId });
+    const res = await fetchAuth("/sandbox", createToken("env-create", projectId, 0), { projectId });
     if (res.status === 200) sandboxId = res.body.sandboxId;
   } catch {}
 
@@ -320,10 +366,11 @@ async function testEnvironmentIsolation(): Promise<TestResult[]> {
   }
 
   // Test: child process cannot read platform secrets.
+  // Each request gets a fresh token to avoid replay detection.
   const secrets = ["DATABASE_URL", "FORGE_MASTER_KEY", "NEXTAUTH_SECRET", "GITHUB_PAT", "VERCEL_TOKEN", "FORGE_WORKER_SECRET"];
   for (const secret of secrets) {
     try {
-      const res = await fetchAuth("/execute", token, {
+      const res = await fetchAuth("/execute", createToken(`env-${secret}`, projectId, 0), {
         sandboxId,
         commands: [{ command: "printenv", args: [secret] }],
       });
@@ -339,8 +386,8 @@ async function testEnvironmentIsolation(): Promise<TestResult[]> {
     }
   }
 
-  // Cleanup
-  await fetch(`${WORKER_URL}/sandbox/${sandboxId}`, { method: "DELETE", headers: { Authorization: token } });
+  // Cleanup (fresh token)
+  await fetch(`${WORKER_URL}/sandbox/${sandboxId}`, { method: "DELETE", headers: { Authorization: createToken("env-cleanup", projectId, 0) } });
 
   return results;
 }

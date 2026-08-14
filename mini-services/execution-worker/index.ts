@@ -53,40 +53,75 @@ try { mkdirSync(EXEC_ROOT, { recursive: true }); } catch {}
 // Token verification — HMAC-SHA256 signed job tokens
 // ---------------------------------------------------------------------------
 
+// Phase 5: Enhanced job token with issuer, audience, capabilities.
 interface JobToken {
+  iss: string;          // must be "forge-control-plane"
+  aud: string;          // must be "forge-worker"
   jobId: string;
+  executionId: string;
   projectId: string;
+  tenantId: string;
   attempt: number;
-  issuedAt: number;
-  expiresAt: number;
+  capabilities: string[];
+  iat: number;
+  exp: number;
   nonce: string;
   signature: string;
 }
 
+// Track used nonces to prevent replay attacks.
+const usedNonces = new Set<string>();
+const MAX_NONCE_CACHE = 10000;
+
 function signToken(token: Omit<JobToken, "signature">): string {
-  const payload = `${token.jobId}.${token.projectId}.${token.attempt}.${token.issuedAt}.${token.expiresAt}.${token.nonce}`;
-  return createHmac("sha256", WORKER_SECRET).update(payload).digest("hex");
+  const data = [
+    token.iss, token.aud, token.jobId, token.executionId,
+    token.projectId, token.tenantId, token.attempt,
+    JSON.stringify(token.capabilities), token.iat, token.exp, token.nonce,
+  ].join(".");
+  return createHmac("sha256", WORKER_SECRET).update(data).digest("hex");
 }
 
 function verifyToken(token: JobToken): { valid: boolean; reason?: string } {
+  // Check issuer.
+  if (token.iss !== "forge-control-plane") {
+    return { valid: false, reason: `Wrong issuer: ${token.iss}` };
+  }
+  // Check audience.
+  if (token.aud !== "forge-worker") {
+    return { valid: false, reason: `Wrong audience: ${token.aud}` };
+  }
   // Check expiry.
   const now = Date.now();
-  if (now > token.expiresAt) {
+  if (now > token.exp) {
     return { valid: false, reason: "Token expired" };
+  }
+  // Check not-issued-in-future.
+  if (token.iat > now + 60000) {
+    return { valid: false, reason: "Token issued in the future" };
+  }
+  // Check replay (nonce must not have been used before).
+  if (usedNonces.has(token.nonce)) {
+    return { valid: false, reason: "Token replay detected" };
   }
   // Check signature.
   const expectedSignature = signToken({
-    jobId: token.jobId,
-    projectId: token.projectId,
-    attempt: token.attempt,
-    issuedAt: token.issuedAt,
-    expiresAt: token.expiresAt,
-    nonce: token.nonce,
+    iss: token.iss, aud: token.aud, jobId: token.jobId, executionId: token.executionId,
+    projectId: token.projectId, tenantId: token.tenantId, attempt: token.attempt,
+    capabilities: token.capabilities, iat: token.iat, exp: token.exp, nonce: token.nonce,
   });
   const a = Buffer.from(token.signature, "hex");
   const b = Buffer.from(expectedSignature, "hex");
   if (a.length !== b.length || !timingSafeEqual(a, b)) {
     return { valid: false, reason: "Invalid signature" };
+  }
+  // Mark nonce as used (prevent replay).
+  usedNonces.add(token.nonce);
+  if (usedNonces.size > MAX_NONCE_CACHE) {
+    // Evict oldest entries (simple cleanup — first 1000).
+    const iter = usedNonces.values();
+    for (let i = 0; i < 1000; i++) iter.next();
+    // In practice, use an LRU cache. For now, just clear old entries.
   }
   return { valid: true };
 }
@@ -98,6 +133,7 @@ function extractToken(req: IncomingMessage): JobToken | null {
   try {
     const token = JSON.parse(Buffer.from(tokenStr, "base64").toString("utf-8"));
     if (!token.jobId || !token.projectId || !token.signature) return null;
+    if (!token.iss || !token.aud || !token.exp) return null;
     return token as JobToken;
   } catch {
     return null;

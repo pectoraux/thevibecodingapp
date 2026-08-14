@@ -20,29 +20,50 @@ if (!WORKER_SECRET && FORGE_EXECUTION_MODE === "sandbox") {
   console.error("[forge-execution-client] FATAL: FORGE_WORKER_SECRET not set in sandbox mode");
 }
 
+// Phase 5: Enhanced job token with issuer, audience, and capabilities.
+// The worker verifies ALL claims, not just the signature.
 interface JobToken {
+  iss: string;          // issuer: "forge-control-plane"
+  aud: string;          // audience: "forge-worker"
   jobId: string;
+  executionId: string;  // stable id for idempotency
   projectId: string;
+  tenantId: string;     // userId (tenant)
   attempt: number;
-  issuedAt: number;
-  expiresAt: number;
+  capabilities: string[]; // ["git", "node", "test", "build"]
+  iat: number;          // issued at (Unix ms)
+  exp: number;          // expires at (Unix ms)
   nonce: string;
   signature: string;
 }
 
 function signToken(payload: Omit<JobToken, "signature">): string {
-  const data = `${payload.jobId}.${payload.projectId}.${payload.attempt}.${payload.issuedAt}.${payload.expiresAt}.${payload.nonce}`;
+  const data = [
+    payload.iss, payload.aud, payload.jobId, payload.executionId,
+    payload.projectId, payload.tenantId, payload.attempt,
+    JSON.stringify(payload.capabilities), payload.iat, payload.exp, payload.nonce,
+  ].join(".");
   return createHmac("sha256", WORKER_SECRET || "").update(data).digest("hex");
 }
 
-function createToken(jobId: string, projectId: string, attempt: number): JobToken {
+function createToken(
+  jobId: string,
+  projectId: string,
+  attempt: number,
+  opts?: { tenantId?: string; executionId?: string; capabilities?: string[] }
+): JobToken {
   const now = Date.now();
   const payload: Omit<JobToken, "signature"> = {
+    iss: "forge-control-plane",
+    aud: "forge-worker",
     jobId,
+    executionId: opts?.executionId || `${jobId}-${attempt}`,
     projectId,
+    tenantId: opts?.tenantId || projectId, // default to projectId if no tenantId
     attempt,
-    issuedAt: now,
-    expiresAt: now + 300000, // 5-minute validity
+    capabilities: opts?.capabilities || ["git", "node", "test", "build"],
+    iat: now,
+    exp: now + 300000, // 5-minute validity
     nonce: randomUUID(),
   };
   return { ...payload, signature: signToken(payload) };
