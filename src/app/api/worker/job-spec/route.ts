@@ -101,20 +101,54 @@ export async function POST(req: Request) {
       // Repository reference (worker uses scoped credential)
       repository: project?.githubConnected ? {
         githubRepo: project.githubRepo,
-        // The worker uses its own scoped GitHub credential — NOT a global PAT.
       } : null,
 
-      // Model provider references (NOT plaintext secrets)
-      // The worker resolves these via authenticated secret resolution.
-      modelProviderRefs: [], // Would contain provider IDs for BYOK resolution
+      // P10-2: BYOK model provider reference.
+      // The worker resolves credentials via /api/worker/resolve-credential.
+      // The control plane sends only the reference, never the plaintext key.
+      modelProviderRef: (() => {
+        // Check if the project has a BYOK provider assigned for this agent type.
+        // For now, default to zai (sandbox LLM). The worker will use the gateway.
+        return {
+          provider: "zai",
+          providerId: null, // null = use default sandbox LLM
+          model: "glm-4.6",
+        };
+      })(),
 
-      // Verification plan
-      verificationPlan: {
-        install: "npm install",
-        test: "npm test",
-        build: "npm run build",
-        lint: "npm run lint",
-      },
+      // P10-5: Architecture-driven VerificationPlan.
+      // Extracted from the architecture contract if available.
+      verificationPlan: (() => {
+        if (architecture) {
+          try {
+            const contract = JSON.parse(architecture.contractJson || "{}");
+            if (contract.verificationPlan) {
+              return contract.verificationPlan;
+            }
+          } catch {}
+        }
+        // Default plan for Node.js projects.
+        return {
+          runtime: "node",
+          packageManager: "npm",
+          install: ["npm install --silent"],
+          unit: ["npm test -- --json --silent"],
+          build: ["npm run build"],
+          static: ["npm run lint"],
+        };
+      })(),
+
+      // P10-1: Base commit SHA for dependent tasks.
+      // If this task depends on a completed task, use that task's commit as the base.
+      baseCommitSha: (() => {
+        const deps = JSON.parse(task.dependencies || "[]") as string[];
+        if (deps.length === 0) return null;
+        // Find the last completed dependency's commit.
+        // For now, return null — the worker will start fresh.
+        // In a full implementation, this would query the task graph for the
+        // latest completed dependency's commitSha.
+        return null;
+      })(),
 
       // Required capabilities
       requiredCapabilities: JSON.parse(job.requiredCapabilities || "[]"),

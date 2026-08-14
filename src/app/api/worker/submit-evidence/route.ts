@@ -35,10 +35,19 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Task not found" }, { status: 404 });
     }
 
-    // Update the task with the worker's results.
+    // P10-6: Completion requires a real commit SHA.
+    // This is a HARD invariant — no commitSha = no completion.
     const testsOk = Array.isArray(testResults) && testResults.length > 0 && testResults.every((t: any) => t.passes);
     const guardianOk = guardianResult?.verdict === "PASS" || guardianResult?.verdict === "WARNING";
     const reviewOk = reviewResult?.verdict === "APPROVED";
+    const hasRealCommit = !!commitSha && commitSha !== "null" && commitSha.length >= 7;
+
+    // Task can only be COMPLETED if ALL of:
+    // - real commit exists (commitSha is not null)
+    // - tests pass
+    // - Guardian is PASS or WARNING
+    // - Reviewer is APPROVED
+    const canComplete = hasRealCommit && guardianOk && reviewOk && testsOk;
 
     await db.task.update({
       where: { id: taskId },
@@ -51,9 +60,9 @@ export async function POST(req: Request) {
         implementationLog: implementationLog || null,
         architectureStatus: guardianResult?.verdict || "PENDING",
         reviewStatus: reviewResult?.verdict === "APPROVED" ? "PASSED" : reviewResult?.verdict === "REJECTED" ? "FAILED" : "CHANGES_REQUESTED",
-        status: (guardianOk && reviewOk && testsOk) ? TaskStatus.COMPLETED : TaskStatus.FAILED,
-        completedAt: (guardianOk && reviewOk && testsOk) ? new Date() : null,
-        failureReason: (guardianOk && reviewOk && testsOk) ? null : `guardian=${guardianResult?.verdict}, review=${reviewResult?.verdict}, tests=${testsOk ? "ok" : "fail"}`,
+        status: canComplete ? TaskStatus.COMPLETED : TaskStatus.FAILED,
+        completedAt: canComplete ? new Date() : null,
+        failureReason: canComplete ? null : `commit=${hasRealCommit ? "ok" : "MISSING"}, guardian=${guardianResult?.verdict}, review=${reviewResult?.verdict}, tests=${testsOk ? "ok" : "fail"}`,
       },
     });
 

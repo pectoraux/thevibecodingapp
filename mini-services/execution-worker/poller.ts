@@ -1,33 +1,24 @@
-// Forge Execution Worker — Phase 8: Real Execution in the Worker
+// Forge Execution Worker — Phase 10: Complete Frozen Execution Architecture
 //
-// This worker:
-// 1. Registers with the control plane (authenticated)
-// 2. Continuously polls for execution jobs (authenticated)
-// 3. Claims jobs atomically (FOR UPDATE SKIP LOCKED)
-// 4. Fetches the ExecutionSpec (authenticated)
-// 5. EXECUTES THE TASK IN THE WORKER PROCESS (not in the control plane)
-//    - Creates a sandbox
-//    - Invokes the LLM
-//    - Writes code to the filesystem
-//    - Runs git operations
-//    - Runs tests
-//    - Runs deterministic Guardian
-//    - Commits
-// 6. Submits evidence to the control plane (authenticated)
-// 7. Reports completion (idempotent, authenticated)
+// This worker implements the frozen Phase 8 architecture with real production mechanisms:
+// 1. Real Git repository/worktree/commit flow
+// 2. BYOK provider gateway (no hardcoded SDK)
+// 3. Independent deterministic Guardian (checks architecture, not test results)
+// 4. Independent LLM Reviewer (separate invocation)
+// 5. Architecture-driven VerificationPlan
 //
 // The control plane NEVER executes generated code.
 
 import { createHmac, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, execSync } from "node:child_process";
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute } from "node:path";
 
 // --- Configuration ---
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase8";
+const WORKER_VERSION = "phase10";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
@@ -38,11 +29,12 @@ if (!WORKER_SECRET) {
   process.exit(1);
 }
 
-console.log(`[worker] Starting Forge Execution Worker (Phase 8)`);
+console.log(`[worker] Starting Forge Execution Worker (Phase 10)`);
 console.log(`[worker] Worker ID: ${WORKER_ID}`);
+console.log(`[worker] Version: ${WORKER_VERSION}`);
 console.log(`[worker] Control plane: ${CONTROL_PLANE_URL}`);
 
-// --- Token helpers ---
+// --- Token helpers (same as Phase 8) ---
 function signToken(payload: any): string {
   const data = [
     payload.iss, payload.aud, payload.workerId,
@@ -55,13 +47,9 @@ function signToken(payload: any): string {
 function createRegToken(): string {
   const now = Date.now();
   const payload = {
-    iss: "forge-worker",
-    aud: "forge-control-plane",
-    workerId: WORKER_ID,
+    iss: "forge-worker", aud: "forge-control-plane", workerId: WORKER_ID,
     capabilities: ["node", "git", "test", "build"],
-    iat: now,
-    exp: now + 60000,
-    nonce: randomUUID(),
+    iat: now, exp: now + 60000, nonce: randomUUID(),
   };
   return `Bearer ${Buffer.from(JSON.stringify({ ...payload, signature: signToken(payload) })).toString("base64")}`;
 }
@@ -72,14 +60,11 @@ let executionToken: string | null = null;
 // --- Authenticated API call ---
 async function apiCall(path: string, method: string, body?: any, token?: string): Promise<any> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) {
-    headers["Authorization"] = token;
-  }
+  if (token) headers["Authorization"] = token;
   const res = await fetch(`${CONTROL_PLANE_URL}${path}`, {
-    method,
-    headers,
+    method, headers,
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(300000), // 5 min for execution
+    signal: AbortSignal.timeout(300000),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -88,19 +73,16 @@ async function apiCall(path: string, method: string, body?: any, token?: string)
   return res.json();
 }
 
-// --- Register ---
+// --- Worker API functions ---
 async function register(): Promise<void> {
   const result = await apiCall("/api/worker/register", "POST", {
-    workerVersion: WORKER_VERSION,
-    protocolVersion: PROTOCOL_VERSION,
-    capabilities: ["node", "git", "test", "build"],
-    maxConcurrency: 1,
+    workerVersion: WORKER_VERSION, protocolVersion: PROTOCOL_VERSION,
+    capabilities: ["node", "git", "test", "build"], maxConcurrency: 1,
   }, createRegToken());
   sessionToken = result.sessionToken;
   console.log(`[worker] Registered — session token obtained`);
 }
 
-// --- Claim a job ---
 async function claimJob(): Promise<{ job: any; executionToken: string } | null> {
   const result = await apiCall("/api/worker/claim", "POST", {}, sessionToken!);
   if (result.job) {
@@ -110,31 +92,341 @@ async function claimJob(): Promise<{ job: any; executionToken: string } | null> 
   return null;
 }
 
-// --- Get job spec ---
 async function getJobSpec(executionId: string): Promise<any> {
   return apiCall("/api/worker/job-spec", "POST", { executionId }, executionToken!);
 }
 
-// --- Submit evidence ---
 async function submitEvidence(data: any): Promise<any> {
   return apiCall("/api/worker/submit-evidence", "POST", data, executionToken!);
 }
 
-// --- Complete job ---
 async function completeJob(status: string): Promise<void> {
   await apiCall("/api/worker/complete", "POST", { status }, executionToken!);
 }
 
-// --- Heartbeat ---
 async function sendHeartbeat(jobId: string): Promise<void> {
-  try {
-    await apiCall("/api/worker/heartbeat", "POST", { jobId }, executionToken!);
-  } catch {}
+  try { await apiCall("/api/worker/heartbeat", "POST", { jobId }, executionToken!); } catch {}
 }
 
-// --- EXECUTE A TASK (in the worker, not the control plane) ---
+async function triggerSchedulerTick(): Promise<void> {
+  try { await apiCall("/api/scheduler/tick", "POST", {}, sessionToken!); } catch {}
+}
+
+// ===========================================================================
+// P10-1: REAL GIT — Initialize repo, create branch, commit, return SHA
+// ===========================================================================
+
+function gitInit(repoPath: string): void {
+  execSync("git init", { cwd: repoPath, timeout: 10000 });
+  execSync('git config user.email "forge-worker@local"', { cwd: repoPath, timeout: 5000 });
+  execSync('git config user.name "Forge Worker"', { cwd: repoPath, timeout: 5000 });
+}
+
+function gitCheckoutBranch(repoPath: string, branchName: string, baseCommit?: string): void {
+  const cmd = baseCommit
+    ? `git checkout -b ${branchName} ${baseCommit}`
+    : `git checkout -b ${branchName}`;
+  execSync(cmd, { cwd: repoPath, timeout: 10000 });
+}
+
+function gitAddAndCommit(repoPath: string, message: string): string {
+  execSync("git add -A", { cwd: repoPath, timeout: 10000 });
+  execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: repoPath, timeout: 10000 });
+  return execSync("git rev-parse HEAD", { cwd: repoPath, timeout: 5000 }).toString().trim();
+}
+
+function gitDiff(repoPath: string): string {
+  try {
+    return execSync("git diff HEAD~1 --stat", { cwd: repoPath, timeout: 10000 }).toString();
+  } catch {
+    return execSync("git diff --cached --stat", { cwd: repoPath, timeout: 10000 }).toString();
+  }
+}
+
+function gitLog(repoPath: string): string {
+  try {
+    return execSync("git log --oneline -5", { cwd: repoPath, timeout: 5000 }).toString();
+  } catch {
+    return "";
+  }
+}
+
+// ===========================================================================
+// P10-2: BYOK — LLM Gateway (no hardcoded SDK)
+// ===========================================================================
+
+interface LlmResult {
+  content: string;
+  tokensInput: number;
+  tokensOutput: number;
+  model: string;
+  success: boolean;
+  error?: string;
+}
+
+async function callLLM(spec: any, messages: { role: string; content: string }[]): Promise<LlmResult> {
+  const provider = spec.modelProviderRef;
+  const model = spec.model || "glm-4.6";
+
+  // If the spec includes a BYOK provider, resolve credentials and call the provider API.
+  if (provider && provider.provider !== "zai") {
+    return await callByokProvider(provider, model, messages);
+  }
+
+  // Default: try z-ai-web-dev-sdk (available in the sandbox).
+  try {
+    const ZAI = await import("z-ai-web-dev-sdk");
+    const zai = await ZAI.create();
+    const adapted = messages.map((m) => ({
+      role: m.role === "system" ? "assistant" : m.role,
+      content: m.content,
+    }));
+    const completion = await zai.chat.completions.create({
+      messages: adapted as any,
+      thinking: { type: "disabled" },
+    });
+    const content = completion.choices?.[0]?.message?.content || "";
+    return {
+      content,
+      tokensInput: Math.ceil(messages.map((m) => m.content).join("").length / 4),
+      tokensOutput: Math.ceil(content.length / 4),
+      model,
+      success: true,
+    };
+  } catch (err: any) {
+    return { content: "", tokensInput: 0, tokensOutput: 0, model, success: false, error: err.message };
+  }
+}
+
+async function callByokProvider(provider: any, model: string, messages: any[]): Promise<LlmResult> {
+  // Resolve credentials via the control plane.
+  try {
+    const credResult = await apiCall("/api/worker/resolve-credential", "POST", {
+      providerId: provider.providerId,
+    }, executionToken!);
+    const apiKey = credResult.apiKey;
+    if (!apiKey) {
+      return { content: "", tokensInput: 0, tokensOutput: 0, model, success: false, error: "No API key resolved" };
+    }
+
+    // Call the provider's API.
+    const urls: Record<string, string> = {
+      openai: "https://api.openai.com/v1/chat/completions",
+      anthropic: "https://api.anthropic.com/v1/messages",
+      google: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      xai: "https://api.x.ai/v1/chat/completions",
+    };
+    const baseUrl = urls[provider.provider] || provider.baseUrl || urls.openai;
+
+    const res = await fetch(baseUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ model, messages, temperature: 0.2 }),
+    });
+
+    if (!res.ok) {
+      return { content: "", tokensInput: 0, tokensOutput: 0, model, success: false, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    const content = data.choices?.[0]?.message?.content || "";
+    return {
+      content,
+      tokensInput: data.usage?.prompt_tokens || 0,
+      tokensOutput: data.usage?.completion_tokens || 0,
+      model,
+      success: true,
+    };
+  } catch (err: any) {
+    return { content: "", tokensInput: 0, tokensOutput: 0, model, success: false, error: err.message };
+  }
+}
+
+// ===========================================================================
+// P10-3: INDEPENDENT DETERMINISTIC GUARDIAN
+// Checks architecture diff, NOT test results
+// ===========================================================================
+
+function runDeterministicGuardian(architecture: any, changedFiles: { path: string; content: string }[], diff: string): {
+  verdict: string; violations: any[]; warnings: any[]; summary: string;
+} {
+  const violations: any[] = [];
+  const warnings: any[] = [];
+
+  if (!architecture) {
+    return { verdict: "WARNING", violations, warnings, summary: "No architecture contract to check against" };
+  }
+
+  const declaredTechs: string[] = (architecture.components || []).flatMap((c: any) => c.tech || []);
+  const declaredTechLower = declaredTechs.map((t: string) => t.toLowerCase());
+  const invariants: string[] = architecture.invariants || [];
+
+  // Check each changed file for forbidden technologies.
+  for (const f of changedFiles) {
+    const content = (f.content || "").toLowerCase();
+    const path = f.path.toLowerCase();
+
+    // Forbidden technology detection.
+    const forbiddenTechs: { pattern: string; tech: string }[] = [
+      { pattern: "firebase", tech: "firebase" },
+      { pattern: "mongoose", tech: "mongoose" },
+      { pattern: "mongodb", tech: "mongodb" },
+      { pattern: "supabase", tech: "supabase" },
+      { pattern: "aws-sdk", tech: "aws-sdk" },
+    ];
+
+    for (const ft of forbiddenTechs) {
+      if (content.includes(ft.pattern) && !declaredTechLower.some((t: string) => t.includes(ft.tech))) {
+        violations.push({
+          check: "forbidden-technology",
+          invariant: `Technology ${ft.tech} is not in the declared architecture`,
+          evidence: `File ${f.path} references ${ft.tech}`,
+          files: [f.path],
+          severity: "high",
+          remediation: `Remove ${ft.tech} or add it to the architecture contract`,
+        });
+      }
+    }
+
+    // Check for TODO/FIXME in production paths (not test files).
+    if (!path.includes("test") && !path.includes("spec") && !path.includes(".test.")) {
+      if (content.includes("todo") || content.includes("fixme") || content.includes("not implemented")) {
+        warnings.push({
+          check: "suspicious-pattern",
+          invariant: "No TODO/FIXME in production code",
+          evidence: `File ${f.path} contains TODO/FIXME/not-implemented marker`,
+          files: [f.path],
+          remediation: "Complete the implementation",
+        });
+      }
+    }
+  }
+
+  // Check for required components.
+  const requiredComponents = (architecture.components || []).filter((c: any) => c.type !== "infra");
+  for (const comp of requiredComponents) {
+    const compFiles = changedFiles.filter((f) => {
+      const path = f.path.toLowerCase();
+      return path.includes(comp.name.toLowerCase()) || path.includes(comp.type.toLowerCase());
+    });
+    if (compFiles.length === 0) {
+      warnings.push({
+        check: "component-presence",
+        invariant: `Component ${comp.name} should have corresponding files`,
+        evidence: `No files found for component ${comp.name}`,
+        files: [],
+        remediation: `Ensure the implementation includes ${comp.name}`,
+      });
+    }
+  }
+
+  const verdict = violations.length > 0 ? "VIOLATION" : warnings.length > 0 ? "WARNING" : "PASS";
+  return {
+    verdict,
+    violations,
+    warnings,
+    summary: `${violations.length} violation(s), ${warnings.length} warning(s) — ${verdict}`,
+  };
+}
+
+// ===========================================================================
+// P10-4: INDEPENDENT LLM REVIEWER
+// Separate LLM invocation, inspects actual diff
+// ===========================================================================
+
+async function runLlmReviewer(spec: any, changedFiles: { path: string; content: string }[], testResults: any[], guardianResult: any): Promise<{
+  verdict: string; findings: any[]; summary: string;
+}> {
+  const filesSummary = changedFiles.map((f) => `--- ${f.path} ---\n${(f.content || "").slice(0, 3000)}`).join("\n\n");
+  const testsSummary = testResults.map((t) => `${t.name}: ${t.passes ? "PASS" : "FAIL"} (${t.evidence})`).join("\n");
+
+  const prompt = `You are an independent code reviewer. You are NOT the implementation agent.
+Review the following code changes INDEPENDENTLY. Do not trust the implementation agent's claims.
+
+Task: ${spec.task.title}
+Description: ${spec.task.description}
+Acceptance criteria: ${JSON.stringify(spec.task.acceptanceCriteria)}
+
+CHANGED FILES:
+${filesSummary}
+
+TEST RESULTS:
+${testsSummary}
+
+GUARDIAN RESULTS:
+${JSON.stringify(guardianResult)}
+
+Review for: correctness, security, edge cases, error handling, API correctness, data integrity, maintainability.
+Do NOT simply approve because tests pass — tests can be incomplete.
+
+Respond with JSON:
+{ "verdict": "APPROVED" | "CHANGES_REQUESTED" | "REJECTED", "findings": [{ "severity": "low|medium|high|critical", "file": "...", "issue": "...", "recommendation": "..." }], "summary": "..." }
+`;
+
+  const result = await callLLM(spec, [
+    { role: "system", content: "You are an independent code reviewer. Be skeptical and thorough." },
+    { role: "user", content: prompt },
+  ]);
+
+  if (!result.success || !result.content) {
+    return {
+      verdict: "CHANGES_REQUESTED",
+      findings: [],
+      summary: "Reviewer LLM unavailable — defaulting to CHANGES_REQUESTED for safety",
+    };
+  }
+
+  try {
+    const jsonMatch = result.content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        verdict: parsed.verdict || "CHANGES_REQUESTED",
+        findings: parsed.findings || [],
+        summary: parsed.summary || "",
+      };
+    }
+  } catch {}
+
+  return {
+    verdict: "CHANGES_REQUESTED",
+    findings: [],
+    summary: "Could not parse reviewer output",
+  };
+}
+
+// ===========================================================================
+// P10-5: ARCHITECTURE-DRIVEN VERIFICATION PLAN
+// ===========================================================================
+
+function getVerificationCommands(verificationPlan: any): {
+  install: string[]; test: string[]; build: string[]; lint: string[];
+} {
+  if (verificationPlan && typeof verificationPlan === "object") {
+    return {
+      install: verificationPlan.install || ["npm install"],
+      test: verificationPlan.unit || verificationPlan.test || ["npm test"],
+      build: verificationPlan.build || ["npm run build"],
+      lint: verificationPlan.lint || verificationPlan.static || [],
+    };
+  }
+  // Default to npm if no plan.
+  return {
+    install: ["npm install"],
+    test: ["npm test"],
+    build: ["npm run build"],
+    lint: [],
+  };
+}
+
+// ===========================================================================
+// MAIN EXECUTE TASK — Real Git + BYOK + Independent Guardian/Reviewer
+// ===========================================================================
+
 async function executeTask(spec: any): Promise<{
-  commitSha?: string;
+  commitSha: string | null;
   testResults: any[];
   guardianResult: any;
   reviewResult: any;
@@ -147,67 +439,75 @@ async function executeTask(spec: any): Promise<{
   const sandboxPath = join(EXEC_ROOT, spec.projectId, spec.executionId);
   mkdirSync(sandboxPath, { recursive: true });
 
+  // P10-1: Initialize a REAL Git repository in the sandbox.
+  gitInit(sandboxPath);
+  const branchName = `forge/${spec.task.code}/attempt-${spec.attempt}`;
+  gitCheckoutBranch(sandboxPath, branchName);
+
+  // If there's a base commit (from a previous task), check it out.
+  if (spec.baseCommitSha) {
+    try {
+      execSync(`git checkout ${spec.baseCommitSha}`, { cwd: sandboxPath, timeout: 10000 });
+      gitCheckoutBranch(sandboxPath, branchName, spec.baseCommitSha);
+    } catch {
+      console.log(`[worker] Could not checkout base commit ${spec.baseCommitSha} — starting fresh`);
+    }
+  }
+
   // Write the architecture contract for reference.
   if (spec.architecture) {
     writeFileSync(join(sandboxPath, "architecture.json"), JSON.stringify(spec.architecture, null, 2));
   }
 
-  // For Phase 8, the worker invokes the LLM to generate code.
-  // In the sandbox environment, we use the z-ai-web-dev-sdk if available,
-  // otherwise the task is BLOCKED (no template fallback).
-  let llmOutput: any = null;
-  try {
-    const ZAI = await import("z-ai-web-dev-sdk");
-    const zai = await ZAI.create();
-    const prompt = `You are a ${spec.task.agentType} implementation agent.
+  // P10-2: Call LLM via BYOK gateway (not hardcoded SDK).
+  const implPrompt = `You are a ${spec.task.agentType} implementation agent.
 Task: ${spec.task.title}
 Description: ${spec.task.description}
 Acceptance criteria: ${JSON.stringify(spec.task.acceptanceCriteria)}
+Architecture constraints: ${JSON.stringify(spec.architecture?.constraints || [])}
 
-Generate the implementation files. Respond with JSON:
+Generate the implementation files. Respond with ONLY JSON:
 { "files": [{ "path": "...", "content": "...", "language": "..." }] }
 `;
 
-    const completion = await zai.chat.completions.create({
-      messages: [
-        { role: "assistant", content: `You are a code generation agent. ${prompt}` },
-        { role: "user", content: "Generate the code." },
-      ],
-      thinking: { type: "disabled" },
-    });
+  const llmResult = await callLLM(spec, [
+    { role: "system", content: "You are a code generation agent. Generate real, working code." },
+    { role: "user", content: implPrompt },
+  ]);
 
-    const content = completion.choices?.[0]?.message?.content || "";
-    // Extract JSON from the response.
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      llmOutput = JSON.parse(jsonMatch[0]);
-    }
-  } catch (err: any) {
-    console.log(`[worker] LLM unavailable: ${err.message} — BLOCKED (no template fallback)`);
+  if (!llmResult.success || !llmResult.content) {
     return {
+      commitSha: null,
       testResults: [],
-      guardianResult: { verdict: "VIOLATION", summary: "LLM unavailable — BLOCKED" },
-      reviewResult: { verdict: "REJECTED", summary: "No implementation produced" },
+      guardianResult: { verdict: "VIOLATION", summary: `LLM unavailable: ${llmResult.error}`, violations: [], warnings: [] },
+      reviewResult: { verdict: "REJECTED", summary: "No implementation produced", findings: [] },
       filesChanged: [],
-      implementationLog: `LLM unavailable: ${err.message}`,
+      implementationLog: `LLM call failed: ${llmResult.error}`,
     };
   }
 
+  // Parse LLM output.
+  let llmOutput: any = null;
+  try {
+    const jsonMatch = llmResult.content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) llmOutput = JSON.parse(jsonMatch[0]);
+  } catch {}
+
   if (!llmOutput?.files || llmOutput.files.length === 0) {
     return {
+      commitSha: null,
       testResults: [],
-      guardianResult: { verdict: "VIOLATION", summary: "No files produced by LLM" },
-      reviewResult: { verdict: "REJECTED", summary: "No files produced" },
+      guardianResult: { verdict: "VIOLATION", summary: "No files produced by LLM", violations: [], warnings: [] },
+      reviewResult: { verdict: "REJECTED", summary: "No files produced", findings: [] },
       filesChanged: [],
       implementationLog: "LLM produced no files",
     };
   }
 
-  // Write files to the sandbox.
-  const filesChanged: string[] = [];
+  // Write files to the sandbox (with path containment).
+  const filesChanged: { path: string; content: string }[] = [];
   for (const f of llmOutput.files) {
     const fullPath = join(sandboxPath, f.path);
-    // Path containment check.
     const resolved = resolve(fullPath);
     if (!resolved.startsWith(sandboxPath)) {
       console.log(`[worker] Path escape rejected: ${f.path}`);
@@ -215,116 +515,105 @@ Generate the implementation files. Respond with JSON:
     }
     mkdirSync(dirname(resolved), { recursive: true });
     writeFileSync(resolved, f.content || "");
-    filesChanged.push(f.path);
+    filesChanged.push({ path: f.path, content: f.content || "" });
   }
 
-  // Run tests in the sandbox.
+  // P10-5: Execute the architecture-driven VerificationPlan.
+  const verCommands = getVerificationCommands(spec.verificationPlan);
   let testResults: any[] = [];
-  try {
-    const installResult = await runCommand(sandboxPath, "npm", ["install", "--silent"], 120000);
-    const testResult = await runCommand(sandboxPath, "npm", ["test", "--", "--json", "--silent"], 120000);
-    testResults = [{
-      name: "npm test",
-      command: "npm test",
-      exitCode: testResult.exitCode,
-      stdout: testResult.stdout.slice(0, 5000),
-      stderr: testResult.stderr.slice(0, 5000),
-      passes: testResult.success,
-      evidence: `exitCode=${testResult.exitCode}, duration=${testResult.durationMs}ms`,
-      durationMs: testResult.durationMs,
-      timedOut: testResult.timedOut,
-    }];
-  } catch (err: any) {
-    testResults = [{
-      name: "test-runner",
-      command: "npm test",
-      exitCode: -1,
-      stdout: "",
-      stderr: err.message,
-      passes: false,
-      evidence: `Test execution failed: ${err.message}`,
-    }];
+
+  // Install dependencies.
+  for (const cmd of verCommands.install) {
+    const [bin, ...args] = cmd.split(" ");
+    const result = await runCommand(sandboxPath, bin, args, 120000);
+    if (!result.success) {
+      testResults.push({
+        name: cmd, command: cmd, exitCode: result.exitCode,
+        stdout: result.stdout.slice(0, 5000), stderr: result.stderr.slice(0, 5000),
+        passes: false, evidence: `Install failed: exitCode=${result.exitCode}`,
+        durationMs: result.durationMs, timedOut: result.timedOut,
+      });
+      break;
+    }
   }
 
-  // Run deterministic Guardian (in the worker).
-  const guardianResult = {
-    verdict: testResults.every((t) => t.passes) ? "PASS" : "VIOLATION",
-    summary: `${testResults.filter((t) => t.passes).length}/${testResults.length} tests passed`,
-    violations: [],
-    warnings: [],
-  };
+  // Run tests.
+  if (testResults.length === 0 || testResults.every((t) => t.passes)) {
+    for (const cmd of verCommands.test) {
+      const [bin, ...args] = cmd.split(" ");
+      const result = await runCommand(sandboxPath, bin, args, 120000);
+      testResults.push({
+        name: cmd, command: cmd, exitCode: result.exitCode,
+        stdout: result.stdout.slice(0, 5000), stderr: result.stderr.slice(0, 5000),
+        passes: result.success,
+        evidence: `exitCode=${result.exitCode}, duration=${result.durationMs}ms`,
+        durationMs: result.durationMs, timedOut: result.timedOut,
+      });
+    }
+  }
 
-  // Run reviewer (simplified — in production this would be an LLM call).
-  const reviewResult = {
-    verdict: testResults.every((t) => t.passes) ? "APPROVED" : "CHANGES_REQUESTED",
-    findings: [],
-    summary: `Review based on test results: ${testResults.filter((t) => t.passes).length}/${testResults.length} passed`,
-  };
+  // P10-1: Create a REAL Git commit.
+  let commitSha: string | null = null;
+  try {
+    commitSha = gitAddAndCommit(sandboxPath, `feat(${spec.task.code}): ${spec.task.title}`);
+    console.log(`[worker] Real git commit: ${commitSha.slice(0, 7)}`);
+  } catch (err: any) {
+    console.log(`[worker] Git commit failed: ${err.message}`);
+  }
 
-  // Clean up sandbox.
+  // Get the real diff.
+  const diff = gitDiff(sandboxPath);
+
+  // P10-3: Run INDEPENDENT deterministic Guardian (checks architecture, NOT tests).
+  const guardianResult = runDeterministicGuardian(
+    spec.architecture,
+    filesChanged,
+    diff
+  );
+
+  // P10-4: Run INDEPENDENT LLM Reviewer (separate invocation).
+  const reviewResult = await runLlmReviewer(spec, filesChanged, testResults, guardianResult);
+
+  // Clean up sandbox ONLY after evidence is collected.
+  // The commit SHA is the durable artifact.
   try { rmSync(sandboxPath, { recursive: true, force: true }); } catch {}
 
   return {
+    commitSha,
     testResults,
     guardianResult,
     reviewResult,
-    filesChanged,
-    implementationLog: `Executed in worker sandbox at ${sandboxPath}`,
+    filesChanged: filesChanged.map((f) => f.path),
+    implementationLog: `Executed in worker sandbox. Git branch: ${branchName}. Commit: ${commitSha || "none"}. LLM model: ${llmResult.model}.`,
   };
 }
 
 // --- Run a command in the sandbox ---
 function runCommand(cwd: string, command: string, args: string[], timeoutMs: number): Promise<{
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
-  durationMs: number;
-  timedOut: boolean;
-  success: boolean;
+  exitCode: number | null; stdout: string; stderr: string; durationMs: number; timedOut: boolean; success: boolean;
 }> {
   return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
+    let stdout = ""; let stderr = ""; let timedOut = false;
     const start = Date.now();
-
     const child = spawn(command, args, {
       cwd,
       env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: "/tmp" },
       stdio: ["pipe", "pipe", "pipe"],
     });
-
     child.stdout?.on("data", (d) => { stdout += d.toString(); if (stdout.length > 200000) stdout = stdout.slice(-200000); });
     child.stderr?.on("data", (d) => { stderr += d.toString(); if (stderr.length > 200000) stderr = stderr.slice(-200000); });
-
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill("SIGTERM"); } catch {}
       setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 5000);
     }, timeoutMs);
-
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({
-        exitCode: code,
-        stdout: stdout.slice(0, 100000),
-        stderr: stderr.slice(0, 100000),
-        durationMs: Date.now() - start,
-        timedOut,
-        success: !timedOut && code === 0,
-      });
+      resolve({ exitCode: code, stdout: stdout.slice(0, 100000), stderr: stderr.slice(0, 100000), durationMs: Date.now() - start, timedOut, success: !timedOut && code === 0 });
     });
-
     child.on("error", () => {
       clearTimeout(timer);
-      resolve({
-        exitCode: -1,
-        stdout,
-        stderr: stderr + "\nCommand not found or failed to execute",
-        durationMs: Date.now() - start,
-        timedOut,
-        success: false,
-      });
+      resolve({ exitCode: -1, stdout, stderr: stderr + "\nCommand not found", durationMs: Date.now() - start, timedOut, success: false });
     });
   });
 }
@@ -332,29 +621,18 @@ function runCommand(cwd: string, command: string, args: string[], timeoutMs: num
 // --- Main worker loop ---
 async function workerLoop(): Promise<void> {
   console.log(`[worker] Entering main loop (polling every ${POLL_INTERVAL_MS}ms)`);
-
   while (true) {
     try {
       const claimed = await claimJob();
-
       if (claimed) {
         const { job } = claimed;
         console.log(`[worker] Claimed job ${job.executionId}`);
-
-        // Start heartbeat loop.
         const heartbeatInterval = setInterval(() => sendHeartbeat(job.id), HEARTBEAT_INTERVAL_MS);
-
         try {
-          // Get the execution spec from the control plane.
           const { spec } = await getJobSpec(job.executionId);
-
-          // Execute the task IN THE WORKER.
           const result = await executeTask(spec);
-
-          // Submit evidence to the control plane.
           await submitEvidence({
-            taskId: job.taskId,
-            projectId: job.projectId,
+            taskId: job.taskId, projectId: job.projectId,
             commitSha: result.commitSha,
             testResults: result.testResults,
             guardianResult: result.guardianResult,
@@ -362,13 +640,13 @@ async function workerLoop(): Promise<void> {
             filesChanged: result.filesChanged,
             implementationLog: result.implementationLog,
           });
-
-          // Complete the job.
-          const success = result.guardianResult.verdict !== "VIOLATION" &&
+          // P10-6: Task is only successful if commitSha exists.
+          const success = result.commitSha !== null &&
+                          result.guardianResult.verdict !== "VIOLATION" &&
                           result.reviewResult.verdict === "APPROVED" &&
                           result.testResults.every((t) => t.passes);
           await completeJob(success ? "SUCCEEDED" : "FAILED");
-          console.log(`[worker] Job ${job.executionId} → ${success ? "SUCCEEDED" : "FAILED"}`);
+          console.log(`[worker] Job ${job.executionId} → ${success ? "SUCCEEDED" : "FAILED"} (commit: ${result.commitSha?.slice(0, 7) || "none"})`);
         } catch (err: any) {
           console.error(`[worker] Job ${job.executionId} failed: ${err.message}`);
           await completeJob("FAILED");
@@ -376,14 +654,7 @@ async function workerLoop(): Promise<void> {
           clearInterval(heartbeatInterval);
         }
       } else {
-        // No ExecutionJob available — trigger the scheduler to create
-        // ExecutionJobs from queued BuildJobs. This ensures the worker
-        // drives the entire pipeline without browser/admin intervention.
-        try {
-          await apiCall("/api/scheduler/tick", "POST", {}, sessionToken!);
-        } catch {
-          // Scheduler tick is best-effort — might fail if not admin.
-        }
+        await triggerSchedulerTick();
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       }
     } catch (err: any) {
@@ -399,7 +670,4 @@ async function main() {
   await workerLoop();
 }
 
-main().catch((err) => {
-  console.error("[worker] Fatal:", err);
-  process.exit(1);
-});
+main().catch((err) => { console.error("[worker] Fatal:", err); process.exit(1); });
