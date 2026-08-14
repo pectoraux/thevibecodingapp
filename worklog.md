@@ -524,3 +524,64 @@ Stage Summary:
   7. **Check counts derived, not stored manually**: `computeCheckCounts` walks the input payloads and counts commit + tests + runtime checks + integration checks + guardian + review. Dashboard gets "9/10 passed" without re-parsing JSON.
   8. **Closed-world sufficiency**: absence of any required field (commitSha, testRuns, guardianResults, reviewResults) = insufficient. No inferred pass from absence.
 - Work record also written to `/home/z/my-project/agent-ctx/p1-guardian-evidence-guardian-evidence-subagent.md` for downstream agents.
+
+---
+Task ID: phase2
+Agent: orchestrator (main) — Phase 2 real systems
+Task: Replace all P0 simulation layers with real autonomous software factory systems
+
+Work Log:
+- Wrote AUDIT.md documenting every simulated system vs real capability
+- Built 8 real infrastructure modules via parallel subagents:
+  1. src/lib/secret-store.ts — AES-256-GCM encryption (replaces XOR)
+  2. src/lib/llm-gateway.ts — real provider adapters, no template fallback in prod
+  3. src/lib/git-engine.ts — real git clone/worktree/commit/push
+  4. src/lib/worker.ts — real command execution with timeout/SIGTERM/SIGKILL
+  5. src/lib/test-runner.ts — real test execution (npm test/pytest/go test/cargo test)
+  6. src/lib/github.ts — real GitHub REST API adapter
+  7. src/lib/guardian-deterministic.ts — mechanical Layer-1 checks (deps, tech, API, schema)
+  8. src/lib/evidence.ts — immutable evidence ledger
+- Updated Prisma schema with TaskEvidence model, pushed to Neon
+- Rewired orchestrator executeTask():
+  - Real git worktree per task attempt (not DB rows)
+  - Real LLM call (BLOCKED if no provider, no template fallback)
+  - Real file writes to worktree filesystem
+  - Real git commit (real SHA)
+  - Real test execution (actual npm test/pytest with exit code, stdout, stderr)
+  - Deterministic Guardian (Layer 1) + LLM Guardian (Layer 2)
+  - Evidence ledger recording (immutable per-attempt evidence)
+  - Task completion requires: real commit + real passing tests + Guardian PASS + review APPROVED + evidence sufficient
+  - Real GitHub PR creation when GitHub is connected
+- Removed old heuristic runTaskTests (deprecated, returns [])
+- Added DEV MODE badge to UI per spec requirement
+- Fixed import error (installDependencies is in worker.ts not test-runner.ts)
+- Built successfully locally, deployed to Vercel
+- Added FORGE_MASTER_KEY env var to Vercel
+
+Stage Summary:
+- All P0 simulations replaced with real systems
+- TemplateAdapter removed from production path (BLOCKED instead)
+- Real git worktrees, real test execution, real GitHub API
+- Deterministic Guardian catches real architecture violations
+- Evidence ledger proves completion with real evidence
+- Vercel deployment: https://thevibecodingapp.vercel.app (READY)
+- GitHub repo: https://github.com/pectoraux/thevibecodingapp
+- Lint: 0 errors, 12 warnings (cosmetic)
+- UI marked as "DEV MODE" per spec requirement #41
+
+What's real now:
+✓ Real git/worktree operations (clone, worktree, commit, push)
+✓ Real command execution (child_process with timeout)
+✓ Real test execution (npm test/pytest/go test with parsed results)
+✓ Real LLM gateway (OpenAI/Anthropic/Google/xAI/zAI adapters, no template fallback)
+✓ Real GitHub API (repos, branches, PRs, check runs)
+✓ Real secret encryption (AES-256-GCM, no XOR)
+✓ Deterministic Guardian (mechanical checks before LLM)
+✓ Evidence ledger (immutable per-attempt evidence)
+✓ Evidence-based completion (not LLM assertion)
+
+Known limitations (documented in AUDIT.md):
+- No Docker (execution worker uses subprocess isolation, not containers)
+- Readiness gate still uses some heuristic checks (P2: executable readiness policy)
+- GitHub Actions integration is P2
+- Deployment verification is P2
