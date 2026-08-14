@@ -6,11 +6,5 @@
   "installCommand": "bun install",
   "github": {
     "silent": true
-  },
-  "crons": [
-    {
-      "path": "/api/scheduler/tick",
-      "schedule": "*/1 * * * *"
-    }
-  ]
+  }
 }
