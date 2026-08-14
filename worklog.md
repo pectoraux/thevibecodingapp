@@ -906,3 +906,72 @@ Stage Summary:
 - Security boundary restored — all worker endpoints require HMAC tokens
 - Execution moved into worker process — control plane only orchestrates
 - Canonical state verified: local = GitHub = deployed = 0b91dca366c1
+
+---
+Task ID: phase8-verification
+Agent: orchestrator (main) — Phase 8 verification and hardening
+Task: Verify Phase 8 fixes are deployed, run security tests, fix remaining issues
+
+Work Log:
+- Verified canonical state: local = GitHub = deployed = 0b91dca (Phase 8)
+- Confirmed all worker endpoints return 401 for unauthenticated requests (deployed)
+- Confirmed /api/worker/execute-task returns 404 (deleted)
+- Ran 10 worker security tests locally — all pass
+- Fixed: Prisma client was missing WorkerRegistry model (regenerated)
+- Fixed: Worker poller now triggers /api/scheduler/tick to create ExecutionJobs
+  (worker drives the full pipeline without browser/admin intervention)
+- Fixed: /api/scheduler/tick accepts worker session tokens (not just admin auth)
+- Redeployed: 9b8c0e654cb1
+
+Revision-level evidence:
+  GitHub main: 9b8c0e654cb1
+  Local HEAD:  9b8c0e654cb1
+  Deployed:    9b8c0e654cb1
+  All three match: ✓
+
+Security test results (10/10 passed):
+  ✓ Unauthenticated register → 401
+  ✓ Unauthenticated claim → 401
+  ✓ Unauthenticated heartbeat → 401
+  ✓ Unauthenticated complete → 401
+  ✓ Unauthenticated job-spec → 401
+  ✓ Unauthenticated submit-evidence → 401
+  ✓ Invalid signature → 401
+  ✓ Expired token → 401
+  ✓ Valid token register → 200
+  ✓ execute-task endpoint deleted → 404
+
+Phase 8 invariants (all satisfied):
+  ✓ Worker registration authenticated (401 without token)
+  ✓ Worker claim authenticated (401 without token)
+  ✓ Worker heartbeat authenticated (401 without token)
+  ✓ Worker complete authenticated (401 without token)
+  ✓ Worker execution authenticated (job-spec + submit-evidence require tokens)
+  ✓ Worker identity cryptographically established (from token, not body)
+  ✓ Lease identity cryptographically established (execution token with leaseId)
+  ✓ Capability matching enforced (SQL filters by requiredCapabilities)
+  ✓ Worker creates sandbox (poller.ts creates sandbox per job)
+  ✓ Worker executes generated code (LLM + tests run in worker process)
+  ✓ Control plane does NOT execute generated commands (execute-task is 404)
+  ✓ Browser has zero execution responsibility (worker polls independently)
+  ✓ No unauthenticated worker API exists (all return 401)
+  ✓ No old synchronous execution path remains (execute-task deleted, scheduler only creates jobs)
+
+Worker execution flow (Phase 8, verified):
+  Worker registers (authenticated with HMAC token)
+  → polls for ExecutionJobs (authenticated)
+  → if none available, triggers scheduler to create ExecutionJobs from BuildJobs
+  → claims job atomically (FOR UPDATE SKIP LOCKED, capability-aware)
+  → fetches ExecutionSpec (authenticated)
+  → creates sandbox directory
+  → invokes LLM in worker process (z-ai-web-dev-sdk)
+  → writes code to sandbox filesystem
+  → runs tests in sandbox (npm test)
+  → runs deterministic Guardian
+  → submits evidence to control plane (authenticated)
+  → reports completion (authenticated, idempotent)
+
+Control plane responsibilities (verified):
+  - architecture, task graph, job state, worker registry, evidence persistence
+  - does NOT execute: npm, pytest, git, LLM, generated code
+  - /api/worker/execute-task does not exist (404)
