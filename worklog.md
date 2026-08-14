@@ -975,3 +975,51 @@ Control plane responsibilities (verified):
   - architecture, task graph, job state, worker registry, evidence persistence
   - does NOT execute: npm, pytest, git, LLM, generated code
   - /api/worker/execute-task does not exist (404)
+
+---
+Task ID: phase8-verification-gate
+Agent: orchestrator (main) — Phase 8 verification gate
+Task: Reconcile canonical state, fix version string, remove dead code, create architecture invariants test
+
+Work Log:
+- Reconciled repository: pushed unpushed commits (local = GitHub = aa74862)
+- Fixed /api/version: updated stale 'phase5' string to 'phase8'
+- Verified README has no stale references (confirmed via GitHub API)
+- Created tests/architecture-invariants.ts — 16 mechanical tests
+- Removed 794 lines of dead code from orchestrator.ts:
+  - tickOnce() — dead code, never called
+  - executeTask() — dead code, only called by tickOnce
+  - runImplementationAgent(), runGuardian(), runCodeReview() — dead helpers
+  - runTaskTests_DEPRECATED() — dead code
+  - All execution imports removed (gitEngine, submitExecutionJob, etc.)
+- Orchestrator reduced from 1306 to 521 lines — contains ZERO execution code
+- All 16 architecture invariants pass
+- Deployed to Vercel: 0a028542393e
+
+FINAL CANONICAL STATE:
+  GitHub main:           0a028542393e
+  Local HEAD:            0a028542393e
+  Deployed revision:     0a028542393e
+  All three match:       ✓
+
+  /api/version:
+    gitSha:         0a028542393e
+    version:        phase8
+    executionMode:  local
+    sandboxed:      false
+    environment:    production
+
+  Worker endpoints (unauthenticated):
+    /api/worker/register:        401 ✓
+    /api/worker/claim:           401 ✓
+    /api/worker/heartbeat:       401 ✓
+    /api/worker/complete:        401 ✓
+    /api/worker/job-spec:        401 ✓
+    /api/worker/submit-evidence: 401 ✓
+    /api/worker/execute-task:    404 ✓ (deleted)
+
+  Architecture invariants: 16/16 passed
+  Worker security tests: 10/10 passed
+
+  Production readiness: NOT READY
+  Reason: executionMode is local (sandbox worker not deployed on Vercel)
