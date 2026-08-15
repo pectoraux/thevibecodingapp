@@ -7,9 +7,9 @@ import { BuildEventType } from "@/lib/types";
 import { readJsonBody } from "../../../../_lib";
 
 // POST /api/projects/[id]/github/connect
-//   Body: { repoName }
-//   Side effect: sets githubConnected=true, githubRepo=repoName, calls initRepository
-//   if repo not yet initialized.
+//
+// Phase 16: Initializes canonicalHeadSha from the actual GitHub default branch HEAD.
+// For existing repositories, this ensures tasks branch from the real codebase state.
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const userId = await requireUserId();
@@ -44,12 +44,41 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }
     }
 
+    // P16: Initialize canonicalHeadSha from the actual GitHub default branch HEAD.
+    let canonicalHeadSha = existing.canonicalHeadSha;
+    try {
+      const githubPat = process.env.GITHUB_PAT;
+      if (githubPat) {
+        const [owner, repo] = repoName.split("/");
+        const branchRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/branches/${project.githubDefaultBranch}`, {
+          headers: {
+            "Authorization": `token ${githubPat}`,
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Forge-Control-Plane",
+          },
+          signal: AbortSignal.timeout(10000),
+        });
+        if (branchRes.ok) {
+          const branchData = await branchRes.json();
+          canonicalHeadSha = branchData.commit?.sha || null;
+          if (canonicalHeadSha) {
+            await db.project.update({
+              where: { id },
+              data: { canonicalHeadSha },
+            });
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error("[github/connect] canonicalHeadSha initialization failed:", err.message);
+    }
+
     await ensureBuildEvent({
       projectId: id,
       type: BuildEventType.GITHUB_CONNECTED,
       level: "success",
-      message: `Connected GitHub repository: ${repoName}`,
-      payload: JSON.stringify({ repoName }),
+      message: `Connected GitHub repository: ${repoName}${canonicalHeadSha ? ` (canonical HEAD: ${canonicalHeadSha.slice(0, 7)})` : ""}`,
+      payload: JSON.stringify({ repoName, canonicalHeadSha }),
     });
 
     return NextResponse.json({ project });

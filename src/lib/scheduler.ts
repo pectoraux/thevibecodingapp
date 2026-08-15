@@ -92,16 +92,18 @@ export async function processBuildQueue(): Promise<{
     const byCode = new Map(tasks.map((t) => [t.code, t]));
 
     for (const task of tasks) {
-      // Skip tasks that are already done or already have an execution job.
-      if (task.status === TaskStatus.COMPLETED) continue;
+      // P16: Skip tasks that are already done, integration-pending, or integrated.
+      if ([TaskStatus.COMPLETED, TaskStatus.INTEGRATION_PENDING, TaskStatus.INTEGRATED].includes(task.status as any)) continue;
 
-      // Check dependencies.
+      // P16: Check dependencies — must be INTEGRATED (not just COMPLETED).
+      // This ensures dependency changes are in the canonical HEAD before
+      // dependent tasks can run.
       const deps = JSON.parse(task.dependencies || "[]") as string[];
-      const allDepsDone = deps.every((d) => {
+      const allDepsIntegrated = deps.every((d) => {
         const dep = byCode.get(d);
-        return dep?.status === TaskStatus.COMPLETED;
+        return dep?.status === TaskStatus.INTEGRATED;
       });
-      if (!allDepsDone) continue;
+      if (!allDepsIntegrated) continue;
 
       // Create an ExecutionJob for this task (idempotent).
       const execJob = await createExecutionJob({

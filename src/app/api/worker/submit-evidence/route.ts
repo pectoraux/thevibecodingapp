@@ -206,17 +206,46 @@ export async function POST(req: Request) {
         implementationLog: implementationLog || null,
         architectureStatus: guardianResult?.verdict || "PENDING",
         reviewStatus: reviewResult?.verdict === "APPROVED" ? "PASSED" : reviewResult?.verdict === "REJECTED" ? "FAILED" : "CHANGES_REQUESTED",
+        // P16: Task is COMPLETED (verified) but NOT INTEGRATED.
+        // Integration happens when the PR is merged.
         status: canComplete ? TaskStatus.COMPLETED : TaskStatus.FAILED,
+        integrationState: canComplete ? "INTEGRATION_PENDING" : "NONE",
         completedAt: canComplete ? new Date() : null,
         failureReason,
       },
     });
 
+    // P16: Create a real GitHub PR for completed GitHub-backed tasks.
+    if (canComplete && mode === "GITHUB_BACKED" && project.githubRepo && commitSha) {
+      try {
+        const prResult = await createGitHubPR(
+          project.githubRepo,
+          expectedBranch,
+          project.githubDefaultBranch,
+          task.code,
+          task.title,
+          commitSha,
+          expectedBaseCommitSha
+        );
+        if (prResult) {
+          await db.task.update({
+            where: { id: taskId! },
+            data: {
+              prNumber: prResult.number,
+              prUrl: prResult.url,
+              prState: "OPEN",
+            },
+          });
+        }
+      } catch (err: any) {
+        console.error(`[submit-evidence] PR creation failed: ${err.message}`);
+        // PR creation failure doesn't block task completion — task is still COMPLETED.
+        // But integration cannot proceed without a PR.
+      }
+    }
+
     // P15E: Do NOT update canonicalHeadSha on task completion.
-    // canonicalHeadSha represents the INTEGRATION branch HEAD (GitHub default branch).
-    // It advances only when a PR is merged, not when a task completes.
-    // A completed task has a verified candidate commit + remote branch — but
-    // the canonical HEAD doesn't change until that commit is merged.
+    // canonicalHeadSha advances ONLY when a PR is merged.
 
     await ensureBuildEvent({
       projectId,
@@ -299,5 +328,99 @@ async function verifyRemoteCommit(
   } catch (err: any) {
     console.error(`[submit-evidence] Remote verification error: ${err.message}`);
     return false;
+  }
+}
+
+// P16: Create a real GitHub PR.
+async function createGitHubPR(
+  githubRepo: string,
+  headBranch: string,
+  baseBranch: string,
+  taskCode: string,
+  taskTitle: string,
+  commitSha: string,
+  baseCommitSha: string | null
+): Promise<{ number: number; url: string } | null> {
+  const githubPat = process.env.GITHUB_PAT;
+  if (!githubPat) return null;
+
+  const [owner, repo] = githubRepo.split("/");
+  const headers = {
+    "Authorization": `token ${githubPat}`,
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "Forge-Control-Plane",
+  };
+
+  try {
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        title: `[${taskCode}] ${taskTitle}`,
+        head: headBranch,
+        base: baseBranch,
+        body: `## Task: ${taskCode} — ${taskTitle}\n\n**Commit:** ${commitSha.slice(0, 7)}\n**Base:** ${baseCommitSha?.slice(0, 7) || "initial"}\n\nThis PR was created by Forge after autonomous verification.\n\n- ✅ Verification passed\n- ✅ Guardian passed\n- ✅ Reviewer approved\n- ✅ Remote commit verified`,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!res.ok) {
+      // PR may already exist — try to find it.
+      const existingRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls?head=${owner}:${headBranch}&state=open`, {
+        headers,
+        signal: AbortSignal.timeout(10000),
+      });
+      if (existingRes.ok) {
+        const prs = await existingRes.json();
+        if (prs.length > 0) {
+          return { number: prs[0].number, url: prs[0].html_url };
+        }
+      }
+      console.error(`[createGitHubPR] Failed: HTTP ${res.status}`);
+      return null;
+    }
+
+    const prData = await res.json();
+    return { number: prData.number, url: prData.html_url };
+  } catch (err: any) {
+    console.error(`[createGitHubPR] Error: ${err.message}`);
+    return null;
+  }
+}
+
+// P16: Refresh canonicalHeadSha from GitHub's actual integration branch HEAD.
+// Called after a PR is merged.
+export async function refreshCanonicalHead(projectId: string): Promise<string | null> {
+  const project = await db.project.findUnique({ where: { id: projectId } });
+  if (!project || !project.githubRepo || !project.githubDefaultBranch) return null;
+
+  const githubPat = process.env.GITHUB_PAT;
+  if (!githubPat) return null;
+
+  const [owner, repo] = project.githubRepo.split("/");
+  const headers = {
+    "Authorization": `token ${githubPat}`,
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "Forge-Control-Plane",
+  };
+
+  try {
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/branches/${project.githubDefaultBranch}`, {
+      headers,
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+
+    const branchData = await res.json();
+    const headSha = branchData.commit?.sha || null;
+    if (headSha) {
+      await db.project.update({
+        where: { id: projectId },
+        data: { canonicalHeadSha: headSha },
+      });
+    }
+    return headSha;
+  } catch {
+    return null;
   }
 }

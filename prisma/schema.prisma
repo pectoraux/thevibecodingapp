@@ -188,6 +188,12 @@ model Task {
   reviewResultJson   String?               // JSON Reviewer verdict
   implementationLog  String?               // raw agent output
 
+  // P16: Integration lifecycle
+  integrationState   String   @default("NONE") // NONE | INTEGRATION_PENDING | INTEGRATED | INTEGRATION_FAILED
+  prNumber           Int?
+  prUrl              String?
+  prState            String?               // OPEN | MERGED | CLOSED
+
   failureReason      String?
   blockedReason      String?
 
