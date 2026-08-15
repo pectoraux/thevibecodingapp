@@ -53,6 +53,20 @@ function readFile(path: string): string {
   }
 }
 
+/** Compare semantic version strings. Returns >0 if a > b, 0 if equal, <0 if a < b. */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const va = pa[i] || 0;
+    const vb = pb[i] || 0;
+    if (va > vb) return 1;
+    if (va < vb) return -1;
+  }
+  return 0;
+}
+
 function record(name: string, passed: boolean, details: string) {
   results.push({ name, passed, details });
 }
@@ -1205,10 +1219,72 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 }
 
 // ===========================================================================
+// PHASE 17G-RECONCILE: tar dependency version security invariant
+// ===========================================================================
+
+// The tar package is used for archive extraction. A security advisory
+// (GHSA-8qq5-rm4j-mr97 / CVE-2026-23745) affects node-tar <=7.5.2 with
+// arbitrary file overwrite via hardlink/symlink extraction. The patched
+// version is 7.5.3+. This test verifies the installed tar version is safe.
+
+// Test 94: package.json declares tar as a dependency.
+{
+  const pkgContent = readFile("package.json");
+  let pkg: any;
+  try { pkg = JSON.parse(pkgContent); } catch { pkg = {}; }
+  const hasTarDep = pkg.dependencies && typeof pkg.dependencies.tar === "string";
+  record(
+    "package.json declares tar as a dependency",
+    !!hasTarDep,
+    `tar dep: ${hasTarDep ? pkg.dependencies.tar : "NOT FOUND"}`
+  );
+}
+
+// Test 95: Installed tar version is patched (>= 7.5.3).
+{
+  let installedVersion: string | null = null;
+  try {
+    const tarPkg = JSON.parse(readFileSync("node_modules/tar/package.json", "utf-8"));
+    installedVersion = tarPkg.version || null;
+  } catch {
+    installedVersion = null;
+  }
+
+  const PATCHED_VERSION = "7.5.3";
+  const isPatched = installedVersion !== null && compareVersions(installedVersion, PATCHED_VERSION) >= 0;
+
+  record(
+    `Installed tar version is patched (>= ${PATCHED_VERSION}) — CVE-2026-23745`,
+    isPatched,
+    `installed: ${installedVersion ?? "UNKNOWN"}, required: >= ${PATCHED_VERSION}`
+  );
+}
+
+// Test 96: repository-reader imports from the tar package.
+{
+  const usesTar = reader.includes('import * as tar from "tar"') || reader.includes('from "tar"');
+  record(
+    "repository-reader.ts imports the tar package (confirms it's the extraction dependency)",
+    usesTar,
+    `usesTar: ${usesTar}`
+  );
+}
+
+// Test 97: tar.x() is called with a filter option (defense-in-depth on top of patched lib).
+{
+  const hasFilter = reader.includes("filter:") && reader.includes("tar.x(");
+  record(
+    "tar.x() called with filter option (defense-in-depth, not relying solely on library version)",
+    hasFilter,
+    `hasFilter: ${hasFilter}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 17G: Corrected Evidence Semantics + Archive Entry Safety ===\n");
+console.log("=== Forge Phase 17G-RECONCILE: Canonical Sync + Tar Dependency Security ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {
