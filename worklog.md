@@ -1352,3 +1352,58 @@ Stage Summary:
 - FILE CLASSIFICATION: binary classified before size check. Large binaries → recognized binary (not UNVERIFIED). Large text → UNVERIFIED (fail-closed). Large unknown with binary content → binary.
 - The repository readiness chain is now: GitHub integration HEAD → exact immutable SHA (freshness-verified) → complete tarball (streaming byte-limited) → deterministic scanner (binary-first classification) → readiness evidence (with exact SHA + snapshotSource).
 - Ready for runtime verification as the next milestone.
+
+---
+Task ID: 17C
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17C — Fail-closed repository snapshot completeness. Fix three remaining issues: (1) unreadable files silently skipped, (2) no aggregate extraction limit, (3) empty/invalid archive treated as complete.
+
+Work Log:
+- Read worklog.md (Phase 17B entry) and verified all three user claims against the REAL on-disk source (not past reports).
+- VERIFIED CLAIM 1 (silent skip): TRUE — walkDirectory() had three try/catch blocks with empty catches: readdir (line 336-338 `catch { return; }`), stat (line 350-352 `catch { continue; }`), readFile (line 360-362 `catch { // Skip unreadable files. }`). All silently skipped errors.
+- VERIFIED CLAIM 2 (no extraction limit): TRUE — no MAX_EXTRACTED_BYTES or MAX_EXTRACTED_FILES constants existed. Only MAX_TARBALL_SIZE (200MB compressed) was enforced.
+- VERIFIED CLAIM 3 (empty archive = complete): TRUE — `if (!topDir) { return { files: [], truncated: false }; }` led to `snapshotComplete: true` in the tarball return path.
+- Fix 1: Rewrote walkDirectory() with a WalkContext interface:
+  * Tracks unreadableFiles: {path, operation: "readdir"|"stat"|"readFile", error}[]
+  * readdir/stat/readFile failures are pushed to unreadableFiles — NOT silently skipped
+  * The old "// Skip unreadable files" comment is gone
+- Fix 2: Added MAX_EXTRACTED_BYTES (500MB) and MAX_EXTRACTED_FILES (100k) constants:
+  * walkDirectory tracks ctx.extractedBytes and ctx.extractedFileCount
+  * Checks file-count limit BEFORE reading (avoids unnecessary I/O)
+  * Checks extracted-bytes limit AFTER reading (before adding to files)
+  * If either exceeded: ctx.limitExceeded = true, walking stops
+  * This is in addition to the 200MB compressed download limit (Phase 17B)
+- Fix 3: Invalid/empty archive now returns snapshotError:
+  * No top-level directory → "Invalid archive: no top-level repository directory found after extraction"
+  * Zero files after walk → "Archive extracted but contained zero files"
+  * Both make snapshotComplete = false (was: returned complete=true)
+- Extended RepoSnapshot with 5 new fields:
+  * downloadedBytes: number (compressed tarball size)
+  * extractedBytes: number (total uncompressed file content)
+  * extractedFileCount: number
+  * unreadableFiles: UnreadableFile[]
+  * snapshotError: string | null
+- Added UnreadableFile type: {path, operation: "readdir"|"stat"|"readFile", error}
+- Updated downloadAndExtractTarball() to return the full extraction metadata
+- Updated all return paths with new fields: emptySnapshot, LOCAL_ONLY, tarball path, Trees API path
+- Tarball path snapshotComplete is now computed: `tarballResult.snapshotError === null && tarballResult.unreadableFiles.length === 0`
+- Updated readiness check "Repository snapshot is complete and verified":
+  * Fails when: snapshotComplete === false, OR unreadableFiles.length > 0, OR snapshotError !== null
+  * Failure reason: "REPOSITORY_SNAPSHOT_UNVERIFIED: ..."
+  * Evidence includes: snapshotSource, repositoryHeadSha, complete, truncated, downloadedBytes, extractedBytes, extractedFileCount, unreadableFiles, snapshotError
+- Updated readiness gate fallback object (project not found) with all new fields
+- Updated build event payload with snapshotSource, snapshotComplete, snapshotError, downloadedBytes, extractedBytes, extractedFileCount, unreadableFiles
+- Added 17 new Phase 17C tests (Tests 37-53) in tests/repository-scanner-invariants.ts
+- Updated 2 Phase 17B tests for renamed variable (bytesDownloaded → downloadedBytes) and computed snapshotComplete
+- Ran full test suite: scanner 55/55, readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 172 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as aa5c586. Pushed to origin main (001290a..aa5c586). Verified local == remote == aa5c58612a3314b5430a0e2557a97734d9eb07d5.
+
+Stage Summary:
+- CANONICAL: GitHub main = aa5c586, Local = aa5c586 (MATCH). Deployed = unverified from sandbox.
+- SNAPSHOT: exact SHA verified, downloadedBytes tracked, extractedBytes tracked, extractedFileCount tracked, unreadableFiles tracked (none silently skipped), snapshotError set on any failure.
+- RESOURCE LIMITS: tarball 200MB (streaming), extracted bytes 500MB, file count 100k. All enforced during extraction, not just download.
+- FAIL-CLOSED: unreadable file → incomplete. Limit exceeded → incomplete. Invalid archive → incomplete. Empty extraction → incomplete.
+- The repository readiness chain is now genuinely fail-closed: GitHub HEAD → exact SHA → bounded download → bounded extraction → NO skipped files → valid archive → complete snapshot → scanner → readiness evidence.
+- Ready for runtime verification as the next milestone.
