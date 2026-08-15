@@ -908,10 +908,107 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 }
 
 // ===========================================================================
+// PHASE 17E: Symlink cycle protection + file deduplication
+// ===========================================================================
+
+// Test 67: WalkContext has visitedRealpaths set for cycle protection.
+{
+  const hasSet = reader.includes("visitedRealpaths: Set<string>");
+  record(
+    "WalkContext has visitedRealpaths: Set<string> for cycle protection",
+    hasSet,
+    `hasSet: ${hasSet}`
+  );
+}
+
+// Test 68: WalkContext has visitedFileRealpaths set for file deduplication.
+{
+  const hasSet = reader.includes("visitedFileRealpaths: Set<string>");
+  record(
+    "WalkContext has visitedFileRealpaths: Set<string> for file deduplication",
+    hasSet,
+    `hasSet: ${hasSet}`
+  );
+}
+
+// Test 69: walkDirectory resolves directory realpath at entry.
+{
+  const resolvesAtEntry = reader.includes("dirRealpath = realpathSync(fullPath)");
+  record(
+    "walkDirectory resolves directory realpath at entry (for cycle detection)",
+    resolvesAtEntry,
+    `resolvesAtEntry: ${resolvesAtEntry}`
+  );
+}
+
+// Test 70: walkDirectory checks visitedRealpaths before recursing.
+{
+  const checksVisited = reader.includes("ctx.visitedRealpaths.has(dirRealpath)");
+  const addsVisited = reader.includes("ctx.visitedRealpaths.add(dirRealpath)");
+  record(
+    "walkDirectory checks + adds visitedRealpaths before recursing (cycle prevention)",
+    checksVisited && addsVisited,
+    `checksVisited: ${checksVisited}, addsVisited: ${addsVisited}`
+  );
+}
+
+// Test 71: readFileEntry deduplicates files by canonical realpath.
+{
+  const resolvesFileRealpath = reader.includes("fileRealpath = realpathSync(entryFull)");
+  const checksFileVisited = reader.includes("ctx.visitedFileRealpaths.has(fileRealpath)");
+  const addsFileVisited = reader.includes("ctx.visitedFileRealpaths.add(fileRealpath)");
+  record(
+    "readFileEntry deduplicates files by realpath (checks + adds visitedFileRealpaths)",
+    resolvesFileRealpath && checksFileVisited && addsFileVisited,
+    `resolves: ${resolvesFileRealpath}, checks: ${checksFileVisited}, adds: ${addsFileVisited}`
+  );
+}
+
+// Test 72: WalkContext initialized with empty visitedRealpaths set.
+{
+  const initializesSet = reader.includes("visitedRealpaths: new Set<string>()");
+  record(
+    "WalkContext initialized with empty visitedRealpaths Set",
+    initializesSet,
+    `initializesSet: ${initializesSet}`
+  );
+}
+
+// Test 73: WalkContext initialized with empty visitedFileRealpaths set.
+{
+  const initializesSet = reader.includes("visitedFileRealpaths: new Set<string>()");
+  record(
+    "WalkContext initialized with empty visitedFileRealpaths Set",
+    initializesSet,
+    `initializesSet: ${initializesSet}`
+  );
+}
+
+// Test 74: walkDirectory returns early when directory already visited.
+{
+  const returnsEarly = reader.includes("Already visited this directory");
+  record(
+    "walkDirectory returns early when directory realpath already visited (cycle broken)",
+    returnsEarly,
+    `returnsEarly: ${returnsEarly}`
+  );
+}
+
+// Test 75: readFileEntry returns early when file already scanned.
+{
+  const returnsEarly = reader.includes("Already scanned this file");
+  record(
+    "readFileEntry returns early when file realpath already scanned (deduplication)",
+    returnsEarly,
+    `returnsEarly: ${returnsEarly}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 17D: Snapshot Memory + Filesystem Boundary Hardening ===\n");
+console.log("=== Forge Phase 17E: Symlink Cycle Protection + File Deduplication ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {

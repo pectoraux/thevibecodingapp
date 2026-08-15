@@ -329,6 +329,7 @@ async function downloadAndExtractTarball(
 
     // Phase 17C: Walk with fail-closed error tracking + resource limits.
     // Phase 17D: + repoRootRealpath for symlink containment.
+    // Phase 17E: + visitedRealpaths/visitedFileRealpaths for cycle protection.
     const ctx: WalkContext = {
       files: [],
       unreadableFiles: [],
@@ -337,6 +338,8 @@ async function downloadAndExtractTarball(
       limitExceeded: false,
       limitExceededReason: null,
       repoRootRealpath: null, // Set after topDir is validated below.
+      visitedRealpaths: new Set<string>(),
+      visitedFileRealpaths: new Set<string>(),
     };
 
     const extractedRoots = readdirSync(extractDir);
@@ -454,10 +457,14 @@ interface WalkContext {
   limitExceededReason: string | null;
   /** Phase 17D: Resolved real path of the repository root for symlink containment. */
   repoRootRealpath: string | null;
+  /** Phase 17E: Set of visited directory realpaths — prevents symlink cycle recursion. */
+  visitedRealpaths: Set<string>;
+  /** Phase 17E: Set of visited file realpaths — prevents duplicate scanning via multiple symlinks. */
+  visitedFileRealpaths: Set<string>;
 }
 
 /**
- * Phase 17D: Walk the extracted directory and read all files.
+ * Phase 17E: Walk the extracted directory and read all files.
  *
  * FAIL-CLOSED: readdir/stat/readFile failures are recorded in ctx.unreadableFiles.
  * They are NOT silently skipped. Any unreadable file makes snapshotComplete = false.
@@ -466,13 +473,15 @@ interface WalkContext {
  * is exceeded, walking stops and ctx.limitExceeded is set.
  *
  * Phase 17D HARDENING:
- *   1. PRE-READ SIZE CHECK — stat.size is checked BEFORE readFileSync. A file
- *      larger than the remaining aggregate budget is rejected without being
- *      loaded into memory.
- *   2. SYMLINK CONTAINMENT — lstatSync detects symlinks. realpathSync resolves
- *      the target. If the target escapes the repository root, the entry is
- *      recorded as untrusted and snapshotComplete = false. Symlinks are NEVER
- *      followed outside the extraction root.
+ *   1. PRE-READ SIZE CHECK — stat.size is checked BEFORE readFileSync.
+ *   2. SYMLINK CONTAINMENT — lstatSync + realpathSync. Escapes are blocked.
+ *
+ * Phase 17E CYCLE PROTECTION:
+ *   3. VISITED-REALPATH SET — before recursing into a directory, resolve its
+ *      realpath. If already visited, skip (prevents symlink cycles like
+ *      a→b→a from recursing forever).
+ *   4. FILE DEDUPLICATION — files are deduplicated by canonical realpath so
+ *      multiple internal symlinks to the same file don't cause repeated scanning.
  */
 function walkDirectory(
   basePath: string,
@@ -483,6 +492,27 @@ function walkDirectory(
   if (ctx.limitExceeded) return;
 
   const fullPath = relativePath ? join(basePath, relativePath) : basePath;
+
+  // Phase 17E: Cycle protection — resolve the realpath of this directory.
+  // If already visited, skip (prevents infinite recursion via symlink cycles).
+  let dirRealpath: string;
+  try {
+    dirRealpath = realpathSync(fullPath);
+  } catch (err: any) {
+    ctx.unreadableFiles.push({
+      path: relativePath || ".",
+      operation: "stat",
+      error: `realpath resolution failed: ${err.message ?? String(err)}`,
+    });
+    return;
+  }
+
+  if (ctx.visitedRealpaths.has(dirRealpath)) {
+    // Already visited this directory (via another path or symlink) — skip.
+    return;
+  }
+  ctx.visitedRealpaths.add(dirRealpath);
+
   let entries: string[];
   try {
     entries = readdirSync(fullPath);
@@ -547,10 +577,12 @@ function walkDirectory(
       }
 
       // Symlink points inside the repo — follow it (statSync follows symlinks).
-      // This is safe because we've verified the target is contained.
+      // Phase 17E: Cycle protection is handled inside walkDirectory (for dirs)
+      // and readFileEntry (for files) via visitedRealpaths/visitedFileRealpaths.
       try {
         const followedStat = statSync(entryFull);
         if (followedStat.isDirectory()) {
+          // walkDirectory will check visitedRealpaths before recursing.
           walkDirectory(basePath, entryRelative, ctx);
         } else if (followedStat.isFile()) {
           readFileEntry(entryFull, entryRelative, followedStat, ctx);
@@ -567,6 +599,7 @@ function walkDirectory(
 
     // Normal entry (not a symlink).
     if (lstat.isDirectory()) {
+      // Phase 17E: walkDirectory checks visitedRealpaths at entry.
       walkDirectory(basePath, entryRelative, ctx);
     } else if (lstat.isFile()) {
       readFileEntry(entryFull, entryRelative, lstat, ctx);
@@ -575,12 +608,15 @@ function walkDirectory(
 }
 
 /**
- * Phase 17D: Read a single file with pre-read size check.
+ * Phase 17E: Read a single file with pre-read size check + deduplication.
  *
  * The file size (from stat) is checked BEFORE readFileSync. If the file would
  * exceed the remaining aggregate budget, it is rejected without being loaded
  * into memory. This prevents a single large file from causing an unbounded
  * memory allocation.
+ *
+ * Phase 17E: Files are deduplicated by canonical realpath. If multiple symlinks
+ * point to the same underlying file, it is only scanned once.
  */
 function readFileEntry(
   entryFull: string,
@@ -588,6 +624,25 @@ function readFileEntry(
   stat: { size: number },
   ctx: WalkContext
 ): void {
+  // Phase 17E: Deduplicate by canonical realpath.
+  // Multiple symlinks to the same file should only scan it once.
+  let fileRealpath: string;
+  try {
+    fileRealpath = realpathSync(entryFull);
+  } catch (err: any) {
+    ctx.unreadableFiles.push({
+      path: entryRelative,
+      operation: "stat",
+      error: `realpath resolution failed: ${err.message ?? String(err)}`,
+    });
+    return;
+  }
+
+  if (ctx.visitedFileRealpaths.has(fileRealpath)) {
+    // Already scanned this file (via another path or symlink) — skip.
+    return;
+  }
+
   // Phase 17C: Check file-count limit before reading.
   if (ctx.extractedFileCount >= MAX_EXTRACTED_FILES) {
     ctx.limitExceeded = true;
@@ -613,6 +668,9 @@ function readFileEntry(
       ctx.limitExceededReason = `File ${entryRelative} content is ${content.length} bytes — exceeded MAX_EXTRACTED_BYTES limit (${MAX_EXTRACTED_BYTES}) after read`;
       return;
     }
+    // Phase 17E: Mark this file as visited BEFORE adding (prevents race in
+    // recursive symlink scenarios, though JS is single-threaded).
+    ctx.visitedFileRealpaths.add(fileRealpath);
     ctx.files.push({ path: entryRelative, content });
     ctx.extractedBytes += content.length;
     ctx.extractedFileCount++;
