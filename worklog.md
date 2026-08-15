@@ -1695,3 +1695,59 @@ Stage Summary:
 - PRODUCTION_READY PREDICATE: architectureFrozen AND allTasksCompleted AND allTasksIntegrated AND staticReadinessPassed AND runtimeVerificationPassed AND runtimeEvidencePersisted AND executionEnvironmentSandboxed AND repositoryHeadVerified.
 - TESTS: 256 passed, 0 failed from clean clone.
 - NEXT: Implement the actual worker runtime verification execution (executeRuntimeVerification in poller.ts) — the pipeline that clones at exact SHA, installs, builds, starts, verifies, tears down.
+
+---
+Task ID: 18A
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 18A — Harden runtime verification contract: server-authoritative SHA, no defaults, required/optional checks, no PRODUCTION_READY from runtime alone, evidence bound to canonical state.
+
+Work Log:
+- VERIFIED all five user claims against real source:
+  1. Endpoint trusted worker SHA (result.repositoryHeadSha persisted directly) — TRUE.
+  2. Evaluator treated integrationChecks/backgroundJobChecks/browserJourneys as best-effort — TRUE.
+  3. deriveRuntimeVerificationPlan had npm defaults — TRUE (lines 291-294).
+  4. Endpoint emitted PRODUCTION_READY from evaluation.passed alone — TRUE (line 88).
+  5. No executeRuntimeVerification() existed — TRUE (only types/predicates).
+- Fix 1: Server-authoritative SHA in submit-runtime-evidence:
+  * Loads project.canonicalHeadSha as expectedSha.
+  * Rejects result.repositoryHeadSha !== expectedSha (HTTP 403).
+  * Independently verifies GitHub branch HEAD == expectedSha.
+  * Rejects when headVerified is false (HTTP 403).
+  * Worker may NEVER choose the revision being certified.
+- Fix 2: No runtime defaults in deriveRuntimeVerificationPlan:
+  * Returns null when architecture is null, not frozen, or deploymentModel lacks any required field (installCommands, buildCommands, startCommand, port).
+  * Returns null on malformed JSON.
+  * No npm/port/command defaults anywhere.
+  * Plan MUST come from frozen architecture contract.
+- Fix 3: Required vs optional runtime checks:
+  * Added CheckRequirement type ("required" | "optional") to all check definitions.
+  * evaluateRuntimeVerificationResult now receives BOTH plan and result.
+  * Required + missing → fail. Required + fail → fail. Optional + missing → ok.
+  * Returns breakdown with requiredPassed/requiredFailed/requiredMissing/optionalPassed/optionalSkipped.
+- Fix 4: Never emit PRODUCTION_READY from runtime pass alone:
+  * Endpoint emits RUNTIME_VERIFIED initially.
+  * After persisting, evaluates complete canonical predicate (8 conditions).
+  * Only if ALL pass → emit PRODUCTION_READY + update project status.
+  * Otherwise → emit RUNTIME_VERIFIED_NOT_PRODUCTION_READY with failure reason.
+- Fix 5: RuntimeEvidence bound to canonical state:
+  * Added schema fields: expectedRepositoryHeadSha, executedRepositoryHeadSha, integrationBranch, runtimePlanHash, architectureHash.
+  * hashRuntimePlan() produces stable SHA-256 hash for reproducibility.
+- Journey model improvements:
+  * API journeys: multi-step sequences with setup, steps[], teardown.
+  * Integration checks: verificationMethod (connectivity, test-mode, etc.).
+  * Background job checks: trigger, observationWindowMs, expectedEffect.
+  * Browser journeys: steps[], assertions[], timeoutMs.
+- Updated tests: 67 total (27 new Phase 18A tests covering all 5 fixes).
+- Fixed old tests to pass plan to evaluator and provide valid architecture to deriveRuntimeVerificationPlan.
+- CLEAN-CLONE VERIFICATION:
+  * Clean clone HEAD = 45b77a6 (matches local + remote).
+  * Verified Phase 18A code: expectedRepositoryHeadSha (2), runtimePlanHash (1), SHA mismatch rejection (1), no npm defaults (0), required/optional (21), canonical predicate (1).
+  * Ran full test suite from clean clone: 283 passed, 0 failed.
+- Committed as 45b77a6. Pushed to origin main (5314b48..45b77a6).
+- SHA: local == remote == clean clone == 45b77a6ae4c3ab0495eb97847f49946ff44f50f0.
+
+Stage Summary:
+- CANONICAL: GitHub main = 45b77a6, Local = 45b77a6, Clean clone = 45b77a6 (ALL MATCH).
+- POLICY LAYER: server-authoritative SHA, no defaults, required/optional checks, no PRODUCTION_READY from runtime alone, evidence bound to canonical state.
+- TESTS: 283 passed, 0 failed from clean clone.
+- NEXT: Phase 18B can implement the actual isolated runtime executor (executeRuntimeVerification in poller.ts) — the pipeline that clones at exact SHA, installs, builds, starts, verifies, tears down.
