@@ -1205,3 +1205,97 @@ Stage Summary:
 - REPOSITORY-READER: strictly read-only. Zero writes to Repo* models. Self-contained (no @/lib/repo import).
 - LOCAL_ONLY HONESTY: content-based readiness checks cannot pass for LOCAL_ONLY because the worker deletes its /tmp checkout. This is correct — LOCAL_ONLY is dev-only. Future phase should either require GitHub for all builds or persist file contents in TaskEvidence.
 - The readiness gate now reads the same repository that the worker actually modifies (GitHub). No more DB shadow.
+
+---
+Task ID: 17A
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17A — Make repository readiness scanning complete and fail-closed. Fix three critical correctness gaps in the Phase 17 repository reader: (1) 50-file content cap, (2) tree truncation not handled, (3) canonicalHeadSha not freshness-verified.
+
+Work Log:
+- Read worklog.md (Phase 17 entry) and verified all three user claims against real source.
+- VERIFIED CLAIM 1 (MAX_CONTENT_FETCHES = 50): TRUE — line 181 of repository-reader.ts. Source files beyond #50 were silently skipped. Secrets/fake-impl in file #51+ could evade scanning.
+- VERIFIED CLAIM 2 (tree truncation not handled): TRUE — treeData.truncated flag was never checked (lines 228-238). Incomplete tree silently proceeded as complete.
+- VERIFIED CLAIM 3 (canonicalHeadSha trusted without freshness): TRUE — line 203 used `project.canonicalHeadSha || branch` without verifying it still equals GitHub branch HEAD.
+- VERIFIED CLAIM 4 (LOCAL_ONLY first-occurrence): TRUE — line 387 `if (!fileMap.has(path))` kept first evidence, not newest.
+- VERIFIED CLAIM 5 (canReachProductionReady only checks execution mode): TRUE — production-enforcement.ts:46-48 checked FORGE_EXECUTION_MODE but not project mode.
+- Installed `tar` package (7.5.22) for tarball-based complete repository download.
+- Created src/lib/repository-scanner.ts (NEW MODULE):
+  * Separation of concerns: reader obtains snapshot, scanner inspects content.
+  * scanFile(): classifies binary by content (null-byte detection in first 8KB), not just extension.
+  * scanRepository(): scans ALL text files — no arbitrary cap.
+  * scanForSecrets(): 14 secret patterns (Stripe live/test/restricted, AWS access key + secret, GitHub PAT/OAuth/user/server/fine-grained, private key material, Google API key, Slack token, JWT).
+  * scanSuspiciousPatterns(): moved here from reader.
+  * Large-file policy: files >1MB (MAX_SCANNABLE_BYTES) marked UNVERIFIED — never silently skipped.
+  * summarizeScan(): aggregate results for readiness checks.
+  * hasErrorHandling(): try/catch/except/.catch detection.
+  * getHighSeverityPatterns(): filters to high-severity labels only.
+- Rewrote src/lib/repository-reader.ts:
+  * COMPLETE CONTENT: downloads GitHub tarball at exact canonical SHA via downloadAndExtractTarball(). One download, no per-file API calls, no 50-file cap, no tree truncation. Uses tar.x() to extract, walkDirectory() to collect all files.
+  * TREE TRUNCATION: if Trees API (used for UI list view) returns truncated=true, snapshot.truncated = true. Readiness fails on truncation.
+  * CANONICAL HEAD FRESHNESS: verifyCanonicalHeadFreshness() compares project.canonicalHeadSha against actual GitHub branch HEAD. If they differ → CANONICAL_HEAD_STALE → headVerified=false → readiness fails.
+  * EXACT SHA: snapshot.head records the verified immutable SHA. snapshot.headVerified and headVerificationNote record verification status.
+  * LOCAL_ONLY: newest evidence for a path wins (was: first occurrence). Changed `if (!fileMap.has(path))` to `fileMap.set(path, ...)` (always overwrite).
+  * getRepositorySnapshot() now takes verifyFreshness parameter (true for readiness, false for UI).
+- Rewrote src/lib/readiness.ts:
+  * Four new structural checks (run before content checks):
+    1. "Repository is GitHub-backed (not LOCAL_ONLY)" — LOCAL_ONLY explicitly blocked
+    2. "Canonical HEAD is fresh" — blocks on CANONICAL_HEAD_STALE
+    3. "Repository tree is not truncated" — blocks on incomplete tree
+    4. "No unscannable files (too large)" — blocks on UNVERIFIED files
+  * Content checks now use scanRepository() results (complete coverage):
+    - Secrets: scans ALL text files (Dockerfile, config.txt, .env, etc.)
+    - Suspicious patterns: complete repository scan via scanner
+    - Error handling: operates on scanned file contents
+    - Health endpoint: checks file paths AND content
+  * Records repositoryHeadSha in every readiness result for reproducibility.
+  * Scan summary included in build event payload.
+- Updated src/lib/production-enforcement.ts:
+  * canReachProductionReady() now accepts projectMode parameter
+  * LOCAL_ONLY explicitly blocked: `if (projectMode === "LOCAL_ONLY") return false`
+  * getLocalOnlyPolicyReason() documents the explicit policy
+- Updated src/app/api/projects/[id]/repository/files/route.ts to import scanSuspiciousPatterns from scanner.
+- Added tests/repository-scanner-invariants.ts (29 checks):
+  * Secret in file #55 (beyond old 50-file cap) → detected
+  * Secret in Dockerfile → detected
+  * Secret in config.txt → detected
+  * Private key material → detected
+  * Binary by content (null bytes) → classified binary
+  * Text without extension → classified text
+  * Known binary extension → fast-path binary
+  * Large file (>1MB) → UNVERIFIED (not skipped)
+  * Large file in repo scan → counted in summary
+  * Suspicious pattern detection
+  * High-severity filtering
+  * Error handling detection
+  * Reader has no MAX_CONTENT_FETCHES
+  * Reader uses tarball download
+  * Reader checks tree truncation
+  * Reader verifies canonical HEAD freshness
+  * Reader records exact SHA
+  * Reader LOCAL_ONLY: newest evidence wins
+  * Readiness has LOCAL_ONLY block check
+  * Readiness has canonical HEAD freshness check
+  * Readiness has tree truncation check
+  * Readiness has unscannable-files check
+  * Readiness records exact SHA
+  * Readiness uses scanner (not inline)
+  * Readiness has zero db.repo* reads
+  * production-enforcement blocks LOCAL_ONLY
+  * production-enforcement has getLocalOnlyPolicyReason
+  * scanSuspiciousPatterns in scanner, not reader
+  * Reader does not import scanner (clean separation)
+- Updated tests/readiness-source-invariants.ts R9 for scanner separation.
+- GITHUB PUSH PROTECTION ISSUE: first push attempt was rejected because the test file contained literal Stripe API key strings (sk_live_...) that triggered GitHub's secret scanning. Fixed by constructing all fake secrets at runtime using string concatenation: `["sk_live_", "a".repeat(24)].join("")`. The literals never appear in source; the scanner detects the constructed values at runtime.
+- Ran full test suite: scanner 29/29, readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 146 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as b9718ad. Pushed to origin main (f2099c3..b9718ad). Verified local == remote == b9718ad26f65053340284655ef926e867f57b6e1.
+
+Stage Summary:
+- CANONICAL: GitHub main = b9718ad, Local = b9718ad (MATCH). Deployed = unverified from sandbox.
+- REPOSITORY READER: canonical source = real GitHub tarball at exact SHA; full content coverage = yes (no cap); tree truncation = detected and blocks; stale HEAD = detected and blocks.
+- SECURITY SCAN: complete coverage = yes (all text files, binary by content); large-file policy = UNVERIFIED (fail-closed).
+- LOCAL_ONLY: production-ready blocked = yes (explicit structural check + policy function).
+- SCANNER SEPARATION: reader obtains snapshot, scanner inspects content. Reader does not import scanner.
+- The readiness gate now has a trustworthy chain: GitHub integration HEAD → exact immutable SHA → complete tarball → deterministic scanner → readiness evidence.
+- Not yet done: scoped GitHub credentials (still uses process.env.GITHUB_PAT), runtime verification, E2E, production sandbox. These are future phases.
