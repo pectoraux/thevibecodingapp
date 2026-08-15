@@ -45,9 +45,10 @@ export const TaskStatus = {
   BLOCKED: "BLOCKED",
   FAILED: "FAILED",
   COMPLETED: "COMPLETED",
-  // P16: Integration lifecycle states
-  INTEGRATION_PENDING: "INTEGRATION_PENDING", // PR created, awaiting merge
-  INTEGRATED: "INTEGRATED",                    // PR merged into canonical branch
+  // P16B: INTEGRATION_PENDING and INTEGRATED are NOT TaskStatus values.
+  // They are tracked in Task.integrationState, not Task.status.
+  // Task.status represents EXECUTION state only.
+  // Task.integrationState represents INTEGRATION state.
 } as const;
 export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
 

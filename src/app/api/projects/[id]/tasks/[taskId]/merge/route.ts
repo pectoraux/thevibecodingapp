@@ -7,14 +7,18 @@ import { refreshCanonicalHead } from "@/app/api/worker/submit-evidence/route";
 
 // POST /api/projects/[id]/tasks/[taskId]/merge
 //
-// Phase 16A: Merge a task's PR into the canonical integration branch.
+// Phase 16B: Merge a task's PR into the canonical integration branch.
+// Task execution state (status) remains COMPLETED — only integrationState changes.
+//
 // Only project owner can merge. Requires:
-//   - task.status === COMPLETED
+//   - task.status === COMPLETED (execution verified)
 //   - task.integrationState === INTEGRATION_PENDING
 //   - task.prNumber exists
+//   - task.projectId === project ID from URL (binding check)
 //   - PR head SHA matches task.commitSha
 //   - PR base matches project.githubDefaultBranch
 //   - Stale base detection (canonical HEAD may have moved)
+//   - GitHub CI checks pass (if configured)
 export async function POST(req: Request, { params }: { params: Promise<{ id: string; taskId: string }> }) {
   try {
     const userId = await requireUserId();
@@ -26,12 +30,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 
-    const task = await db.task.findUnique({ where: { id: taskId } });
+    // P16B: Load task with project binding — task must belong to this project.
+    const task = await db.task.findFirst({
+      where: { id: taskId, projectId: id },
+    });
     if (!task) {
-      return NextResponse.json({ error: "Task not found" }, { status: 404 });
+      return NextResponse.json({ error: "Task not found in this project" }, { status: 404 });
     }
 
-    // P16A: Verify task is COMPLETED and INTEGRATION_PENDING.
+    // P16B: Verify task is COMPLETED (execution state) and INTEGRATION_PENDING (integration state).
     if (task.status !== TaskStatus.COMPLETED) {
       return NextResponse.json({ error: `Task must be COMPLETED (current: ${task.status})` }, { status: 400 });
     }
@@ -78,12 +85,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
 
     // 4. P16A: Stale base detection.
-    // If canonicalHeadSha has moved since the PR was created, the PR may be stale.
     const currentCanonicalHead = project.canonicalHeadSha;
     const prBaseSha = prData.base?.sha;
     if (currentCanonicalHead && prBaseSha && currentCanonicalHead !== prBaseSha) {
-      // The canonical HEAD has moved since this PR was created.
-      // The PR is based on a stale commit.
       await db.task.update({
         where: { id: taskId },
         data: {
@@ -100,7 +104,38 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }, { status: 409 });
     }
 
-    // 5. Merge the PR via GitHub API.
+    // 5. P16B: Check GitHub CI status (check runs for the PR head commit).
+    const checksRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${task.commitSha}/check-runs`, {
+      headers, signal: AbortSignal.timeout(10000),
+    });
+    if (checksRes.ok) {
+      const checksData = await checksRes.json();
+      const checkRuns = checksData.check_runs || [];
+      // Check if any required checks have failed or are still pending.
+      const failedChecks = checkRuns.filter((cr: any) => cr.conclusion === "failure");
+      const pendingChecks = checkRuns.filter((cr: any) => cr.status !== "completed");
+
+      if (failedChecks.length > 0) {
+        await db.task.update({
+          where: { id: taskId },
+          data: {
+            integrationState: "INTEGRATION_FAILED",
+            failureReason: `CI_FAILED: ${failedChecks.length} check(s) failed`,
+          },
+        });
+        return NextResponse.json({
+          error: `CI_FAILED: ${failedChecks.length} check(s) failed. Merge blocked.`,
+        }, { status: 422 });
+      }
+
+      if (pendingChecks.length > 0) {
+        return NextResponse.json({
+          error: `CI_PENDING: ${pendingChecks.length} check(s) still running. Merge blocked.`,
+        }, { status: 409 });
+      }
+    }
+
+    // 6. Merge the PR via GitHub API.
     const mergeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${task.prNumber}/merge`, {
       method: "PUT",
       headers,
@@ -125,14 +160,38 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }, { status: 500 });
     }
 
-    // 6. Refresh canonicalHeadSha from actual GitHub branch HEAD.
+    // 7. P16B: Refresh canonicalHeadSha from actual GitHub branch HEAD.
+    // Must succeed before marking INTEGRATED.
     const newCanonicalHead = await refreshCanonicalHead(id);
 
-    // 7. Mark task as INTEGRATED.
+    if (!newCanonicalHead) {
+      // P16B: PR merged but canonical HEAD refresh failed.
+      // Do NOT mark as INTEGRATED — use CANONICAL_HEAD_UNVERIFIED.
+      await db.task.update({
+        where: { id: taskId },
+        data: {
+          integrationState: "CANONICAL_HEAD_UNVERIFIED",
+          prState: "MERGED",
+          failureReason: "PR merged but canonical HEAD refresh failed — manual verification required",
+        },
+      });
+      await db.project.update({
+        where: { id },
+        data: { status: "HUMAN_REVIEW_REQUIRED" },
+      });
+      return NextResponse.json({
+        ok: true,
+        integrated: false,
+        warning: "PR merged but canonical HEAD could not be verified. Manual review required.",
+        prNumber: task.prNumber,
+      });
+    }
+
+    // 8. P16B: Mark task as INTEGRATED — status remains COMPLETED.
     await db.task.update({
       where: { id: taskId },
       data: {
-        status: TaskStatus.INTEGRATED,
+        // P16B: status STAYS COMPLETED — only integrationState changes.
         integrationState: "INTEGRATED",
         prState: "MERGED",
       },
@@ -142,7 +201,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       projectId: id,
       type: BuildEventType.TASK_COMPLETED,
       level: "success",
-      message: `Task ${task.code} INTEGRATED — PR #${task.prNumber} merged, canonical HEAD: ${newCanonicalHead?.slice(0, 7) || "unknown"}`,
+      message: `Task ${task.code} INTEGRATED — PR #${task.prNumber} merged, canonical HEAD: ${newCanonicalHead.slice(0, 7)}`,
       taskId,
       agentType: task.agentType,
     });

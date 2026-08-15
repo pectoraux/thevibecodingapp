@@ -92,16 +92,16 @@ export async function processBuildQueue(): Promise<{
     const byCode = new Map(tasks.map((t) => [t.code, t]));
 
     for (const task of tasks) {
-      // P16: Skip tasks that are already done, integration-pending, or integrated.
-      if ([TaskStatus.COMPLETED, TaskStatus.INTEGRATION_PENDING, TaskStatus.INTEGRATED].includes(task.status as any)) continue;
+      // P16B: Skip tasks that are COMPLETED (execution done).
+      // Integration state is tracked separately in integrationState.
+      if (task.status === TaskStatus.COMPLETED) continue;
 
-      // P16: Check dependencies — must be INTEGRATED (not just COMPLETED).
-      // This ensures dependency changes are in the canonical HEAD before
-      // dependent tasks can run.
+      // P16B: Check dependencies — must be INTEGRATED (not just COMPLETED).
+      // Uses integrationState, NOT task.status.
       const deps = JSON.parse(task.dependencies || "[]") as string[];
       const allDepsIntegrated = deps.every((d) => {
         const dep = byCode.get(d);
-        return dep?.status === TaskStatus.INTEGRATED;
+        return dep?.status === TaskStatus.COMPLETED && dep?.integrationState === "INTEGRATED";
       });
       if (!allDepsIntegrated) continue;
 
