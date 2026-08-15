@@ -35,8 +35,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Task not found" }, { status: 404 });
     }
 
-    // P10-6: Completion requires a real commit SHA.
-    // This is a HARD invariant — no commitSha = no completion.
+    // P13: Completion requires a real commit SHA and all verification passes.
+    // UNVERIFIED, VIOLATION, ARCHITECTURE_CHANGE_REQUIRED all block completion.
     const testsOk = Array.isArray(testResults) && testResults.length > 0 && testResults.every((t: any) => t.passes);
     const guardianOk = guardianResult?.verdict === "PASS" || guardianResult?.verdict === "WARNING";
     const reviewOk = reviewResult?.verdict === "APPROVED";
@@ -45,7 +45,7 @@ export async function POST(req: Request) {
     // Task can only be COMPLETED if ALL of:
     // - real commit exists (commitSha is not null)
     // - tests pass
-    // - Guardian is PASS or WARNING
+    // - Guardian is PASS or WARNING (NOT UNVERIFIED/VIOLATION/ARCHITECTURE_CHANGE_REQUIRED)
     // - Reviewer is APPROVED
     const canComplete = hasRealCommit && guardianOk && reviewOk && testsOk;
 

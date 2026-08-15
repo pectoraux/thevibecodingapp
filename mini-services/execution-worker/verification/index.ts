@@ -247,9 +247,9 @@ Respond with JSON:
 
   if (!result.success || !result.content) {
     return {
-      verdict: "WARNING",
+      verdict: "UNVERIFIED",
       findings: [],
-      summary: "Semantic Guardian LLM unavailable — defaulting to WARNING for safety",
+      summary: "Semantic Guardian LLM unavailable — UNVERIFIED (fail-closed: cannot complete without verification)",
     };
   }
 
@@ -258,7 +258,7 @@ Respond with JSON:
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
       return {
-        verdict: parsed.verdict || "WARNING",
+        verdict: parsed.verdict || "UNVERIFIED",
         findings: parsed.findings || [],
         summary: parsed.summary || "",
       };
@@ -266,8 +266,8 @@ Respond with JSON:
   } catch {}
 
   return {
-    verdict: "WARNING",
+    verdict: "UNVERIFIED",
     findings: [],
-    summary: "Could not parse semantic Guardian output",
+    summary: "Could not parse semantic Guardian output — UNVERIFIED (fail-closed)",
   };
 }

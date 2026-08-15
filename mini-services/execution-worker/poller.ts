@@ -20,7 +20,7 @@ import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runS
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase12";
+const WORKER_VERSION = "phase13";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
@@ -311,56 +311,64 @@ Generate the implementation files. Respond with ONLY JSON:
     }
   }
 
-  // --- Real Git commit ---
+  // --- P13: Candidate commit (local only — NOT pushed yet) ---
   let commitSha: string | null = gitAddAndCommit(sandboxPath, `feat(${spec.task.code}): ${spec.task.title}`);
   if (commitSha) {
-    console.log(`[worker] Commit: ${commitSha.slice(0, 7)}`);
+    console.log(`[worker] Candidate commit: ${commitSha.slice(0, 7)}`);
   }
 
   // --- Full diff for Guardian ---
   const diff = gitDiff(sandboxPath, spec.baseCommitSha || undefined);
   const diffStat = gitDiffStat(sandboxPath, spec.baseCommitSha || undefined);
 
-  // --- Push to remote (authenticated) ---
-  let pushedToRemote = false;
-  if (repoCloned && commitSha && spec.repository?.githubRepo) {
-    // Re-authenticate for push using the GitHub token.
-    const pushUrl = githubToken
-      ? `https://x-access-token:${githubToken}@github.com/${spec.repository.githubRepo}.git`
-      : `https://github.com/${spec.repository.githubRepo}.git`;
-    pushedToRemote = gitPush(sandboxPath, branchName, pushUrl);
-    // After push, remove the credential from .git/config.
-    if (githubToken) {
-      gitExec(sandboxPath, ["remote", "set-url", "origin", `https://github.com/${spec.repository.githubRepo}.git`]);
-    }
-    console.log(`[worker] Push: ${pushedToRemote ? "success" : "failed"}`);
-  }
-
-  // --- P12: Deterministic Guardian (Layer 1) ---
+  // --- P13: Deterministic Guardian (Layer 1) — BEFORE push ---
   const deterministicGuardianResult = runDeterministicGuardian(
     spec.architecture, filesChanged, diff + "\n\n--- DIFF STAT ---\n" + diffStat
   );
 
-  // --- P12: Semantic Architecture Guardian (Layer 2) ---
-  // Separate LLM invocation — asks "does this remain faithful to the frozen architecture?"
+  // --- P13: Semantic Architecture Guardian (Layer 2) — BEFORE push ---
   const semanticGuardianResult = await runSemanticGuardian(
     spec, filesChanged, diff, deterministicGuardianResult, apiCall, executionToken
   );
 
-  // Combine guardian results: VIOLATION from either layer = VIOLATION.
+  // P13: Combined Guardian — UNVERIFIED blocks (fail-closed).
+  // VIOLATION or UNVERIFIED or ARCHITECTURE_CHANGE_REQUIRED from either = block.
+  const blockVerdicts = ["VIOLATION", "UNVERIFIED", "ARCHITECTURE_CHANGE_REQUIRED"];
   const guardianResult = {
     deterministic: deterministicGuardianResult,
     semantic: semanticGuardianResult,
-    verdict: deterministicGuardianResult.verdict === "VIOLATION" || semanticGuardianResult.verdict === "VIOLATION"
-      ? "VIOLATION"
+    verdict: blockVerdicts.includes(deterministicGuardianResult.verdict) || blockVerdicts.includes(semanticGuardianResult.verdict)
+      ? (semanticGuardianResult.verdict === "UNVERIFIED" ? "UNVERIFIED"
+        : deterministicGuardianResult.verdict === "VIOLATION" || semanticGuardianResult.verdict === "VIOLATION" ? "VIOLATION"
+        : "ARCHITECTURE_CHANGE_REQUIRED")
       : deterministicGuardianResult.verdict === "WARNING" || semanticGuardianResult.verdict === "WARNING"
       ? "WARNING"
       : "PASS",
     summary: `Deterministic: ${deterministicGuardianResult.summary} | Semantic: ${semanticGuardianResult.summary}`,
   };
 
-  // --- Independent Reviewer ---
+  // --- P13: Independent Reviewer — BEFORE push ---
   const reviewResult = await runLlmReviewer(spec, filesChanged, testResults, guardianResult, apiCall, executionToken);
+
+  // --- P13: Push ONLY if verification passes (candidate → verified) ---
+  let pushedToRemote = false;
+  const guardianOk = guardianResult.verdict === "PASS" || guardianResult.verdict === "WARNING";
+  const reviewOk = reviewResult.verdict === "APPROVED";
+  const testsOk = testResults.length > 0 && testResults.every((t) => t.passes);
+
+  if (commitSha && guardianOk && reviewOk && testsOk) {
+    // Only push verified candidates to remote.
+    if (repoCloned && spec.repository?.githubRepo) {
+      const pushUrl = `https://x-access-token:${githubToken}@github.com/${spec.repository.githubRepo}.git`;
+      pushedToRemote = gitPush(sandboxPath, branchName, pushUrl);
+      if (githubToken) {
+        gitExec(sandboxPath, ["remote", "set-url", "origin", `https://github.com/${spec.repository.githubRepo}.git`]);
+      }
+      console.log(`[worker] Push verified candidate: ${pushedToRemote ? "success" : "failed"}`);
+    }
+  } else {
+    console.log(`[worker] Candidate NOT pushed — verification failed (guardian=${guardianResult.verdict}, review=${reviewResult.verdict}, tests=${testsOk})`);
+  }
 
   // --- Cleanup (after evidence collected) ---
   try { rmSync(sandboxPath, { recursive: true, force: true }); } catch {}
@@ -409,9 +417,13 @@ async function workerLoop(): Promise<void> {
             filesChanged: result.filesChanged,
             implementationLog: result.implementationLog,
           });
+          // P13: Success requires Guardian PASS or WARNING only.
+          // UNVERIFIED, VIOLATION, ARCHITECTURE_CHANGE_REQUIRED all block.
+          const blockVerdicts = ["VIOLATION", "UNVERIFIED", "ARCHITECTURE_CHANGE_REQUIRED"];
           const success = result.commitSha !== null &&
-                          result.guardianResult.verdict !== "VIOLATION" &&
+                          !blockVerdicts.includes(result.guardianResult.verdict) &&
                           result.reviewResult.verdict === "APPROVED" &&
+                          result.testResults.length > 0 &&
                           result.testResults.every((t) => t.passes);
           await completeJob(success ? "SUCCEEDED" : "FAILED");
           console.log(`[worker] ${job.executionId} → ${success ? "SUCCEEDED" : "FAILED"}`);
