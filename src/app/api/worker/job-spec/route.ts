@@ -147,28 +147,23 @@ export async function POST(req: Request) {
         return null;
       })(),
 
-      // P10-1: Base commit SHA for dependent tasks.
-      // Resolve from the task graph: find the latest completed dependency's commit.
+      // P15F: Base commit SHA from the CANONICAL PROJECT HEAD.
+      // The canonicalHeadSha represents the integration branch HEAD —
+      // it includes ALL merged dependency changes, not just one.
+      // It advances only when a PR is merged (not on task completion).
+      //
+      // For the FIRST task (canonicalHeadSha is null): base = null (fresh repo).
+      // For subsequent tasks: base = canonicalHeadSha (the integration HEAD).
+      //
+      // Dependencies are still checked (all must be COMPLETED), but the
+      // BASE is the canonical HEAD, not a single dependency's commit.
       baseCommitSha: await (async () => {
-        const deps = JSON.parse(task.dependencies || "[]") as string[];
-        if (deps.length === 0) return null;
-
-        // Find all completed dependency tasks.
-        const depTasks = await db.task.findMany({
-          where: {
-            projectId: job.projectId,
-            code: { in: deps },
-            status: "COMPLETED",
-            commitSha: { not: null },
-          },
-          orderBy: { completedAt: "desc" },
-        });
-
-        // Return the most recent completed dependency's commit SHA.
-        if (depTasks.length > 0 && depTasks[0].commitSha) {
-          return depTasks[0].commitSha;
+        // P15F: Use canonicalHeadSha as the base.
+        if (project.canonicalHeadSha) {
+          return project.canonicalHeadSha;
         }
 
+        // For the first task (no canonical HEAD yet): no base.
         return null;
       })(),
 

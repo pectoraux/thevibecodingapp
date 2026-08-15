@@ -73,19 +73,13 @@ export async function POST(req: Request) {
     // Do NOT trust body.branchName.
     const expectedBranch = `forge/${task.code.toLowerCase()}/attempt-${executionJob.attempt}`;
 
-    // P15D: Derive expected baseCommitSha from the canonical project HEAD.
-    // The canonical HEAD is updated after every successful task completion.
-    // This ensures ALL dependency changes are present in the base —
-    // not just the most recent dependency.
+    // P15F: Derive expected baseCommitSha from the CANONICAL PROJECT HEAD.
+    // canonicalHeadSha = the integration branch HEAD (GitHub default branch).
+    // It advances ONLY when a PR is merged — NOT on task completion.
+    // This ensures ALL dependency changes are in the base.
     //
-    // For the FIRST task (no dependencies, no canonical HEAD yet):
-    //   base = null (fresh repository)
-    //
-    // For tasks WITH dependencies:
-    //   base = project.canonicalHeadSha (which includes all merged dependency commits)
-    //
-    // For tasks WITHOUT dependencies but after other tasks completed:
-    //   base = project.canonicalHeadSha (build on existing work)
+    // For the FIRST task (canonicalHeadSha is null): base = null (fresh repo).
+    // For subsequent tasks: base = canonicalHeadSha.
     let expectedBaseCommitSha: string | null = project.canonicalHeadSha;
 
     // P15D: If the task has dependencies, verify they are ALL completed.

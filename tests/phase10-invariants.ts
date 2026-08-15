@@ -109,16 +109,16 @@ function testJobSpecByokResolution() {
   });
 }
 
-// Test 7: Job-spec resolves baseCommitSha from task graph
+// Test 7: Job-spec resolves baseCommitSha from canonicalHeadSha (P15F)
 function testBaseCommitPropagation() {
   const jobSpec = readFile("src/app/api/worker/job-spec/route.ts");
   const hasBaseCommitSha = jobSpec.includes("baseCommitSha");
-  const hasTaskGraphLookup = jobSpec.includes("depTasks") || jobSpec.includes("code: { in: deps }");
+  const hasCanonicalHead = jobSpec.includes("canonicalHeadSha");
 
   results.push({
-    name: "Job-spec resolves baseCommitSha from task graph",
-    passed: hasBaseCommitSha && hasTaskGraphLookup,
-    details: `baseCommitSha: ${hasBaseCommitSha}, task graph lookup: ${hasTaskGraphLookup}`,
+    name: "Job-spec resolves baseCommitSha from canonicalHeadSha",
+    passed: hasBaseCommitSha && hasCanonicalHead,
+    details: `baseCommitSha: ${hasBaseCommitSha}, canonicalHeadSha: ${hasCanonicalHead}`,
   });
 }
 

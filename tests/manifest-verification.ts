@@ -139,13 +139,13 @@ results.push({
   details: hasCommitReturn ? "gitAddAndCommit in module + used in poller" : "No real commit return",
 });
 
-// baseCommitPropagation
+// baseCommitPropagation — P15F: uses canonicalHeadSha, not depTasks
 const jobSpec = readFile("src/app/api/worker/job-spec/route.ts");
-const hasBaseCommitLookup = jobSpec.includes("depTasks") || jobSpec.includes("code: { in: deps");
+const hasCanonicalHeadBase = jobSpec.includes("canonicalHeadSha");
 results.push({
   name: "baseCommitPropagation = true",
-  passed: hasBaseCommitLookup,
-  details: hasBaseCommitLookup ? "Task graph lookup for baseCommitSha" : "No base commit propagation",
+  passed: hasCanonicalHeadBase,
+  details: hasCanonicalHeadBase ? "Uses canonicalHeadSha for base" : "No canonical head base",
 });
 
 // byokGateway — check llm module
