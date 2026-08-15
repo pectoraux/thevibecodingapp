@@ -1455,3 +1455,39 @@ Stage Summary:
 - RESOURCE LIMITS: tarball 200MB (streaming), extracted bytes 500MB (pre-read checked), file count 100k. All enforced before unbounded allocation.
 - The repository snapshot boundary is now hardened against: unbounded memory allocation, symlink escapes, invalid archive structures, and semantic conflation of authority with completeness.
 - Ready for runtime verification as the next milestone.
+
+---
+Task ID: 17E
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17E — Symlink cycle protection + file deduplication + canonical-state reconciliation. Fix internal symlink cycle P0 (a→b→a can recurse forever) and sync local/remote.
+
+Work Log:
+- CANONICAL-STATE VERIFICATION:
+  * User claimed GitHub main ends at f2c9359 (Phase 16D). Verified via git fetch + git rev-parse: remote origin/main was actually at 8ef366f (Phase 17D). The user's web view was likely cached.
+  * Found local divergence: local had 0ccf869 (worklog append) not on remote. Pushed it to sync.
+  * After push: local == remote == 0ccf869. Then added 17E fix on top.
+- VERIFIED P0 CLAIM (symlink cycles): TRUE — walkDirectory followed internal symlinks recursively without a visited-realpath set. A repository with a/link→../b + b/link→../a would recurse forever (until stack/resource limits). The containment check passed because targets were inside the repo, but there was no cycle detection.
+- Fix 1: Added visitedRealpaths: Set<string> to WalkContext.
+  * At the start of walkDirectory, resolve the directory's realpath via realpathSync.
+  * If already in visitedRealpaths, return immediately (cycle broken).
+  * Otherwise, add to the set before proceeding.
+  * Prevents a→b→a, a→a, and multiple-symlinks-to-same-dir from recursing.
+- Fix 2: Added visitedFileRealpaths: Set<string> to WalkContext.
+  * In readFileEntry, resolve the file's realpath before reading.
+  * If already in visitedFileRealpaths, skip (already scanned).
+  * Otherwise, add to the set before reading.
+  * Prevents multiple symlinks to the same file from double-scanning and double-counting against resource limits.
+- Updated WalkContext interface with both new fields.
+- Updated WalkContext initialization in downloadAndExtractTarball with empty Sets.
+- Added 9 new Phase 17E tests (Tests 67-75).
+- Ran full test suite: scanner 77/77, readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 194 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as 04c2125. Pushed to origin main (0ccf869..04c2125). Verified local == remote == 04c2125cf4d00ac1e565ba45387b4ca5c7fa9d22.
+
+Stage Summary:
+- CANONICAL: GitHub main = 04c2125, Local = 04c2125 (MATCH). User's claim of f2c9359 was stale/cached — git protocol confirmed 8ef366f→0ccf869→04c2125 on remote.
+- CYCLE PROTECTION: visitedRealpaths Set prevents infinite recursion from internal symlink cycles (a→b→a, a→a).
+- FILE DEDUPLICATION: visitedFileRealpaths Set prevents repeated scanning of the same file via multiple symlinks.
+- The repository snapshot boundary is now hardened against: unbounded memory allocation, symlink escapes, invalid archive structures, semantic conflation of authority, AND symlink cycles.
+- Ready for runtime verification as the next milestone.
