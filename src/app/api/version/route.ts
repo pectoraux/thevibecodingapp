@@ -35,7 +35,7 @@ export async function GET() {
     environment: process.env.NODE_ENV || "development",
     executionMode: FORGE_EXECUTION_MODE,
     sandboxed: isExecutionSandboxed(),
-    version: "phase16",
+    version: "phase16a",
     vercelUrl: process.env.VERCEL_URL || null,
     vercelRegion: process.env.VERCEL_REGION || null,
   });

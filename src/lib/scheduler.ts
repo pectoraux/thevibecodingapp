@@ -165,13 +165,8 @@ async function checkCompletedBuilds(): Promise<void> {
       where: { projectId: buildJob.projectId },
     });
 
-    const pendingTasks = tasks.filter((t) => t.status !== TaskStatus.COMPLETED);
-
-    if (pendingTasks.length === 0) {
-      // All tasks done — run readiness gate.
-      await finalizeBuild(buildJob);
-    } else if (tasks.some((t) => t.status === TaskStatus.FAILED && t.attempts >= t.maxAttempts)) {
-      // A task exhausted retries — build is blocked.
+    // P16A: Check for failed tasks first.
+    if (tasks.some((t) => t.status === TaskStatus.FAILED && t.attempts >= t.maxAttempts)) {
       await db.project.update({
         where: { id: buildJob.projectId },
         data: { status: ProjectStatus.HUMAN_REVIEW_REQUIRED },
@@ -179,7 +174,33 @@ async function checkCompletedBuilds(): Promise<void> {
       await updateJobStatus(buildJob.id, "BLOCKED", {
         errorMessage: "Task exhausted retries",
       });
+      continue;
     }
+
+    // P16A: Build completion requires ALL tasks to be COMPLETED.
+    const pendingTasks = tasks.filter((t) => t.status !== TaskStatus.COMPLETED);
+    if (pendingTasks.length > 0) continue;
+
+    // P16A: For GITHUB_BACKED projects, ALL tasks must also be INTEGRATED.
+    // COMPLETED alone is NOT sufficient — the PR must be merged.
+    const project = await db.project.findUnique({
+      where: { id: buildJob.projectId },
+      select: { githubConnected: true, githubRepo: true },
+    });
+    const isGithubBacked = project?.githubConnected && !!project.githubRepo;
+
+    if (isGithubBacked) {
+      const unintegratedTasks = tasks.filter(
+        (t) => t.integrationState !== "INTEGRATED"
+      );
+      if (unintegratedTasks.length > 0) {
+        // Some tasks are COMPLETED but not INTEGRATED — build cannot finalize.
+        continue;
+      }
+    }
+
+    // All tasks completed AND integrated (for GitHub-backed) — run readiness gate.
+    await finalizeBuild(buildJob);
   }
 }
 

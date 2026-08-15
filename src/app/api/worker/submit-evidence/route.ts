@@ -215,7 +215,7 @@ export async function POST(req: Request) {
       },
     });
 
-    // P16: Create a real GitHub PR for completed GitHub-backed tasks.
+    // P16A: Create a real GitHub PR for completed GitHub-backed tasks.
     if (canComplete && mode === "GITHUB_BACKED" && project.githubRepo && commitSha) {
       try {
         const prResult = await createGitHubPR(
@@ -234,14 +234,39 @@ export async function POST(req: Request) {
               prNumber: prResult.number,
               prUrl: prResult.url,
               prState: "OPEN",
+              integrationState: "INTEGRATION_PENDING",
+            },
+          });
+        } else {
+          // P16A: PR creation returned null — integration failed.
+          await db.task.update({
+            where: { id: taskId! },
+            data: {
+              integrationState: "INTEGRATION_FAILED",
+              failureReason: "PR creation failed — no PR returned from GitHub API",
             },
           });
         }
       } catch (err: any) {
         console.error(`[submit-evidence] PR creation failed: ${err.message}`);
-        // PR creation failure doesn't block task completion — task is still COMPLETED.
-        // But integration cannot proceed without a PR.
+        // P16A: PR creation failure sets INTEGRATION_FAILED, not silent success.
+        await db.task.update({
+          where: { id: taskId! },
+          data: {
+            integrationState: "INTEGRATION_FAILED",
+            failureReason: `PR creation failed: ${err.message}`,
+          },
+        });
       }
+    } else if (canComplete && mode === "LOCAL_ONLY") {
+      // P16A: For LOCAL_ONLY projects, INTEGRATION_PENDING is immediate
+      // (no PR needed — integration is automatic).
+      await db.task.update({
+        where: { id: taskId! },
+        data: {
+          integrationState: "INTEGRATED",
+        },
+      });
     }
 
     // P15E: Do NOT update canonicalHeadSha on task completion.
