@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { requireUserId } from "@/lib/auth";
-import { initRepository } from "@/lib/repo";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType } from "@/lib/types";
 import { readJsonBody } from "../../../../_lib";
@@ -34,15 +33,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       },
     });
 
-    // If the repo has no commits yet, initialize it.
-    const commitCount = await db.repoCommit.count({ where: { projectId: id } });
-    if (commitCount === 0) {
-      try {
-        await initRepository(id, repoName);
-      } catch (initErr: any) {
-        console.error("[initRepository] failed:", initErr);
-      }
-    }
+    // P16D-RECONCILE: no virtual-repo seeding. The real GitHub repository is
+    // the canonical source; canonicalHeadSha is initialized from the actual
+    // GitHub default branch HEAD below.
 
     // P16: Initialize canonicalHeadSha from the actual GitHub default branch HEAD.
     let canonicalHeadSha = existing.canonicalHeadSha;

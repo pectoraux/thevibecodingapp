@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { initRepository } from "@/lib/repo";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType, ProjectStatus } from "@/lib/types";
 import { requireUserId } from "@/lib/auth";
@@ -30,7 +29,8 @@ export async function GET() {
   }
 }
 
-// POST /api/projects — create a new DRAFT project + initialize its repo (owned by the authenticated user)
+// POST /api/projects — create a new DRAFT project (owned by the authenticated user).
+// P16D-RECONCILE: no virtual-repo seeding — real Git/GitHub is the canonical source.
 export async function POST(req: Request) {
   try {
     const userId = await requireUserId();
@@ -64,14 +64,6 @@ export async function POST(req: Request) {
       message: `Project “${project.name}” created`,
       payload: JSON.stringify({ name, description }),
     });
-
-    // Initialize the virtual repository with README + .gitignore.
-    try {
-      await initRepository(project.id, name);
-    } catch (repoErr: any) {
-      // Non-fatal — surface in the response but keep the project.
-      console.error("[initRepository] failed:", repoErr);
-    }
 
     return NextResponse.json({ project }, { status: 201 });
   } catch (e: any) {

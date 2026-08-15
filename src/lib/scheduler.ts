@@ -19,7 +19,7 @@ import { createJob, updateJobStatus, recoverExpiredJobs } from "@/lib/job-queue"
 import { createExecutionJob, recoverExpiredExecutionJobs } from "@/lib/execution-jobs";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType, TaskStatus, ProjectStatus } from "@/lib/types";
-import { isTaskIntegrated, areAllTasksReady, type ProjectMode } from "@/lib/integration-state";
+import { isTaskCompleted, isTaskIntegrated, areAllTasksReady, type ProjectMode } from "@/lib/integration-state";
 
 // ---------------------------------------------------------------------------
 // Enqueue a build — creates a QUEUED BuildJob and returns immediately.
@@ -93,8 +93,8 @@ export async function processBuildQueue(): Promise<{
     const byCode = new Map(tasks.map((t) => [t.code, t]));
 
     for (const task of tasks) {
-      // P16D: Skip tasks that are COMPLETED (execution done).
-      if (task.status === TaskStatus.COMPLETED) continue;
+      // P16D: Skip tasks whose execution is complete (canonical helper — no inline predicate).
+      if (isTaskCompleted(task)) continue;
 
       // P16D: Check dependencies — must be INTEGRATED using canonical helper.
       const project = await db.project.findUnique({
@@ -182,8 +182,8 @@ async function checkCompletedBuilds(): Promise<void> {
       continue;
     }
 
-    // P16D: Build completion requires ALL tasks to be COMPLETED.
-    const pendingTasks = tasks.filter((t) => t.status !== TaskStatus.COMPLETED);
+    // P16D: Build completion requires ALL tasks to have completed execution (canonical helper).
+    const pendingTasks = tasks.filter((t) => !isTaskCompleted(t));
     if (pendingTasks.length > 0) continue;
 
     // P16D: For GITHUB_BACKED projects, ALL tasks must also be INTEGRATED.
