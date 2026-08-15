@@ -3,6 +3,10 @@
 // In production, the platform MUST refuse to start in LOCAL_UNSANDBOXED mode.
 // This is enforced by architecture, not by UI warnings.
 //
+// Phase 18: The production readiness predicate now requires BOTH static
+// AND runtime verification. See src/lib/runtime-verification.ts for the
+// full predicate.
+//
 // Call enforceProductionMode() at startup (or in middleware) to verify.
 
 import { FORGE_EXECUTION_MODE } from "@/lib/execution-mode";
@@ -47,6 +51,10 @@ export function enforceProductionMode(): ProductionCheckResult {
  * ephemeral and file contents are not persisted, so content-based readiness
  * checks cannot verify the actual repository. A GitHub connection is required
  * for PRODUCTION_READY.
+ *
+ * Phase 18: This is the PRE-CONDITION check. The full PRODUCTION_READY
+ * predicate also requires runtime verification — see
+ * canReachProductionReadyWithRuntime() in runtime-verification.ts.
  */
 export function canReachProductionReady(projectMode?: "LOCAL_ONLY" | "GITHUB_BACKED"): boolean {
   // Execution mode must be sandboxed.
@@ -73,3 +81,15 @@ export function canReachProductionReady(projectMode?: "LOCAL_ONLY" | "GITHUB_BAC
 export function getLocalOnlyPolicyReason(): string {
   return "LOCAL_ONLY projects cannot reach PRODUCTION_READY — the worker's /tmp checkout is ephemeral and file contents are not persisted. Connect a GitHub repository to enable production readiness verification.";
 }
+
+/**
+ * Phase 18: The full PRODUCTION_READY predicate.
+ *
+ * Re-exports the canonical predicate from runtime-verification.ts so callers
+ * can import it from either location.
+ */
+export {
+  canReachProductionReadyWithRuntime,
+  getProductionReadinessFailureReason,
+  type ProductionReadinessEvidence,
+} from "@/lib/runtime-verification";

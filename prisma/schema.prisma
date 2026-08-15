@@ -84,6 +84,7 @@ model Project {
   readinessChecks   ReadinessCheck[]
   adrs              Adr[]
   buildJobs         BuildJob[]
+  runtimeEvidence   RuntimeEvidence[]
 }
 
 // ---------------------------------------------------------------------------
@@ -653,4 +654,64 @@ model ExecutionJob {
   @@index([status])
   @@index([leaseExpiresAt])
   @@index([workerId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18: Runtime Evidence — immutable record of runtime verification.
+//
+// Runtime verification executes the ACTUAL merged application at the exact
+// canonical GitHub SHA. It proves the product works, not just that the code
+// looks correct.
+//
+// PRODUCTION_READY requires BOTH:
+//   - staticReadinessPassed (Phase 17 repository snapshot + scanner)
+//   - runtimeVerificationPassed (Phase 18 execution evidence)
+//
+// This model is APPEND-ONLY — never UPDATE; only CREATE. Each verification
+// run produces a new RuntimeEvidence record tied to a specific immutable SHA.
+// ---------------------------------------------------------------------------
+
+model RuntimeEvidence {
+  id              String   @id @default(cuid())
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Exact revision verified — the application was executed at THIS SHA.
+  repositoryHeadSha   String
+  headVerified        Boolean  @default(false)
+
+  // Environment fingerprint — what environment executed the application.
+  environmentFingerprint String  // JSON: { nodeVersion, platform, arch, executionMode, workerVersion }
+
+  // Pipeline stage results (each is JSON with success, durationMs, exitCode, output)
+  dependencyInstallResult String  // JSON: install command results
+  buildResult             String  // JSON: build command results
+  startupResult           String  // JSON: { success, port, pid, startupDurationMs }
+  healthChecks            String  @default("[]") // JSON array of health check results
+  apiJourneys             String  @default("[]") // JSON array of API journey results
+  integrationChecks       String  @default("[]") // JSON array of integration check results
+  backgroundJobChecks     String  @default("[]") // JSON array of background job results
+  browserJourneys         String  @default("[]") // JSON array of browser journey results
+  teardownResult          String  // JSON: { success, durationMs }
+
+  // Overall verdict
+  passed          Boolean  @default(false)
+  failureReason   String?
+
+  // Truncated logs (for debugging — full logs may be stored externally)
+  logs            String?
+
+  // Execution identity (like TaskEvidence)
+  executionId     String?  // ExecutionJob that ran this verification
+  workerId        String?
+
+  // Timing
+  startedAt       DateTime
+  completedAt     DateTime?
+
+  createdAt       DateTime @default(now())
+
+  @@index([projectId])
+  @@index([repositoryHeadSha])
+  @@index([passed])
 }

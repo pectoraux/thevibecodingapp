@@ -30,6 +30,11 @@ import {
   type ScannedFile,
   type ScanSummary,
 } from "@/lib/repository-scanner";
+import {
+  canReachProductionReadyWithRuntime,
+  getProductionReadinessFailureReason,
+  type ProductionReadinessEvidence,
+} from "@/lib/runtime-verification";
 
 // ---------------------------------------------------------------------------
 // Preflight
@@ -501,6 +506,47 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
         passed: offenders.length === 0,
         evidence: { offenders: offenders.map((t) => t.code) },
         failureReason: offenders.length > 0 ? `${offenders.length} task(s) failed or pending review` : undefined,
+      };
+    },
+  },
+  // ======================================================================
+  // PHASE 18: Runtime verification gate
+  // ======================================================================
+  {
+    category: ReadinessCategory.RUNTIME,
+    name: "Runtime verification passed at exact canonical SHA",
+    description: "The actual merged application was started and verified at the exact canonical GitHub SHA. Static inspection alone is not sufficient — the product must actually work.",
+    required: true,
+    check: async (projectId, repo) => {
+      if (!repo.head) {
+        return { passed: false, evidence: { reason: "No repository HEAD SHA" }, failureReason: "No repository HEAD SHA to verify against" };
+      }
+
+      // Query for RuntimeEvidence at the exact canonical SHA.
+      const runtimeEvidence = await db.runtimeEvidence.findFirst({
+        where: {
+          projectId,
+          repositoryHeadSha: repo.head,
+          passed: true,
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      return {
+        passed: !!runtimeEvidence,
+        evidence: {
+          repositoryHeadSha: repo.head,
+          runtimeEvidenceId: runtimeEvidence?.id ?? null,
+          runtimeEvidencePassed: runtimeEvidence?.passed ?? false,
+          runtimeEvidenceDate: runtimeEvidence?.createdAt?.toISOString() ?? null,
+          // Phase 18: This is the RUNTIME gate — distinct from static readiness.
+          // Static readiness (Phase 17) proves the code looks correct.
+          // Runtime verification (Phase 18) proves the application works.
+          verificationType: "RUNTIME_EXECUTION",
+        },
+        failureReason: !runtimeEvidence
+          ? `RUNTIME_VERIFICATION_REQUIRED: No passed runtime evidence at SHA ${repo.head.slice(0, 7)}. The application must be executed and verified at the exact canonical revision.`
+          : undefined,
       };
     },
   },
