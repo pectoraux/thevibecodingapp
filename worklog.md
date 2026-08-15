@@ -1134,3 +1134,30 @@ Remaining honest limitations:
   3. executionMode is local (Vercel is serverless, can't host persistent worker)
   4. No E2E/browser testing yet
   5. No runtime verification (app startup/health checks) yet
+
+---
+Task ID: 16D-RECONCILE
+Agent: orchestrator (main, Z.ai Code)
+Task: Force canonical repository to match the reported Phase 16D architecture — remove old scheduler integration predicates, make repo.ts read-only, kill virtual-repo writes, add invariant tests, push.
+
+Work Log:
+- Read worklog.md and verified the user's factual claims against the REAL on-disk source (not the summary).
+- VERIFIED CLAIM 1 (scheduler): FALSE as stated. scheduler.ts:22 ALREADY imports isTaskIntegrated/areAllTasksReady from @/lib/integration-state and uses them (line 109 deps, line 197 build completion). Grep for `integrationState === "INTEGRATED"` across all of src/ returned only 3 hits: merge route (legitimate short-circuit) + 2 inside the helper module itself. Zero inline integration predicates in the scheduler. The user's quoted snippet (`dep?.status === COMPLETED && dep?.integrationState === "INTEGRATED"`) is NOT in the current file — stale.
+- VERIFIED CLAIM 2 (repo.ts): TRUE. repo.ts was a writable DB-backed virtual repo (ensureBranch, writeFileToRepo, createCommit, createPullRequest, mergePullRequest, initRepository) and initRepository was called by active routes (projects POST, github/connect POST).
+- Audited all Repo*/PullRequest writes via grep: ALL writes (repoBranch.create, repoFile.update/create/deleteMany, repoCommit.create, repoBranch.update, pullRequest.create/update) were confined EXCLUSIVELY to src/lib/repo.ts. The merge route (tasks/[taskId]/merge) uses the real GitHub API + updates Task.integrationState/Project.canonicalHeadSha — does NOT touch virtual repo models.
+- Rewrote src/lib/repo.ts as a STRICTLY READ-ONLY metadata adapter. Removed all mutation functions + scanSuspiciousPatterns + WriteFileInput/CommitInput interfaces. Kept only: listFiles, getFile, listCommits, listPullRequests. Documented the read-only canonical-source invariant in the module header.
+- Removed initRepository call sites from src/app/api/projects/route.ts (POST) and src/app/api/projects/[id]/github/connect/route.ts (POST). Both were non-fatal try/catch, so removal cannot regress the happy path — only removes the simulated-repo seeding side-effect.
+- Polished src/lib/scheduler.ts: routed execution-status checks (task.status === COMPLETED) through the canonical isTaskCompleted() helper so the scheduler uses helpers for BOTH completion and integration decisions. Zero inline predicates remain.
+- Added tests/repository-source-invariants.ts (10 mechanical checks): scheduler imports helpers + zero inline integration/integration-blocking predicates; repo.ts exports no mutations + only reads; no active code imports mutation functions from @/lib/repo; no active code writes to Repo*/PullRequest models; real Git worker is sole repository executor.
+- Ran full test suite: architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7, repository-source 10/10 — 106 passed, 0 failed.
+- Lint: 1 pre-existing error in src/lib/evidence.ts:303 (require() import) — NOT touched by this reconciliation, out of scope. 12 pre-existing unused-disable warnings.
+- Agent Browser: dev server started cleanly (Ready in 1091ms, GET / 200, 0 compile/runtime errors). / route renders the Forge auth screen fully (H1, tabs, login form, demo buttons, semantic footer). Demo Admin login returned 401 from /api/auth/callback/credentials — PRE-EXISTING auth issue (demo account seeding), unrelated to reconciliation; all other auth endpoints returned 200 (DB healthy).
+- Committed as f2c9359. Pushed to origin main (73c4199..f2c9359). Verified local HEAD == origin/main == f2c9359952d61337a6adbc22769511316b6f1f87.
+- Deployed (Vercel) SHA: CANNOT be verified from this sandbox — no Vercel API token, no production URL in vercel.json/.env (NEXTAUTH_URL unset). Vercel GitHub auto-deploy (github.silent:true) will redeploy f2c9359 on push; user must confirm via their deployed /api/version endpoint.
+
+Stage Summary:
+- CANONICAL: GitHub main = f2c9359, Local = f2c9359 (MATCH). Deployed = unverified from sandbox.
+- SCHEDULER: integration helper imported (isTaskIntegrated, areAllTasksReady, isTaskCompleted); inline integration predicates = 0; dependency readiness via isTaskIntegrated(dep, mode); build readiness via areAllTasksReady(tasks, mode).
+- REPOSITORY: real Git canonical (worker git/repository.ts is sole executor); virtual repo writes = 0 (repo.ts read-only); RepoBranch/RepoCommit/RepoFile/PullRequest are read-only metadata — no active code writes to them.
+- TESTS: 106 passed, 0 failed on clean tree.
+- Key honesty note: the user's scheduler claim was stale — the scheduler was ALREADY reconciled before this task. The real work was repo.ts write removal + invariant tests. Reported this with evidence rather than pretending to "fix" an already-fixed scheduler.
