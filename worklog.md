@@ -1624,3 +1624,74 @@ Stage Summary:
 - DEPENDENCY: tar version = 7.5.22, patched = YES (>= 7.5.3, CVE-2026-23745 safe). Verified mechanically via test, not assumed.
 - TESTS: 216 passed, 0 failed from clean clone.
 - The repository snapshot layer is FROZEN. Ready for runtime verification as the next milestone.
+
+---
+Task ID: 18
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 18 — Runtime verification architecture. PRODUCTION_READY now requires BOTH static AND runtime verification evidence.
+
+Work Log:
+- Synced local worklog commit (83d1abf) to remote before starting Phase 18.
+- Designed the runtime verification architecture:
+  * Static readiness (Phase 17): "The code looks correct."
+  * Runtime verification (Phase 18): "The application actually works."
+  * Neither alone is sufficient for PRODUCTION_READY.
+- Added RuntimeEvidence Prisma model:
+  * Immutable, append-only record tied to exact repositoryHeadSha.
+  * Fields for every pipeline stage: dependencyInstallResult, buildResult, startupResult, healthChecks[], apiJourneys[], integrationChecks[], backgroundJobChecks[], browserJourneys[], teardownResult.
+  * Plus: environmentFingerprint, passed, failureReason, logs, executionId, workerId, startedAt, completedAt.
+  * Indexed on projectId, repositoryHeadSha, passed.
+  * db:push failed (no DIRECT_URL in sandbox) but db:generate succeeded — Prisma Client includes RuntimeEvidence.
+- Created src/lib/runtime-verification.ts:
+  * RuntimeVerificationPlan interface: what to execute (install/build/start/health/API/integration/teardown).
+  * RuntimeVerificationResult interface: the evidence record with all stage results.
+  * ProductionReadinessEvidence interface: the full predicate input (8 conditions).
+  * canReachProductionReadyWithRuntime(): canonical predicate requiring ALL 8 conditions.
+  * getProductionReadinessFailureReason(): lists all failing conditions.
+  * deriveRuntimeVerificationPlan(): builds a plan from project + architecture (extracts API journeys, integrations, deployment model).
+  * evaluateRuntimeVerificationResult(): fail-closed evaluation (doesn't trust worker self-assessment — independently checks each stage result).
+- Updated src/lib/production-enforcement.ts:
+  * Re-exports Phase 18 predicate + types from runtime-verification.ts.
+  * Documents that canReachProductionReady() is the PRE-CONDITION; the full predicate also requires runtime.
+- Updated src/lib/readiness.ts:
+  * New readiness check: "Runtime verification passed at exact canonical SHA".
+  * Queries db.runtimeEvidence.findFirst by exact repositoryHeadSha + passed=true.
+  * Fails with RUNTIME_VERIFICATION_REQUIRED when no passed evidence exists at the SHA.
+  * Evidence records verificationType: RUNTIME_EXECUTION.
+- Created POST /api/worker/submit-runtime-evidence endpoint:
+  * Authenticated (worker token + execution token + lease verification).
+  * Derives identity from token (not body) — same security model as submit-evidence.
+  * Evaluates result fail-closed via evaluateRuntimeVerificationResult().
+  * Creates NEW RuntimeEvidence record (append-only, never update).
+  * Emits build event (PRODUCTION_READY or HUMAN_REVIEW_REQUIRED).
+- Added tests/runtime-verification-invariants.ts (40 checks):
+  * Prisma model has all required fields + append-only.
+  * Module exports correct types and functions.
+  * Predicate requires ALL 8 conditions (each tested individually).
+  * getProductionReadinessFailureReason lists all failing conditions.
+  * evaluateRuntimeVerificationResult passes/fails correctly per stage (install, startup, health).
+  * deriveRuntimeVerificationPlan handles nulls + extracts architecture details.
+  * Readiness gate has runtime verification check + queries by exact SHA.
+  * API endpoint is authenticated, verifies lease, evaluates fail-closed, creates append-only evidence.
+  * production-enforcement re-exports Phase 18 predicate.
+- CLEAN-CLONE VERIFICATION:
+  * Cloned GitHub main to /tmp/forge-clean-clone.
+  * Clean clone HEAD = 5314b48 (matches local + remote).
+  * Verified Phase 18 code present: runtime-verification.ts (YES), RuntimeEvidence model (1), submit-runtime-evidence route (YES), runtime check in readiness (1), canReachProductionReadyWithRuntime (1).
+  * Ran full test suite from clean clone: runtime-verification 40/40, scanner 99/99, readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 256 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as 5314b48. Pushed to origin main (83d1abf..5314b48).
+- SHA VERIFICATION (triple): local HEAD == origin/main == clean clone HEAD == 5314b4867c8cb7465df60d0275a92122a6b96b30. ALL THREE MATCH.
+
+Stage Summary:
+- CANONICAL: GitHub main = 5314b48, Local = 5314b48, Clean clone = 5314b48 (ALL MATCH).
+- PHASE 18 ARCHITECTURE:
+  * RuntimeEvidence Prisma model (immutable, append-only, SHA-bound).
+  * runtime-verification.ts module (plan, result, predicate, evaluation).
+  * Readiness gate check querying RuntimeEvidence by exact SHA.
+  * Authenticated API endpoint for evidence submission.
+  * Production predicate requiring BOTH static AND runtime.
+- PRODUCTION_READY PREDICATE: architectureFrozen AND allTasksCompleted AND allTasksIntegrated AND staticReadinessPassed AND runtimeVerificationPassed AND runtimeEvidencePersisted AND executionEnvironmentSandboxed AND repositoryHeadVerified.
+- TESTS: 256 passed, 0 failed from clean clone.
+- NEXT: Implement the actual worker runtime verification execution (executeRuntimeVerification in poller.ts) — the pipeline that clones at exact SHA, installs, builds, starts, verifies, tears down.
