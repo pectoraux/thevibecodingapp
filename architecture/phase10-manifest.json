@@ -1,5 +1,5 @@
 {
-  "architectureVersion": "phase11a",
+  "architectureVersion": "phase12",
   "description": "Phase 11A — Modular worker with real repository continuity, safe git, BYOK provider adapters, no silent fallbacks",
   "requiredFiles": [
     "mini-services/execution-worker/poller.ts",
@@ -18,8 +18,8 @@
     "tests/phase10-invariants.ts"
   ],
   "requiredInvariants": {
-    "workerVersion": "phase11a",
-    "versionEndpoint": "phase11a",
+    "workerVersion": "phase12",
+    "versionEndpoint": "phase12",
     "realGit": true,
     "realCommit": true,
     "baseCommitPropagation": true,
@@ -44,6 +44,7 @@
     "versionPhase5": "Version endpoint must not report phase5",
     "versionPhase8": "Version endpoint must not report phase8",
     "versionPhase10": "Version endpoint must not report phase10",
+    "versionPhase11a": "Version endpoint must not report phase11a",
     "silentBaseCommitFallback": "Worker must not silently fall back when baseCommitSha is unavailable",
     "npmFallbackForVerificationPlan": "Worker must not silently fall back to npm when VerificationPlan is missing",
     "shellInterpolatedGit": "Git commands must use argument arrays, not shell-interpolated strings"

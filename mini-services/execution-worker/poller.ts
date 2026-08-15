@@ -14,13 +14,13 @@ import { join, dirname, resolve } from "node:path";
 
 import { gitInit, gitClone, gitFetch, gitCheckoutBranch, gitCheckout, gitRevParse, gitAddAndCommit, gitDiff, gitDiffStat, gitPush, gitExec } from "./git/repository.js";
 import { callLLM } from "./llm/gateway.js";
-import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer } from "./verification/index.js";
+import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runSemanticGuardian } from "./verification/index.js";
 
 // --- Configuration ---
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase11a";
+const WORKER_VERSION = "phase12";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
@@ -162,26 +162,37 @@ async function executeTask(spec: any): Promise<{
   if (spec.repository?.githubRepo) {
     sandboxPath = join(EXEC_ROOT, spec.projectId, spec.executionId);
 
-    // P11B: Authenticated clone — resolve GitHub credential from control plane.
+    // P12: Authenticated clone — resolve GitHub credential from control plane.
+    // NO anonymous fallback — BLOCKED if credential resolution fails.
     try {
       const credResult = await apiCall("/api/worker/resolve-github-credential", "POST", {
         projectId: spec.projectId,
       }, executionToken);
       githubToken = credResult.token;
-    } catch {
-      console.log(`[worker] Could not resolve GitHub credential — attempting anonymous clone`);
+    } catch (err: any) {
+      // P12: No anonymous fallback for GitHub-backed projects.
+      return blocked(
+        "GitHub credential unavailable — cannot clone repository",
+        `Credential resolution failed: ${err.message}`
+      );
+    }
+
+    if (!githubToken) {
+      // P12: No token = BLOCKED, not anonymous.
+      return blocked(
+        "GitHub credential unavailable — cannot clone repository",
+        "No token returned from resolve-github-credential"
+      );
     }
 
     // Build authenticated clone URL (token is never stored in .git/config permanently).
     const repoSlug = spec.repository.githubRepo;
-    const cloneUrl = githubToken
-      ? `https://x-access-token:${githubToken}@github.com/${repoSlug}.git`
-      : `https://github.com/${repoSlug}.git`;
-    console.log(`[worker] Cloning: ${repoSlug} (authenticated: ${!!githubToken})`);
+    const cloneUrl = `https://x-access-token:${githubToken}@github.com/${repoSlug}.git`;
+    console.log(`[worker] Cloning: ${repoSlug} (authenticated)`);
     repoCloned = gitClone(cloneUrl, sandboxPath);
 
     // After clone, remove the credential from .git/config for security.
-    if (repoCloned && githubToken) {
+    if (repoCloned) {
       gitExec(sandboxPath, ["remote", "set-url", "origin", `https://github.com/${repoSlug}.git`]);
     }
 
@@ -325,10 +336,28 @@ Generate the implementation files. Respond with ONLY JSON:
     console.log(`[worker] Push: ${pushedToRemote ? "success" : "failed"}`);
   }
 
-  // --- Independent Guardian ---
-  const guardianResult = runDeterministicGuardian(
+  // --- P12: Deterministic Guardian (Layer 1) ---
+  const deterministicGuardianResult = runDeterministicGuardian(
     spec.architecture, filesChanged, diff + "\n\n--- DIFF STAT ---\n" + diffStat
   );
+
+  // --- P12: Semantic Architecture Guardian (Layer 2) ---
+  // Separate LLM invocation — asks "does this remain faithful to the frozen architecture?"
+  const semanticGuardianResult = await runSemanticGuardian(
+    spec, filesChanged, diff, deterministicGuardianResult, apiCall, executionToken
+  );
+
+  // Combine guardian results: VIOLATION from either layer = VIOLATION.
+  const guardianResult = {
+    deterministic: deterministicGuardianResult,
+    semantic: semanticGuardianResult,
+    verdict: deterministicGuardianResult.verdict === "VIOLATION" || semanticGuardianResult.verdict === "VIOLATION"
+      ? "VIOLATION"
+      : deterministicGuardianResult.verdict === "WARNING" || semanticGuardianResult.verdict === "WARNING"
+      ? "WARNING"
+      : "PASS",
+    summary: `Deterministic: ${deterministicGuardianResult.summary} | Semantic: ${semanticGuardianResult.summary}`,
+  };
 
   // --- Independent Reviewer ---
   const reviewResult = await runLlmReviewer(spec, filesChanged, testResults, guardianResult, apiCall, executionToken);
@@ -342,7 +371,7 @@ Generate the implementation files. Respond with ONLY JSON:
     guardianResult,
     reviewResult,
     filesChanged: filesChanged.map((f) => f.path),
-    implementationLog: `Executed in sandbox. Branch: ${branchName}. Commit: ${commitSha?.slice(0, 7) || "none"}. Pushed: ${pushedToRemote}.`,
+    implementationLog: `Executed in sandbox. Branch: ${branchName}. Commit: ${commitSha?.slice(0, 7) || "none"}. Pushed: ${pushedToRemote}. Deterministic: ${deterministicGuardianResult.verdict}. Semantic: ${semanticGuardianResult.verdict}.`,
   };
 }
 

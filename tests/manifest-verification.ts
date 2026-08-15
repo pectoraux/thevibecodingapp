@@ -253,6 +253,13 @@ for (const [pattern, description] of Object.entries(manifest.forbiddenPatterns))
       passed: !hasPhase10,
       details: hasPhase10 ? "Version endpoint says phase10" : "Clean",
     });
+  } else if (pattern === "versionPhase11a") {
+    const hasPhase11a = versionRoute.includes('"phase11a"');
+    results.push({
+      name: `Forbidden: ${pattern}`,
+      passed: !hasPhase11a,
+      details: hasPhase11a ? "Version endpoint says phase11a" : "Clean",
+    });
   } else if (pattern === "silentBaseCommitFallback") {
     const hasFallback = poller.includes("starting fresh");
     results.push({

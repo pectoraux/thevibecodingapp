@@ -7,15 +7,29 @@ import { callLLM } from "../llm/gateway.js";
 export function getVerificationCommands(verificationPlan: any): {
   install: string[]; test: string[]; build: string[]; lint: string[];
 } | null {
+  // P12: Strict VerificationPlan — no npm fallback for missing fields.
   if (verificationPlan && typeof verificationPlan === "object" && Object.keys(verificationPlan).length > 0) {
+    const install = verificationPlan.install || verificationPlan.install;
+    const test = verificationPlan.unit || verificationPlan.test;
+    const build = verificationPlan.build;
+    const lint = verificationPlan.lint || verificationPlan.static;
+
+    // P12: All required fields must be present. No defaults.
+    if (!install || !Array.isArray(install) || install.length === 0) {
+      return null; // BLOCKED — incomplete plan
+    }
+    if (!test || !Array.isArray(test) || test.length === 0) {
+      return null; // BLOCKED — incomplete plan
+    }
+
     return {
-      install: verificationPlan.install || ["npm install"],
-      test: verificationPlan.unit || verificationPlan.test || ["npm test"],
-      build: verificationPlan.build || ["npm run build"],
-      lint: verificationPlan.lint || verificationPlan.static || [],
+      install,
+      test,
+      build: build || [], // build is optional
+      lint: lint || [], // lint is optional
     };
   }
-  // P11: No silent npm fallback — return null to signal BLOCKED.
+  // P12: No plan at all — BLOCKED.
   return null;
 }
 
@@ -156,5 +170,104 @@ Respond with JSON:
     verdict: "CHANGES_REQUESTED",
     findings: [],
     summary: "Could not parse reviewer output",
+  };
+}
+
+// --- Semantic Architecture Guardian (P12) ---
+//
+// Separate LLM invocation that asks: "Does this implementation remain
+// faithful to the frozen architecture?"
+//
+// This is NOT the Reviewer. The Reviewer asks "Is this code good?"
+// The Guardian asks "Does this still mean what our architecture says?"
+
+export async function runSemanticGuardian(
+  spec: any,
+  changedFiles: { path: string; content: string }[],
+  diff: string,
+  deterministicGuardianResult: any,
+  apiCall: (path: string, method: string, body?: any, token?: string) => Promise<any>,
+  executionToken: string | null
+): Promise<{
+  verdict: string;
+  findings: any[];
+  summary: string;
+}> {
+  const filesSummary = changedFiles.map((f) => `--- ${f.path} ---\n${(f.content || "").slice(0, 2000)}`).join("\n\n");
+  const archSummary = spec.architecture ? JSON.stringify({
+    version: spec.architecture.version,
+    hash: spec.architecture.hash,
+    components: (spec.architecture.components || []).map((c: any) => ({ name: c.name, type: c.type, tech: c.tech })),
+    invariants: spec.architecture.invariants,
+    constraints: spec.architecture.constraints,
+  }) : "No architecture contract";
+
+  const prompt = `You are the Architecture Guardian. Your ONLY question is:
+Does this implementation remain faithful to the frozen architecture?
+
+You are NOT a code reviewer. You do not care about code quality.
+You care ONLY about architectural fidelity.
+
+FROZEN ARCHITECTURE:
+${archSummary}
+
+TASK: ${spec.task.title} (${spec.task.code})
+DESCRIPTION: ${spec.task.description}
+
+CHANGED FILES:
+${filesSummary}
+
+GIT DIFF:
+${diff.slice(0, 10000)}
+
+DETERMINISTIC GUARDIAN FINDINGS:
+${JSON.stringify(deterministicGuardianResult)}
+
+Evaluate:
+- Are the declared technologies still being used?
+- Are service boundaries maintained?
+- Are API contracts respected?
+- Are data models consistent with the architecture?
+- Are there unauthorized architecture changes?
+- Does the implementation introduce hidden coupling?
+- Does the implementation deviate from the architectural intent?
+
+Respond with JSON:
+{
+  "verdict": "PASS" | "WARNING" | "VIOLATION" | "ARCHITECTURE_CHANGE_REQUIRED",
+  "findings": [{ "category": "technology|boundary|api|data_model|coupling|intent", "severity": "low|medium|high|critical", "evidence": "...", "recommendation": "..." }],
+  "summary": "..."
+}
+`;
+
+  const result = await callLLM(spec, [
+    { role: "system", content: "You are the Architecture Guardian. You evaluate architectural fidelity, not code quality. Be strict." },
+    { role: "user", content: prompt },
+  ], apiCall, executionToken);
+
+  if (!result.success || !result.content) {
+    return {
+      verdict: "WARNING",
+      findings: [],
+      summary: "Semantic Guardian LLM unavailable — defaulting to WARNING for safety",
+    };
+  }
+
+  try {
+    const jsonMatch = result.content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        verdict: parsed.verdict || "WARNING",
+        findings: parsed.findings || [],
+        summary: parsed.summary || "",
+      };
+    }
+  } catch {}
+
+  return {
+    verdict: "WARNING",
+    findings: [],
+    summary: "Could not parse semantic Guardian output",
   };
 }
