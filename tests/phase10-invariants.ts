@@ -17,18 +17,18 @@ function readFile(path: string): string {
   try { return readFileSync(path, "utf-8"); } catch { return ""; }
 }
 
-// Test 1: submit-evidence requires commitSha for completion
+// Test 1: submit-evidence requires commitSha for completion (P15: via canCompleteTask)
 function testCommitRequired() {
   const content = readFile("src/app/api/worker/submit-evidence/route.ts");
-  const hasHasRealCommit = content.includes("hasRealCommit");
-  const hasLengthCheck = content.includes("commitSha.length >= 7");
-  const hasCanCompleteWithCommit = content.includes("canComplete = hasRealCommit");
-  const hasFailureReasonWithCommit = content.includes("commit=") && content.includes("MISSING");
+  const policy = readFile("src/lib/completion-policy.ts");
+  const hasCanCompleteTask = content.includes("canCompleteTask");
+  const hasCommitCheck = policy.includes("commitSha") && policy.includes("length >= 7");
+  const hasFailureReason = policy.includes("commit=MISSING") || policy.includes("getFailureReason");
 
   results.push({
     name: "submit-evidence requires real commitSha for completion",
-    passed: hasHasRealCommit && hasLengthCheck && hasCanCompleteWithCommit && hasFailureReasonWithCommit,
-    details: `hasRealCommit: ${hasHasRealCommit}, length check: ${hasLengthCheck}, canComplete uses commit: ${hasCanCompleteWithCommit}, failure reason includes commit: ${hasFailureReasonWithCommit}`,
+    passed: hasCanCompleteTask && hasCommitCheck && hasFailureReason,
+    details: `canCompleteTask: ${hasCanCompleteTask}, commit check in policy: ${hasCommitCheck}, failure reason: ${hasFailureReason}`,
   });
 }
 

@@ -20,7 +20,7 @@ import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runS
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase14";
+const WORKER_VERSION = "phase15";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
@@ -425,30 +425,25 @@ async function workerLoop(): Promise<void> {
         try {
           const { spec } = await getJobSpec(job.executionId);
           const result = await executeTask(spec);
-          await submitEvidence({
+
+          // P15: The control plane's submit-evidence is the CANONICAL authority.
+          // It uses canCompleteTask() with remote verification.
+          // The worker uses the response from submit-evidence, not its own check.
+          const evidenceResponse = await submitEvidence({
             taskId: job.taskId, projectId: job.projectId,
             commitSha: result.commitSha,
+            pushedToRemote: result.pushedToRemote || false,
             testResults: result.testResults,
             guardianResult: result.guardianResult,
             reviewResult: result.reviewResult,
             filesChanged: result.filesChanged,
             implementationLog: result.implementationLog,
           });
-          // P14: One canonical completion predicate.
-          // For GITHUB_BACKED: push must succeed. For LOCAL_ONLY: push not required.
-          const blockVerdicts = ["VIOLATION", "UNVERIFIED", "ARCHITECTURE_CHANGE_REQUIRED"];
-          const isGithubBacked = !!spec?.repository?.githubRepo;
-          const guardianPassed = !blockVerdicts.includes(result.guardianResult.verdict);
-          const reviewApproved = result.reviewResult.verdict === "APPROVED";
-          const testsPassed = result.testResults.length > 0 && result.testResults.every((t) => t.passes);
-          const hasCommit = result.commitSha !== null;
 
-          // P14: For GitHub-backed projects, push success is mandatory.
-          const pushOk = isGithubBacked ? result.pushedToRemote : true;
-
-          const success = hasCommit && guardianPassed && reviewApproved && testsPassed && pushOk;
+          // P15: Use the control plane's canonical decision.
+          const success = evidenceResponse.success;
           await completeJob(success ? "SUCCEEDED" : "FAILED");
-          console.log(`[worker] ${job.executionId} → ${success ? "SUCCEEDED" : "FAILED"}`);
+          console.log(`[worker] ${job.executionId} → ${success ? "SUCCEEDED" : "FAILED"}${evidenceResponse.failureReason ? ` (${evidenceResponse.failureReason})` : ""}`);
         } catch (err: any) {
           console.error(`[worker] ${job.executionId} failed: ${err.message}`);
           await completeJob("FAILED");

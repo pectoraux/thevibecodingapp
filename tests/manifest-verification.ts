@@ -204,14 +204,15 @@ results.push({
   details: hasVerificationPlanExtraction ? "Extracts from architecture contract" : "Hardcoded",
 });
 
-// commitRequiredForCompletion
+// commitRequiredForCompletion — P15: now uses canCompleteTask from completion-policy
 const submitEvidence = readFile("src/app/api/worker/submit-evidence/route.ts");
-const hasHasRealCommit = submitEvidence.includes("hasRealCommit");
-const hasCanCompleteWithCommit = submitEvidence.includes("canComplete = hasRealCommit");
+const completionPolicy = readFile("src/lib/completion-policy.ts");
+const hasCanCompleteTask = submitEvidence.includes("canCompleteTask");
+const hasCommitCheck = completionPolicy.includes("commitSha") && completionPolicy.includes("length >= 7");
 results.push({
   name: "commitRequiredForCompletion = true",
-  passed: hasHasRealCommit && hasCanCompleteWithCommit,
-  details: `hasRealCommit: ${hasHasRealCommit}, canComplete requires it: ${hasCanCompleteWithCommit}`,
+  passed: hasCanCompleteTask && hasCommitCheck,
+  details: `canCompleteTask: ${hasCanCompleteTask}, commit check in policy: ${hasCommitCheck}`,
 });
 
 // successExpressionConsistent
