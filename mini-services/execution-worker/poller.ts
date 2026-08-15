@@ -20,7 +20,7 @@ import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runS
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase16c";
+const WORKER_VERSION = "phase16d";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
