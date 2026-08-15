@@ -269,6 +269,14 @@ model TaskEvidence {
   architectureHash    String
   commitSha           String?
 
+  // P15B: Git evidence — derived from trusted execution state, not worker body
+  executionId         String?                  // ExecutionJob that produced this evidence
+  workerId            String?                  // Worker that executed
+  branchName          String?                  // Expected branch (derived from task code + attempt)
+  baseCommitSha       String?                  // Expected base (derived from task graph)
+  pushedToRemote      Boolean  @default(false) // Worker pushed to remote
+  remoteCommitVerified Boolean @default(false) // Control plane independently verified
+
   // Real execution evidence (JSON-encoded arrays/objects)
   changedFiles        String   @default("[]")  // JSON array of file paths
   commandsExecuted    String   @default("[]")  // JSON array of {command, exitCode, durationMs}
@@ -287,6 +295,7 @@ model TaskEvidence {
 
   @@index([taskId])
   @@index([projectId])
+  @@index([executionId])
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 {
-  "architectureVersion": "phase15a",
+  "architectureVersion": "phase15b",
   "description": "Phase 11A — Modular worker with real repository continuity, safe git, BYOK provider adapters, no silent fallbacks",
   "requiredFiles": [
     "mini-services/execution-worker/poller.ts",
@@ -18,8 +18,8 @@
     "tests/phase10-invariants.ts"
   ],
   "requiredInvariants": {
-    "workerVersion": "phase15a",
-    "versionEndpoint": "phase15a",
+    "workerVersion": "phase15b",
+    "versionEndpoint": "phase15b",
     "realGit": true,
     "realCommit": true,
     "baseCommitPropagation": true,

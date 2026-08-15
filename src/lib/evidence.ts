@@ -110,6 +110,13 @@ export interface RecordEvidenceInput {
   guardianResults?: GuardianEvidencePayload | null;
   reviewResults?: ReviewEvidencePayload | null;
   integrationChecks?: IntegrationCheckResult[];
+  // P15B: Git evidence metadata
+  executionId?: string | null;
+  workerId?: string | null;
+  branchName?: string | null;
+  baseCommitSha?: string | null;
+  pushedToRemote?: boolean;
+  remoteCommitVerified?: boolean;
 }
 
 export interface EvidenceSummary {
@@ -234,6 +241,13 @@ export async function recordEvidence(
       architectureVersion: evidence.architectureVersion,
       architectureHash: evidence.architectureHash,
       commitSha: evidence.commitSha ?? null,
+      // P15B: Git evidence metadata
+      executionId: evidence.executionId ?? null,
+      workerId: evidence.workerId ?? null,
+      branchName: evidence.branchName ?? null,
+      baseCommitSha: evidence.baseCommitSha ?? null,
+      pushedToRemote: evidence.pushedToRemote ?? false,
+      remoteCommitVerified: evidence.remoteCommitVerified ?? false,
       changedFiles: encodeArray(evidence.changedFiles),
       commandsExecuted: encodeArray(evidence.commandsExecuted),
       testRuns: encodeArray(evidence.testRuns),
