@@ -73,37 +73,38 @@ export async function POST(req: Request) {
     // Do NOT trust body.branchName.
     const expectedBranch = `forge/${task.code.toLowerCase()}/attempt-${executionJob.attempt}`;
 
-    // P15C: Derive expected baseCommitSha from the task graph.
-    // For tasks with multiple dependencies, ALL must be completed.
-    // The base is the MOST RECENT commit across all completed dependencies.
-    // (In a sequential merge model, the project HEAD advances after each merge,
-    // so the latest dependency commit represents the canonical base.)
-    // If any dependency is NOT completed, the base is null → ancestry check
-    // is skipped, but the task should not have been claimed in the first place.
-    let expectedBaseCommitSha: string | null = null;
+    // P15D: Derive expected baseCommitSha from the canonical project HEAD.
+    // The canonical HEAD is updated after every successful task completion.
+    // This ensures ALL dependency changes are present in the base —
+    // not just the most recent dependency.
+    //
+    // For the FIRST task (no dependencies, no canonical HEAD yet):
+    //   base = null (fresh repository)
+    //
+    // For tasks WITH dependencies:
+    //   base = project.canonicalHeadSha (which includes all merged dependency commits)
+    //
+    // For tasks WITHOUT dependencies but after other tasks completed:
+    //   base = project.canonicalHeadSha (build on existing work)
+    let expectedBaseCommitSha: string | null = project.canonicalHeadSha;
+
+    // P15D: If the task has dependencies, verify they are ALL completed.
     const deps = JSON.parse(task.dependencies || "[]") as string[];
     if (deps.length > 0) {
-      const depTasks = await db.task.findMany({
+      const completedDeps = await db.task.count({
         where: {
           projectId,
           code: { in: deps },
           status: "COMPLETED",
-          commitSha: { not: null },
         },
-        orderBy: { completedAt: "desc" },
       });
 
-      // P15C: Verify ALL dependencies are completed.
-      if (depTasks.length === deps.length) {
-        // All deps complete — use the most recent commit as the base.
-        // In a sequential model, this is the project's current HEAD.
-        if (depTasks.length > 0 && depTasks[0].commitSha) {
-          expectedBaseCommitSha = depTasks[0].commitSha;
-        }
-      } else {
-        // Not all dependencies are completed — this is a scheduling error.
-        // The task should not have been claimed. Mark as BLOCKED.
-        const missing = deps.filter(d => !depTasks.some(dt => dt.code === d));
+      if (completedDeps !== deps.length) {
+        const depTasks = await db.task.findMany({
+          where: { projectId, code: { in: deps } },
+          select: { code: true, status: true },
+        });
+        const missing = depTasks.filter(t => t.status !== "COMPLETED").map(t => t.code);
         return NextResponse.json({
           error: `BLOCKED: Dependencies not completed: ${missing.join(", ")}`,
         }, { status: 403 });
@@ -176,6 +177,30 @@ export async function POST(req: Request) {
     const canComplete = canCompleteTask(evidence, mode);
     const failureReason = canComplete ? null : getFailureReason(evidence, mode);
 
+    // P15D: Lease compare-and-set — atomic completion transition.
+    // Only complete the task if the execution job still has the same lease.
+    // This prevents a stale worker from completing after the job has been re-leased.
+    if (canComplete) {
+      const leaseUpdate = await db.executionJob.updateMany({
+        where: {
+          id: executionJob.id,
+          workerId: token.workerId,
+          leaseId: token.leaseId,
+        },
+        data: { status: "SUCCEEDED", completedAt: new Date() },
+      });
+
+      if (leaseUpdate.count === 0) {
+        // Lease was reclaimed by another worker — cannot complete.
+        return NextResponse.json({
+          ok: true,
+          success: false,
+          taskStatus: "FAILED",
+          failureReason: "LEASE_RECLAIMED — another worker now owns this execution",
+        });
+      }
+    }
+
     await db.task.update({
       where: { id: taskId! },
       data: {
@@ -192,6 +217,16 @@ export async function POST(req: Request) {
         failureReason,
       },
     });
+
+    // P15D: Update canonical project HEAD on completion.
+    // This ensures dependent tasks branch from a base that includes ALL
+    // completed dependency changes.
+    if (canComplete && commitSha) {
+      await db.project.update({
+        where: { id: projectId },
+        data: { canonicalHeadSha: commitSha },
+      });
+    }
 
     await ensureBuildEvent({
       projectId,

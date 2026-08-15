@@ -61,6 +61,12 @@ model Project {
   githubConnected   Boolean  @default(false)
   githubDefaultBranch String  @default("main")
 
+  // P15D: Canonical project HEAD — tracks the latest merged commit.
+  // Every completed task's commit is merged into the canonical HEAD.
+  // Dependent tasks branch from this HEAD, ensuring all dependency
+  // changes are present in their base.
+  canonicalHeadSha  String?
+
   // Architecture
   architecture      Architecture?
   changeRequests    ArchitectureChangeRequest[]

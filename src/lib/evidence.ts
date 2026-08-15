@@ -294,15 +294,13 @@ export async function getProjectEvidence(projectId: string): Promise<TaskEvidenc
 }
 
 // ---------------------------------------------------------------------------
-// P15C: hasSufficientEvidence now DELEGATES to canCompleteTask().
-// There is ONE completion authority: canCompleteTask() in completion-policy.ts.
-// This function exists for backward compatibility with callers that don't have
-// project mode context. The submit-evidence endpoint calls canCompleteTask()
-// directly with the correct mode (GITHUB_BACKED or LOCAL_ONLY).
+// P15D: hasSufficientEvidence now takes an optional mode parameter.
+// If mode is provided, it uses the ACTUAL project mode (GITHUB_BACKED or LOCAL_ONLY).
+// If mode is not provided, it defaults to LOCAL_ONLY for backward compatibility.
+// The submit-evidence endpoint always passes the correct mode.
 // ---------------------------------------------------------------------------
 
-export function hasSufficientEvidence(evidence: TaskEvidence): boolean {
-  // P15C: Delegate to the canonical canCompleteTask().
+export function hasSufficientEvidence(evidence: TaskEvidence, mode?: "LOCAL_ONLY" | "GITHUB_BACKED"): boolean {
   const { canCompleteTask } = require("@/lib/completion-policy") as typeof import("@/lib/completion-policy");
 
   const tests = decodeArray<TestRunResult>(evidence.testRuns);
@@ -314,6 +312,9 @@ export function hasSufficientEvidence(evidence: TaskEvidence): boolean {
   const review = decodeObject<ReviewEvidencePayload>(evidence.reviewResults);
   const reviewVerdict = review?.verdict || "REJECTED";
 
+  // P15D: Use the provided mode, or default to LOCAL_ONLY.
+  const projectMode = mode || "LOCAL_ONLY";
+
   return canCompleteTask({
     commitSha: evidence.commitSha,
     pushedToRemote: evidence.pushedToRemote,
@@ -323,7 +324,7 @@ export function hasSufficientEvidence(evidence: TaskEvidence): boolean {
     reviewVerdict,
     testsPassed,
     evidencePersisted: true,
-  }, "LOCAL_ONLY");
+  }, projectMode);
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +332,7 @@ export function hasSufficientEvidence(evidence: TaskEvidence): boolean {
 // Used by the dashboard and the orchestrator's completion gate.
 // ---------------------------------------------------------------------------
 
-export function summarizeEvidence(evidence: TaskEvidence[]): EvidenceSummary {
+export function summarizeEvidence(evidence: TaskEvidence[], mode?: "LOCAL_ONLY" | "GITHUB_BACKED"): EvidenceSummary {
   const totalAttempts = evidence.length;
   if (totalAttempts === 0) {
     return {
@@ -380,7 +381,7 @@ export function summarizeEvidence(evidence: TaskEvidence[]): EvidenceSummary {
   // canComplete is true ONLY if the LATEST attempt has sufficient evidence.
   // (We don't want a stale-good evidence from attempt 1 to mask a broken
   // attempt 2 that introduced a Guardian violation.)
-  const canComplete = hasSufficientEvidence(latest);
+  const canComplete = hasSufficientEvidence(latest, mode);
 
   // Sum totals across all attempts (informational).
   const totalChecks = evidence.reduce((sum, e) => sum + (e.totalChecks || 0), 0);
