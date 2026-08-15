@@ -1161,3 +1161,47 @@ Stage Summary:
 - REPOSITORY: real Git canonical (worker git/repository.ts is sole executor); virtual repo writes = 0 (repo.ts read-only); RepoBranch/RepoCommit/RepoFile/PullRequest are read-only metadata — no active code writes to them.
 - TESTS: 106 passed, 0 failed on clean tree.
 - Key honesty note: the user's scheduler claim was stale — the scheduler was ALREADY reconciled before this task. The real work was repo.ts write removal + invariant tests. Reported this with evidence rather than pretending to "fix" an already-fixed scheduler.
+
+---
+Task ID: 17
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17 — Remove repository shadow from readiness and repository truth. Migrate readiness gate and repository UI from legacy DB Repo* models to a canonical repository read adapter that reads real Git/GitHub.
+
+Work Log:
+- Read worklog.md (16D-RECONCILE entry) and verified the user's accepted the reconciliation.
+- Investigated the real execution-mode architecture before designing:
+  * execution-mode.ts: "local" vs "sandbox" (subprocess vs isolated worker) — NOT GitHub-vs-local.
+  * poller.ts: for GITHUB_BACKED, clones from GitHub, pushes candidate branch. For LOCAL_ONLY, does gitInit in /tmp/forge-exec/{projectId}/{executionId}, commits locally, then DELETES the repo (rmSync) after execution. The commit is never pushed anywhere.
+  * CRITICAL FINDING: there is NO persistent local Git repository for LOCAL_ONLY. The worker's /tmp checkout is ephemeral. The only persistent record is TaskEvidence (file paths, not contents — worker submits filesChanged: paths only).
+  * CRITICAL FINDING: the readiness gate was ALREADY broken for real worker output — it read RepoFile which was only ever populated by initRepository (README/.gitignore seed), never by the worker. File-based checks could never have passed against real generated code.
+- Designed repository-reader.ts with two backends:
+  * GITHUB_BACKED → reads real GitHub repository via REST API (tree for paths, contents for content, commits for history, pulls for PRs). Uses canonicalHeadSha (maintained by merge route).
+  * LOCAL_ONLY → derives best-available view from TaskEvidence (file paths from changedFiles; content=null). Honestly labeled as evidence-derived, not repository-truth.
+- Created src/lib/repository-reader.ts:
+  * getRepositorySnapshot(project, withContent) — fetches tree (1 call), optionally fetches contents for source files (capped at 50), commits, PRs.
+  * getFileContent(project, path) — single file content fetch.
+  * scanSuspiciousPatterns(content) — moved here from repo.ts (pure utility).
+  * View types match the frontend API contract (RepoBranchView, RepoFileView, RepoCommitView, RepoPullRequestView).
+  * Handles GITHUB_PAT missing, GitHub API errors, 404s gracefully (returns unreadable snapshot).
+- Rewrote src/lib/readiness.ts:
+  * Zero db.repoFile/db.repoCommit/db.repoBranch/db.pullRequest reads.
+  * Fetches canonical snapshot ONCE (with content) in runReadinessGate, shares across all checks.
+  * Separated getProjectDbData (tasks/creds/architecture — cheap DB queries) from repo snapshot (expensive GitHub API calls) to avoid redundant API calls per check.
+  * Content-based checks (suspicious patterns, error handling, secrets) operate on real GitHub file contents for GITHUB_BACKED.
+  * For LOCAL_ONLY: content-based checks honestly report "Cannot scan file contents — connect GitHub for production readiness verification". This is architecturally correct — LOCAL_ONLY code evaporates when the worker cleans up /tmp.
+- Rewrote src/app/api/projects/[id]/repository/route.ts → uses getRepositorySnapshot (no content, for UI list).
+- Rewrote src/app/api/projects/[id]/repository/files/route.ts → uses getFileContent (for file detail).
+- Updated prisma/schema.prisma: Repo* model comments changed from "Virtual Repository (DB-backed GitHub simulation)" to "Legacy repository metadata/cache. NOT canonical repository state." Project model comment updated from "simulated, DB-backed virtual repo" to "real GitHub repository — canonical source of code".
+- Added tests/readiness-source-invariants.ts (11 checks): readiness imports reader + zero db.repo* reads; repository routes use reader + zero db.repo* reads; reader writes zero Repo* models; reader doesn't import @/lib/repo; Phase 16D global write invariant preserved.
+- Ran full test suite: readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 117 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (full Forge auth screen, 0 errors, GET / 200).
+- Committed as f2099c3. Pushed to origin main (f2c9359..f2099c3). Verified local == remote == f2099c36d9a76978c5ee7896ebae4bc7f4984a48.
+
+Stage Summary:
+- CANONICAL: GitHub main = f2099c3, Local = f2099c3 (MATCH). Deployed = unverified from sandbox.
+- READINESS: reads canonical repository (real GitHub for GITHUB_BACKED; TaskEvidence for LOCAL_ONLY). Zero db.repoFile/repoCommit reads.
+- REPOSITORY UI: reads canonical repository via repository-reader. Zero db.repo* reads.
+- REPOSITORY-READER: strictly read-only. Zero writes to Repo* models. Self-contained (no @/lib/repo import).
+- LOCAL_ONLY HONESTY: content-based readiness checks cannot pass for LOCAL_ONLY because the worker deletes its /tmp checkout. This is correct — LOCAL_ONLY is dev-only. Future phase should either require GitHub for all builds or persist file contents in TaskEvidence.
+- The readiness gate now reads the same repository that the worker actually modifies (GitHub). No more DB shadow.
