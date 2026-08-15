@@ -1536,3 +1536,43 @@ Stage Summary:
 - TESTS: 200 passed, 0 failed from clean clone.
 - The repository snapshot boundary is now: fail-closed, cycle-protected, deduplicated, memory-bounded, filesystem-contained, archive-validated, and evidence-clear.
 - Ready for runtime verification as the next milestone.
+
+---
+Task ID: 17G
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17G — Corrected evidence semantics (repositoryEntriesExamined/filePathsExamined/uniqueFilesScanned) + archive entry safety (tar extraction filter).
+
+Work Log:
+- VERIFIED CLAIM 1 (path-count semantics): TRUE — repositoryPathsExamined was only incremented in readFileEntry (line 644), so it counted file paths, not all entries. Directories, symlinks-to-directories, and rejected entries were not counted.
+- VERIFIED CLAIM 2 (tar extraction before containment): TRUE — tar.x() at line 330 extracted the full archive before any symlink/path containment checks. Post-extraction realpath checks protected the scanner but didn't prove extraction safety.
+- Fix 1: Corrected path-count semantics. Replaced repositoryPathsExamined with three fields:
+  * repositoryEntriesExamined: incremented in walkDirectory for every entry (dirs + files + symlinks — not .git).
+  * filePathsExamined: incremented in readFileEntry before dedup.
+  * uniqueFilesScanned: same as extractedFileCount (after dedup).
+  * Invariant: repositoryEntriesExamined >= filePathsExamined >= uniqueFilesScanned.
+  * Old repositoryPathsExamined removed from RepoSnapshot, WalkContext, downloadAndExtractTarball, all return paths.
+- Fix 2: Archive entry safety via tar extraction filter.
+  * tar.x() now uses preservePaths: false (explicit) + filter function called per entry DURING extraction.
+  * Filter rejects: ABSOLUTE_PATH, PATH_TRAVERSAL (../), UNSAFE_ENTRY_TYPE (hardlinks, devices, FIFOs — only File/OldFile/ContiguousFile/Directory/SymbolicLink allowed), SYMLINK_UNSAFE_TARGET (absolute or traversing linkpath).
+  * Unsafe entries recorded in unsafeArchiveEntries: UnsafeArchiveEntry[] and propagated to RepoSnapshot + readiness evidence + build event payload.
+  * Added UnsafeArchiveEntry interface: {path, type, reason, linkpath?}.
+- Updated all return paths: tarball, Trees API, LOCAL_ONLY, emptySnapshot, invalid-archive early returns.
+- Updated readiness check evidence + build event payload with new field names + unsafeArchiveEntries.
+- Added 18 Phase 17G tests (Tests 76-93).
+- CLEAN-CLONE VERIFICATION:
+  * Cloned GitHub main to /tmp/forge-clean-clone.
+  * Clean clone HEAD = 5961819 (matches local + remote).
+  * Verified Phase 17G code: repositoryEntriesExamined (16 hits), filePathsExamined (15), unsafeArchiveEntries (19), preservePaths:false (2), UNSAFE_ENTRY_TYPE (1).
+  * Old repositoryPathsExamined: 1 hit (in test checking it's gone).
+  * Ran full test suite from clean clone: 212 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as 5961819. Pushed to origin main (5a1cdba..5961819).
+- SHA VERIFICATION: local HEAD == origin/main == 59618197c4079d22edc88891bb60b9931978ed60 == clean clone HEAD. (GitHub API rate-limited, but 3 sources confirm.)
+
+Stage Summary:
+- CANONICAL: GitHub main = 5961819, Local = 5961819, Clean clone = 5961819 (ALL MATCH).
+- SNAPSHOT EVIDENCE: repositoryEntriesExamined (all entries) >= filePathsExamined (files before dedup) >= uniqueFilesScanned (after dedup). Semantics now precise.
+- ARCHIVE SECURITY: tar extraction filter validates every entry DURING extraction (not after). Rejects absolute paths, ../ traversal, hardlinks, devices, FIFOs, unsafe symlink targets. Unsafe entries recorded + propagated.
+- The repository snapshot boundary is now: fail-closed, cycle-protected, deduplicated, memory-bounded, filesystem-contained, archive-validated, evidence-precise, AND extraction-safe.
+- Ready for runtime verification as the next milestone.
