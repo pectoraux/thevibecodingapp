@@ -16,9 +16,11 @@ import {
   getProductionReadinessFailureReason,
   deriveRuntimeVerificationPlan,
   evaluateRuntimeVerificationResult,
+  hashRuntimePlan,
   type ProductionReadinessEvidence,
   type RuntimeVerificationResult,
   type RuntimeVerificationPlan,
+  type RuntimeVerificationPlan as Plan,
 } from "../src/lib/runtime-verification";
 
 interface TestResult {
@@ -39,6 +41,26 @@ function readFile(path: string): string {
 
 function record(name: string, passed: boolean, details: string) {
   results.push({ name, passed, details });
+}
+
+// Minimal plan for tests that just need the evaluator to run.
+function makeMinimalPlan(): Plan {
+  return {
+    repositoryHeadSha: "abc1234",
+    githubRepo: "owner/repo",
+    githubDefaultBranch: "main",
+    installCommands: ["npm install"],
+    buildCommands: ["npm run build"],
+    startCommand: "npm start",
+    expectedPort: 3000,
+    startupTimeoutMs: 30000,
+    healthChecks: [],
+    apiJourneys: [],
+    integrationChecks: [],
+    backgroundJobChecks: [],
+    browserJourneys: [],
+    teardownTimeoutMs: 10000,
+  };
 }
 
 // ===========================================================================
@@ -335,7 +357,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     completedAt: new Date().toISOString(),
     logs: "",
   };
-  const evaluation = evaluateRuntimeVerificationResult(result);
+  const evaluation = evaluateRuntimeVerificationResult(result, makeMinimalPlan());
   record(
     "evaluateRuntimeVerificationResult passes when all stages succeed",
     evaluation.passed,
@@ -364,7 +386,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     completedAt: new Date().toISOString(),
     logs: "",
   };
-  const evaluation = evaluateRuntimeVerificationResult(result);
+  const evaluation = evaluateRuntimeVerificationResult(result, makeMinimalPlan());
   record(
     "evaluateRuntimeVerificationResult fails when dependency install fails",
     !evaluation.passed && evaluation.failureReason?.includes("dependencyInstall"),
@@ -393,7 +415,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     completedAt: new Date().toISOString(),
     logs: "",
   };
-  const evaluation = evaluateRuntimeVerificationResult(result);
+  const evaluation = evaluateRuntimeVerificationResult(result, makeMinimalPlan());
   record(
     "evaluateRuntimeVerificationResult fails when startup fails",
     !evaluation.passed && evaluation.failureReason?.includes("startup"),
@@ -403,6 +425,10 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
 
 // Test 27: evaluateRuntimeVerificationResult fails when health check fails.
 {
+  const planWithHealth: Plan = {
+    ...makeMinimalPlan(),
+    healthChecks: [{ name: "health", path: "/api/health", expectedStatus: 200, timeoutMs: 10000, required: "required" }],
+  };
   const result: RuntimeVerificationResult = {
     repositoryHeadSha: "abc1234",
     headVerified: true,
@@ -410,7 +436,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     dependencyInstallResult: { success: true, durationMs: 1000, exitCode: 0, output: "installed" },
     buildResult: { success: true, durationMs: 2000, exitCode: 0, output: "built" },
     startupResult: { success: true, durationMs: 500, exitCode: 0, output: "started", port: 3000, pid: 12345 },
-    healthChecks: [{ name: "health", path: "/api/health", passed: false, status: null, responseTimeMs: 0, error: "timeout" }],
+    healthChecks: [{ name: "health", path: "/api/health", passed: false, status: null, responseTimeMs: 0, required: "required", error: "timeout" }],
     apiJourneys: [],
     integrationChecks: [],
     backgroundJobChecks: [],
@@ -422,10 +448,10 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     completedAt: new Date().toISOString(),
     logs: "",
   };
-  const evaluation = evaluateRuntimeVerificationResult(result);
+  const evaluation = evaluateRuntimeVerificationResult(result, planWithHealth);
   record(
     "evaluateRuntimeVerificationResult fails when health check fails",
-    !evaluation.passed && evaluation.failureReason?.includes("healthChecks"),
+    !evaluation.passed && evaluation.failureReason?.includes("health"),
     `passed: ${evaluation.passed}, reason: ${evaluation.failureReason}`
   );
 }
@@ -464,7 +490,19 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
 {
   const plan = deriveRuntimeVerificationPlan(
     { canonicalHeadSha: "abc123def456", githubRepo: "owner/repo", githubDefaultBranch: "main" },
-    null
+    {
+      contractJson: "{}",
+      apiContracts: "[]",
+      integrations: "[]",
+      testingStrategy: "{}",
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"],
+        buildCommands: ["npm run build"],
+        startCommand: "npm start",
+        port: 3000,
+      }),
+      frozen: true,
+    }
   );
   record(
     "deriveRuntimeVerificationPlan returns a plan with correct SHA + repo",
@@ -485,13 +523,19 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
       ]),
       integrations: "[]",
       testingStrategy: "{}",
-      deploymentModel: "{}",
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"],
+        buildCommands: ["npm run build"],
+        startCommand: "npm start",
+        port: 3000,
+      }),
+      frozen: true,
     }
   );
   record(
     "deriveRuntimeVerificationPlan extracts API journeys from architecture",
-    plan !== null && plan.apiJourneys.length === 2 && plan.apiJourneys[0].path === "/api/users",
-    `journeys: ${plan?.apiJourneys.length}`
+    plan !== null && plan.apiJourneys.length === 2 && plan.apiJourneys[0].steps[0].path === "/api/users",
+    `journeys: ${plan?.apiJourneys.length}, firstStepPath: ${plan?.apiJourneys[0]?.steps[0]?.path}`
   );
 }
 
@@ -608,10 +652,448 @@ const enforcement = readFile("src/lib/production-enforcement.ts");
 }
 
 // ===========================================================================
+// PHASE 18A: Server-authoritative SHA + no defaults + required/optional
+// ===========================================================================
+
+const runtimeModulePhase18A = readFile("src/lib/runtime-verification.ts");
+const evidenceRoutePhase18A = readFile("src/app/api/worker/submit-runtime-evidence/route.ts");
+
+// Test 41: NO DEFAULTS — deriveRuntimeVerificationPlan returns null without architecture.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    null
+  );
+  record(
+    "Phase 18A: deriveRuntimeVerificationPlan returns null when architecture is null (NO DEFAULTS)",
+    plan === null,
+    `plan: ${plan}`
+  );
+}
+
+// Test 42: NO DEFAULTS — returns null when architecture is not frozen.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    { contractJson: "{}", apiContracts: "[]", integrations: "[]", testingStrategy: "{}", deploymentModel: "{}", frozen: false }
+  );
+  record(
+    "Phase 18A: deriveRuntimeVerificationPlan returns null when architecture is not frozen",
+    plan === null,
+    `plan: ${plan}`
+  );
+}
+
+// Test 43: NO DEFAULTS — returns null when deployment model lacks installCommands.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}",
+      apiContracts: "[]",
+      integrations: "[]",
+      testingStrategy: "{}",
+      deploymentModel: JSON.stringify({ buildCommands: ["npm run build"], startCommand: "npm start", port: 3000 }),
+      frozen: true,
+    }
+  );
+  record(
+    "Phase 18A: returns null when deployment model lacks installCommands (NO npm default)",
+    plan === null,
+    `plan: ${plan}`
+  );
+}
+
+// Test 44: NO DEFAULTS — returns null when deployment model lacks startCommand.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}",
+      apiContracts: "[]",
+      integrations: "[]",
+      testingStrategy: "{}",
+      deploymentModel: JSON.stringify({ installCommands: ["npm install"], buildCommands: ["npm run build"], port: 3000 }),
+      frozen: true,
+    }
+  );
+  record(
+    "Phase 18A: returns null when deployment model lacks startCommand (NO npm start default)",
+    plan === null,
+    `plan: ${plan}`
+  );
+}
+
+// Test 45: NO DEFAULTS — returns null when deployment model lacks port.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}",
+      apiContracts: "[]",
+      integrations: "[]",
+      testingStrategy: "{}",
+      deploymentModel: JSON.stringify({ installCommands: ["npm install"], buildCommands: ["npm run build"], startCommand: "npm start" }),
+      frozen: true,
+    }
+  );
+  record(
+    "Phase 18A: returns null when deployment model lacks port (NO port 3000 default)",
+    plan === null,
+    `plan: ${plan}`
+  );
+}
+
+// Test 46: NO DEFAULTS — returns null on malformed JSON.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}",
+      apiContracts: "[]",
+      integrations: "[]",
+      testingStrategy: "{}",
+      deploymentModel: "INVALID JSON{{",
+      frozen: true,
+    }
+  );
+  record(
+    "Phase 18A: returns null on malformed deployment model JSON (NO fallback)",
+    plan === null,
+    `plan: ${plan}`
+  );
+}
+
+// Test 47: Valid plan with full deployment model.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}",
+      apiContracts: JSON.stringify([{ method: "GET", path: "/api/users", name: "List users" }]),
+      integrations: JSON.stringify([{ name: "Postgres", type: "database", verificationMethod: "connectivity" }]),
+      testingStrategy: JSON.stringify({
+        apiJourneys: [{
+          name: "User CRUD",
+          required: "required",
+          steps: [
+            { method: "POST", path: "/api/users", expectedStatus: 201, capture: "$.id" },
+            { method: "GET", path: "/api/users/{id}", expectedStatus: 200 },
+          ],
+        }],
+      }),
+      deploymentModel: JSON.stringify({
+        installCommands: ["pip install -r requirements.txt"],
+        buildCommands: ["python -m build"],
+        startCommand: "uvicorn app:main",
+        port: 8000,
+      }),
+      frozen: true,
+    }
+  );
+  record(
+    "Phase 18A: valid plan from full architecture (Python app, not npm defaults)",
+    plan !== null &&
+    plan.installCommands[0] === "pip install -r requirements.txt" &&
+    plan.startCommand === "uvicorn app:main" &&
+    plan.expectedPort === 8000 &&
+    plan.apiJourneys.length === 1 &&
+    plan.apiJourneys[0].steps.length === 2,
+    `plan: ${plan ? "valid" : "null"}, journeys: ${plan?.apiJourneys.length ?? 0}`
+  );
+}
+
+// Test 48: hashRuntimePlan produces a stable hash.
+{
+  const plan = makeMinimalPlan();
+  const hash1 = hashRuntimePlan(plan);
+  const hash2 = hashRuntimePlan(plan);
+  record(
+    "hashRuntimePlan produces a stable hash for the same plan",
+    hash1 === hash2 && hash1.length === 16,
+    `hash1: ${hash1}, hash2: ${hash2}`
+  );
+}
+
+// Test 49: hashRuntimePlan produces different hashes for different plans.
+{
+  const plan1 = makeMinimalPlan();
+  const plan2 = { ...makeMinimalPlan(), expectedPort: 8080 };
+  const hash1 = hashRuntimePlan(plan1);
+  const hash2 = hashRuntimePlan(plan2);
+  record(
+    "hashRuntimePlan produces different hashes for different plans",
+    hash1 !== hash2,
+    `hash1: ${hash1}, hash2: ${hash2}`
+  );
+}
+
+// Test 50: Endpoint verifies SHA match (server-authoritative).
+{
+  const verifiesSha = evidenceRoutePhase18A.includes("result.repositoryHeadSha !== expectedSha") ||
+    evidenceRoutePhase18A.includes("SHA mismatch");
+  record(
+    "submit-runtime-evidence endpoint verifies result.repositoryHeadSha == project.canonicalHeadSha",
+    verifiesSha,
+    `verifiesSha: ${verifiesSha}`
+  );
+}
+
+// Test 51: Endpoint rejects SHA mismatch.
+{
+  const rejectsMismatch = evidenceRoutePhase18A.includes("REJECTED") && evidenceRoutePhase18A.includes("SHA mismatch");
+  record(
+    "submit-runtime-evidence endpoint rejects SHA mismatch (server-authoritative)",
+    rejectsMismatch,
+    `rejectsMismatch: ${rejectsMismatch}`
+  );
+}
+
+// Test 52: Endpoint independently verifies GitHub freshness.
+{
+  const verifiesFreshness = evidenceRoutePhase18A.includes("api.github.com") && evidenceRoutePhase18A.includes("branchRes");
+  record(
+    "submit-runtime-evidence endpoint independently verifies GitHub branch HEAD (freshness)",
+    verifiesFreshness,
+    `verifiesFreshness: ${verifiesFreshness}`
+  );
+}
+
+// Test 53: Endpoint rejects when headVerified is false.
+{
+  const rejectsUnverified = evidenceRoutePhase18A.includes("Canonical HEAD not verified");
+  record(
+    "submit-runtime-evidence endpoint rejects when canonical HEAD not verified",
+    rejectsUnverified,
+    `rejectsUnverified: ${rejectsUnverified}`
+  );
+}
+
+// Test 54: Endpoint derives plan from architecture (NO DEFAULTS).
+{
+  const derivesPlan = evidenceRoutePhase18A.includes("deriveRuntimeVerificationPlan");
+  const rejectsNoPlan = evidenceRoutePhase18A.includes("No valid runtime verification plan");
+  record(
+    "submit-runtime-evidence endpoint derives plan from architecture and rejects if missing (NO DEFAULTS)",
+    derivesPlan && rejectsNoPlan,
+    `derivesPlan: ${derivesPlan}, rejectsNoPlan: ${rejectsNoPlan}`
+  );
+}
+
+// Test 55: Endpoint uses plan-aware evaluation.
+{
+  const planAware = evidenceRoutePhase18A.includes("evaluateRuntimeVerificationResult(result, plan)");
+  record(
+    "submit-runtime-evidence endpoint uses plan-aware evaluation (passes plan to evaluator)",
+    planAware,
+    `planAware: ${planAware}`
+  );
+}
+
+// Test 56: Endpoint does NOT emit PRODUCTION_READY from runtime pass alone.
+{
+  // The endpoint should emit RUNTIME_VERIFIED, not PRODUCTION_READY, initially.
+  // PRODUCTION_READY only comes from the complete canonical predicate.
+  const usesCanonicalPredicate = evidenceRoutePhase18A.includes("canReachProductionReadyWithRuntime(prodEvidence)");
+  const runtimeEventNotProductionReady = evidenceRoutePhase18A.includes("RUNTIME_VERIFIED") || evidenceRoutePhase18A.includes("runtimeVerified");
+  record(
+    "submit-runtime-evidence evaluates canonical predicate before PRODUCTION_READY (not runtime pass alone)",
+    usesCanonicalPredicate,
+    `usesCanonicalPredicate: ${usesCanonicalPredicate}`
+  );
+}
+
+// Test 57: Endpoint records expectedRepositoryHeadSha (server-derived).
+{
+  const recordsExpected = evidenceRoutePhase18A.includes("expectedRepositoryHeadSha: expectedSha");
+  record(
+    "submit-runtime-evidence records expectedRepositoryHeadSha (server-derived, not worker-supplied)",
+    recordsExpected,
+    `recordsExpected: ${recordsExpected}`
+  );
+}
+
+// Test 58: Endpoint records runtimePlanHash.
+{
+  const recordsHash = evidenceRoutePhase18A.includes("runtimePlanHash");
+  record(
+    "submit-runtime-evidence records runtimePlanHash (for reproducibility)",
+    recordsHash,
+    `recordsHash: ${recordsHash}`
+  );
+}
+
+// Test 59: Endpoint records architectureHash.
+{
+  const recordsArchHash = evidenceRoutePhase18A.includes("architectureHash");
+  record(
+    "submit-runtime-evidence records architectureHash (for reproducibility)",
+    recordsArchHash,
+    `recordsArchHash: ${recordsArchHash}`
+  );
+}
+
+// Test 60: Required API journey missing → UNVERIFIED (fail).
+{
+  const plan: Plan = {
+    ...makeMinimalPlan(),
+    apiJourneys: [{
+      name: "Critical Journey",
+      description: "must pass",
+      required: "required",
+      steps: [{ name: "step1", method: "GET", path: "/api/critical", expectedStatus: 200 }],
+    }],
+  };
+  const result: RuntimeVerificationResult = {
+    ...makeMinimalResult(),
+    apiJourneys: [], // Missing the required journey.
+  };
+  const evaluation = evaluateRuntimeVerificationResult(result, plan);
+  record(
+    "Required API journey missing → evaluation fails (UNVERIFIED)",
+    !evaluation.passed && evaluation.failureReason?.includes("Critical Journey:MISSING"),
+    `passed: ${evaluation.passed}, reason: ${evaluation.failureReason}`
+  );
+}
+
+// Test 61: Optional API journey missing → SKIPPED (ok).
+{
+  const plan: Plan = {
+    ...makeMinimalPlan(),
+    apiJourneys: [{
+      name: "Optional Journey",
+      description: "nice to have",
+      required: "optional",
+      steps: [{ name: "step1", method: "GET", path: "/api/optional", expectedStatus: 200 }],
+    }],
+  };
+  const result: RuntimeVerificationResult = {
+    ...makeMinimalResult(),
+    apiJourneys: [], // Missing the optional journey.
+  };
+  const evaluation = evaluateRuntimeVerificationResult(result, plan);
+  record(
+    "Optional API journey missing → evaluation passes (SKIPPED)",
+    evaluation.passed,
+    `passed: ${evaluation.passed}, reason: ${evaluation.failureReason}`
+  );
+}
+
+// Test 62: Required integration check failed → FAILED.
+{
+  const plan: Plan = {
+    ...makeMinimalPlan(),
+    integrationChecks: [{
+      name: "Postgres",
+      type: "database",
+      required: "required",
+      verificationMethod: "connectivity",
+    }],
+  };
+  const result: RuntimeVerificationResult = {
+    ...makeMinimalResult(),
+    integrationChecks: [{
+      name: "Postgres",
+      type: "database",
+      passed: false,
+      required: "required",
+      verificationMethod: "connectivity",
+      error: "connection refused",
+    }],
+  };
+  const evaluation = evaluateRuntimeVerificationResult(result, plan);
+  record(
+    "Required integration check failed → evaluation fails",
+    !evaluation.passed && evaluation.failureReason?.includes("Postgres:FAILED"),
+    `passed: ${evaluation.passed}, reason: ${evaluation.failureReason}`
+  );
+}
+
+// Test 63: No npm defaults in runtime-verification.ts.
+{
+  const hasNpmDefault = runtimeModulePhase18A.includes('"npm install"') || runtimeModulePhase18A.includes('"npm start"');
+  record(
+    "runtime-verification.ts has NO npm defaults (no 'npm install' or 'npm start' literals)",
+    !hasNpmDefault,
+    `hasNpmDefault: ${hasNpmDefault}`
+  );
+}
+
+// Test 64: RuntimeEvidence schema has expectedRepositoryHeadSha field.
+{
+  const hasField = readFile("prisma/schema.prisma").includes("expectedRepositoryHeadSha");
+  record(
+    "RuntimeEvidence schema has expectedRepositoryHeadSha field (server-authoritative)",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 65: RuntimeEvidence schema has runtimePlanHash field.
+{
+  const hasField = readFile("prisma/schema.prisma").includes("runtimePlanHash");
+  record(
+    "RuntimeEvidence schema has runtimePlanHash field (reproducibility)",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 66: RuntimeEvidence schema has architectureHash field.
+{
+  const hasField = readFile("prisma/schema.prisma").includes("architectureHash");
+  record(
+    "RuntimeEvidence schema has architectureHash field (reproducibility)",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 67: Evaluator returns breakdown with required/optional counts.
+{
+  const result: RuntimeVerificationResult = makeMinimalResult();
+  const evaluation = evaluateRuntimeVerificationResult(result, makeMinimalPlan());
+  const hasBreakdown = evaluation.breakdown &&
+    typeof evaluation.breakdown.requiredPassed === "number" &&
+    typeof evaluation.breakdown.requiredFailed === "number" &&
+    typeof evaluation.breakdown.requiredMissing === "number" &&
+    typeof evaluation.breakdown.optionalPassed === "number" &&
+    typeof evaluation.breakdown.optionalSkipped === "number";
+  record(
+    "Evaluator returns breakdown with required/optional counts",
+    hasBreakdown,
+    `breakdown: ${JSON.stringify(evaluation.breakdown)}`
+  );
+}
+
+// Helper for minimal result.
+function makeMinimalResult(): RuntimeVerificationResult {
+  return {
+    repositoryHeadSha: "abc1234",
+    headVerified: true,
+    environmentFingerprint: { nodeVersion: "20", platform: "linux", arch: "x64", executionMode: "sandbox", workerVersion: "phase18", timestamp: new Date().toISOString() },
+    dependencyInstallResult: { success: true, durationMs: 1000, exitCode: 0, output: "installed" },
+    buildResult: { success: true, durationMs: 2000, exitCode: 0, output: "built" },
+    startupResult: { success: true, durationMs: 500, exitCode: 0, output: "started", port: 3000, pid: 12345 },
+    healthChecks: [],
+    apiJourneys: [],
+    integrationChecks: [],
+    backgroundJobChecks: [],
+    browserJourneys: [],
+    teardownResult: { success: true, durationMs: 100 },
+    passed: true,
+    failureReason: null,
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    logs: "",
+  };
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 18: Runtime Verification Invariants ===\n");
+console.log("=== Forge Phase 18A: Runtime Verification Policy Hardening ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {

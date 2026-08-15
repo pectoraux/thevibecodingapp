@@ -680,6 +680,18 @@ model RuntimeEvidence {
   repositoryHeadSha   String
   headVerified        Boolean  @default(false)
 
+  // Phase 18A: Server-authoritative SHA binding.
+  // expectedRepositoryHeadSha = project.canonicalHeadSha at submission time (server-derived, not worker-supplied).
+  // executedRepositoryHeadSha = result.repositoryHeadSha (what the worker claims to have executed).
+  // These must match for the evidence to be valid.
+  expectedRepositoryHeadSha  String?
+  executedRepositoryHeadSha  String?
+  integrationBranch          String?
+  // Hash of the RuntimeVerificationPlan used (for reproducibility).
+  runtimePlanHash            String?
+  // Hash of the architecture contract (for reproducibility).
+  architectureHash           String?
+
   // Environment fingerprint — what environment executed the application.
   environmentFingerprint String  // JSON: { nodeVersion, platform, arch, executionMode, workerVersion }
 

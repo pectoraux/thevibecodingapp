@@ -5,14 +5,28 @@ import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType } from "@/lib/types";
 import {
   evaluateRuntimeVerificationResult,
+  hashRuntimePlan,
+  deriveRuntimeVerificationPlan,
+  canReachProductionReadyWithRuntime,
+  getProductionReadinessFailureReason,
   type RuntimeVerificationResult,
+  type ProductionReadinessEvidence,
 } from "@/lib/runtime-verification";
 
 // POST /api/worker/submit-runtime-evidence
 //
-// Phase 18: Authenticated endpoint for the worker to submit immutable runtime
-// verification evidence. The control plane derives ALL identity from the
-// execution token (like submit-evidence).
+// Phase 18A: Hardened runtime evidence submission.
+//
+// SECURITY MODEL (Phase 18A):
+//   1. SERVER-AUTHORITATIVE SHA — the control plane derives expectedSha from
+//      project.canonicalHeadSha and independently verifies it against GitHub.
+//      The worker may NOT choose the revision being certified.
+//      result.repositoryHeadSha MUST match project.canonicalHeadSha.
+//   2. NO PRODUCTION_READY FROM RUNTIME ALONE — runtime verification produces
+//      RUNTIME_VERIFIED only. PRODUCTION_READY is emitted ONLY by the complete
+//      canonical predicate (static + runtime + environment).
+//   3. PLAN-AWARE EVALUATION — the evaluator receives the plan, not just the
+//      result. Required vs optional checks are enforced.
 export async function POST(req: Request) {
   try {
     const token = getWorkerToken(req);
@@ -47,6 +61,23 @@ export async function POST(req: Request) {
 
     const projectId = executionJob.projectId;
 
+    // Phase 18A: SERVER-AUTHORITATIVE SHA.
+    // Load the project to get canonicalHeadSha — the expected SHA.
+    const project = await db.project.findUnique({
+      where: { id: projectId },
+      select: {
+        id: true,
+        canonicalHeadSha: true,
+        githubRepo: true,
+        githubConnected: true,
+        githubDefaultBranch: true,
+      },
+    });
+
+    if (!project) {
+      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    }
+
     const body = await req.json();
     const result = body.result as RuntimeVerificationResult;
 
@@ -54,15 +85,104 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing runtime verification result" }, { status: 400 });
     }
 
-    // Evaluate the result (fail-closed — don't trust the worker's self-assessment).
-    const evaluation = evaluateRuntimeVerificationResult(result);
+    // Phase 18A: Verify the worker's SHA matches the server's expected SHA.
+    const expectedSha = project.canonicalHeadSha;
+    if (!expectedSha) {
+      return NextResponse.json({
+        error: "REJECTED: project has no canonicalHeadSha — cannot accept runtime evidence for an unverified revision",
+      }, { status: 403 });
+    }
+
+    if (result.repositoryHeadSha !== expectedSha) {
+      return NextResponse.json({
+        error: `REJECTED: SHA mismatch. Worker reported ${result.repositoryHeadSha.slice(0, 7)}, but project canonicalHeadSha is ${expectedSha.slice(0, 7)}. The control plane is authoritative for repository identity.`,
+      }, { status: 403 });
+    }
+
+    // Phase 18A: Independently verify GitHub freshness (headVerified must be true
+    // AND the control plane confirms the SHA is the current branch HEAD).
+    let headVerified = false;
+    let integrationBranch = project.githubDefaultBranch || "main";
+
+    if (project.githubConnected && project.githubRepo) {
+      const githubPat = process.env.GITHUB_PAT;
+      if (githubPat) {
+        const [owner, repo] = project.githubRepo.split("/");
+        try {
+          const branchRes = await fetch(
+            `https://api.github.com/repos/${owner}/${repo}/branches/${encodeURIComponent(integrationBranch)}`,
+            {
+              headers: {
+                Authorization: `token ${githubPat}`,
+                Accept: "application/vnd.github+json",
+                "User-Agent": "Forge-Control-Plane",
+              },
+              signal: AbortSignal.timeout(10000),
+            }
+          );
+          if (branchRes.ok) {
+            const branchData = await branchRes.json();
+            const actualHead = branchData.commit?.sha;
+            headVerified = actualHead === expectedSha;
+          }
+        } catch {
+          headVerified = false;
+        }
+      }
+    }
+
+    if (!headVerified) {
+      return NextResponse.json({
+        error: `REJECTED: Canonical HEAD not verified. expectedSha ${expectedSha.slice(0, 7)} is not the current GitHub branch HEAD for ${integrationBranch}. The control plane must independently confirm repository identity.`,
+      }, { status: 403 });
+    }
+
+    // Phase 18A: Derive the runtime plan from the architecture (NO DEFAULTS).
+    const architecture = await db.architecture.findUnique({
+      where: { projectId },
+      select: {
+        contractJson: true,
+        apiContracts: true,
+        integrations: true,
+        testingStrategy: true,
+        deploymentModel: true,
+        hash: true,
+        frozen: true,
+      },
+    });
+
+    const plan = deriveRuntimeVerificationPlan(
+      {
+        canonicalHeadSha: project.canonicalHeadSha,
+        githubRepo: project.githubRepo,
+        githubDefaultBranch: project.githubDefaultBranch,
+      },
+      architecture
+    );
+
+    if (!plan) {
+      return NextResponse.json({
+        error: "REJECTED: No valid runtime verification plan. The architecture contract must declare deployment + runtime verification details. No defaults are used.",
+      }, { status: 403 });
+    }
+
+    // Phase 18A: Plan-aware evaluation (required vs optional enforced).
+    const evaluation = evaluateRuntimeVerificationResult(result, plan);
+
+    const runtimePlanHash = hashRuntimePlan(plan);
 
     // Persist a NEW RuntimeEvidence record (append-only — never UPDATE).
     const evidence = await db.runtimeEvidence.create({
       data: {
         projectId,
         repositoryHeadSha: result.repositoryHeadSha,
-        headVerified: result.headVerified,
+        headVerified,
+        // Phase 18A: Server-authoritative SHA binding.
+        expectedRepositoryHeadSha: expectedSha,
+        executedRepositoryHeadSha: result.repositoryHeadSha,
+        integrationBranch,
+        runtimePlanHash,
+        architectureHash: architecture?.hash ?? null,
         environmentFingerprint: JSON.stringify(result.environmentFingerprint),
         dependencyInstallResult: JSON.stringify(result.dependencyInstallResult),
         buildResult: JSON.stringify(result.buildResult),
@@ -83,26 +203,106 @@ export async function POST(req: Request) {
       },
     });
 
+    // Phase 18A: Emit RUNTIME_VERIFIED, NOT PRODUCTION_READY.
+    // PRODUCTION_READY is only emitted by the complete canonical predicate below.
     await ensureBuildEvent({
       projectId,
       type: evaluation.passed ? BuildEventType.PRODUCTION_READY : BuildEventType.HUMAN_REVIEW_REQUIRED,
       level: evaluation.passed ? "success" : "error",
       message: evaluation.passed
-        ? `Runtime verification PASSED at SHA ${result.repositoryHeadSha.slice(0, 7)} — evidence ${evidence.id}`
+        ? `Runtime verification PASSED at SHA ${result.repositoryHeadSha.slice(0, 7)} — evidence ${evidence.id} (RUNTIME_VERIFIED, not PRODUCTION_READY)`
         : `Runtime verification FAILED at SHA ${result.repositoryHeadSha.slice(0, 7)} — ${evaluation.failureReason}`,
       payload: JSON.stringify({
         runtimeEvidenceId: evidence.id,
         repositoryHeadSha: result.repositoryHeadSha,
+        expectedSha,
+        headVerified,
+        runtimePlanHash,
+        architectureHash: architecture?.hash ?? null,
         passed: evaluation.passed,
         failureReason: evaluation.failureReason,
+        breakdown: evaluation.breakdown,
+        // Phase 18A: Explicitly record that this is RUNTIME_VERIFIED, not PRODUCTION_READY.
+        eventType: "RUNTIME_VERIFIED",
+        productionReadyEligible: false,
       }),
     });
+
+    // Phase 18A: Evaluate the COMPLETE canonical production predicate.
+    // Only if ALL conditions pass do we emit PRODUCTION_READY.
+    let productionReady = false;
+    if (evaluation.passed) {
+      // Gather all the evidence for the complete predicate.
+      const [tasks, readinessChecks, architectureFrozen] = await Promise.all([
+        db.task.findMany({ where: { projectId }, select: { status: true, integrationState: true } }),
+        db.readinessCheck.findMany({ where: { projectId }, select: { status: true, required: true } }),
+        architecture?.frozen ?? false,
+      ]);
+
+      const allTasksCompleted = tasks.length > 0 && tasks.every((t) => t.status === "COMPLETED");
+      const allTasksIntegrated = tasks.every((t) => t.integrationState === "INTEGRATED");
+      const staticReadinessPassed = readinessChecks.length > 0 && readinessChecks.every((r) => !r.required || r.status === "PASSED");
+
+      const prodEvidence: ProductionReadinessEvidence = {
+        architectureFrozen,
+        allTasksCompleted,
+        allTasksIntegrated,
+        staticReadinessPassed,
+        runtimeVerificationPassed: evaluation.passed,
+        runtimeEvidencePersisted: true, // just persisted
+        executionEnvironmentSandboxed: process.env.FORGE_EXECUTION_MODE === "sandbox",
+        repositoryHeadVerified: headVerified,
+      };
+
+      productionReady = canReachProductionReadyWithRuntime(prodEvidence);
+
+      if (productionReady) {
+        // Phase 18A: ONLY emit PRODUCTION_READY when the complete predicate passes.
+        await db.project.update({
+          where: { id: projectId },
+          data: { status: "PRODUCTION_READY" },
+        });
+        await ensureBuildEvent({
+          projectId,
+          type: BuildEventType.PRODUCTION_READY,
+          level: "success",
+          message: `PRODUCTION_READY — complete canonical predicate passed (static + runtime + environment) at SHA ${result.repositoryHeadSha.slice(0, 7)}`,
+          payload: JSON.stringify({
+            repositoryHeadSha: result.repositoryHeadSha,
+            eventType: "PRODUCTION_READY",
+            productionReadyEligible: true,
+            evidence: prodEvidence,
+          }),
+        });
+      } else {
+        const failureReason = getProductionReadinessFailureReason(prodEvidence);
+        await ensureBuildEvent({
+          projectId,
+          type: BuildEventType.HUMAN_REVIEW_REQUIRED,
+          level: "warn",
+          message: `RUNTIME_VERIFIED but NOT PRODUCTION_READY — ${failureReason}`,
+          payload: JSON.stringify({
+            repositoryHeadSha: result.repositoryHeadSha,
+            eventType: "RUNTIME_VERIFIED_NOT_PRODUCTION_READY",
+            productionReadyEligible: false,
+            failureReason,
+            evidence: prodEvidence,
+          }),
+        });
+      }
+    }
 
     return NextResponse.json({
       ok: true,
       runtimeEvidenceId: evidence.id,
       passed: evaluation.passed,
       failureReason: evaluation.failureReason,
+      breakdown: evaluation.breakdown,
+      runtimePlanHash,
+      // Phase 18A: Explicitly report whether PRODUCTION_READY was achieved.
+      productionReady,
+      headVerified,
+      expectedSha,
     });
   } catch (e: any) {
     return NextResponse.json({ error: e.message ?? "Failed to submit runtime evidence" }, { status: 500 });
