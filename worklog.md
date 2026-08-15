@@ -1576,3 +1576,51 @@ Stage Summary:
 - ARCHIVE SECURITY: tar extraction filter validates every entry DURING extraction (not after). Rejects absolute paths, ../ traversal, hardlinks, devices, FIFOs, unsafe symlink targets. Unsafe entries recorded + propagated.
 - The repository snapshot boundary is now: fail-closed, cycle-protected, deduplicated, memory-bounded, filesystem-contained, archive-validated, evidence-precise, AND extraction-safe.
 - Ready for runtime verification as the next milestone.
+
+---
+Task ID: 17G-RECONCILE
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17G-RECONCILE — Canonicalize 17G onto main + verify tar dependency version security.
+
+Work Log:
+- CANONICAL-STATE VERIFICATION (fourth occurrence of stale web view):
+  * User claimed GitHub main = 8ef366f (Phase 17D). Previous occurrences: f2c9359 (16D), 8ef366f (17D again), 8ef366f (17D third time).
+  * Verified via git fetch + git rev-parse: origin/main = 5961819 (Phase 17G) before this task, then 1bb2d15 (worklog sync), then c11e86d (this task).
+  * 8ef366f (Phase 17D) confirmed as ancestor of 5961819 on main — no Phase 17D changes lost.
+  * User's GitHub web view is cached/stale (fourth occurrence). Git protocol is the authoritative source.
+- Pushed local worklog commit (1bb2d15) to sync local with remote.
+- TAR DEPENDENCY SECURITY:
+  * Security advisory GHSA-8qq5-rm4j-mr97 (CVE-2026-23745) affects node-tar <=7.5.2.
+  * Arbitrary file overwrite via hardlink/symlink extraction.
+  * Patched version: 7.5.3+.
+  * Installed version: 7.5.22 (read from node_modules/tar/package.json).
+  * package.json declares: tar: ^7.5.22.
+  * bun.lock resolves: tar@7.5.22.
+  * 7.5.22 >= 7.5.3 → SAFE (patched).
+- Added 4 new Phase 17G-RECONCILE tests (Tests 94-97):
+  * Test 94: package.json declares tar as a dependency.
+  * Test 95: Installed tar version is patched (>= 7.5.3) — CVE-2026-23745. Reads node_modules/tar/package.json, compares versions semantically. FAILS if below patched release.
+  * Test 96: repository-reader imports the tar package.
+  * Test 97: tar.x() called with filter option (defense-in-depth).
+- Added compareVersions() helper for semantic version comparison.
+- CLEAN-CLONE VERIFICATION:
+  * Cloned GitHub main to /tmp/forge-clean-clone (fresh, depth 1).
+  * Clean clone HEAD = c11e86d (matches local + remote).
+  * Verified Phase 17G code present: repositoryEntriesExamined (16), filePathsExamined (15), unsafeArchiveEntries (19), preservePaths:false (2), UNSAFE_ENTRY_TYPE (1), visitedRealpaths (8).
+  * Verified clean-clone tar version: 7.5.22 (patched).
+  * Ran full test suite from clean clone: scanner 99/99, readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 216 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as c11e86d. Pushed to origin main (1bb2d15..c11e86d).
+- SHA VERIFICATION (triple):
+  * local HEAD = c11e86d9acf291f938d8899d0cdffbd2fc03ba33
+  * origin/main = c11e86d9acf291f938d8899d0cdffbd2fc03ba33
+  * clean clone HEAD = c11e86d9acf291f938d8899d0cdffbd2fc03ba33
+  * ALL THREE MATCH. (GitHub API rate-limited — 3 git sources confirm.)
+
+Stage Summary:
+- CANONICAL: GitHub main = c11e86d, Local = c11e86d, Clean clone = c11e86d (ALL MATCH).
+- PHASE 17G: archive entry filtering (filter + preservePaths:false), path traversal rejection, absolute path rejection, symlink target validation, hardlink rejection (type whitelist), special file rejection, symlink cycle protection (visitedRealpaths), evidence counters (repositoryEntriesExamined >= filePathsExamined >= uniqueFilesScanned).
+- DEPENDENCY: tar version = 7.5.22, patched = YES (>= 7.5.3, CVE-2026-23745 safe). Verified mechanically via test, not assumed.
+- TESTS: 216 passed, 0 failed from clean clone.
+- The repository snapshot layer is FROZEN. Ready for runtime verification as the next milestone.
