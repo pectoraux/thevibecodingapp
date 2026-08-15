@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 
-import { gitInit, gitClone, gitFetch, gitCheckoutBranch, gitCheckout, gitRevParse, gitAddAndCommit, gitDiff, gitDiffStat, gitPush } from "./git/repository.js";
+import { gitInit, gitClone, gitFetch, gitCheckoutBranch, gitCheckout, gitRevParse, gitAddAndCommit, gitDiff, gitDiffStat, gitPush, gitExec } from "./git/repository.js";
 import { callLLM } from "./llm/gateway.js";
 import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer } from "./verification/index.js";
 
@@ -157,15 +157,36 @@ async function executeTask(spec: any): Promise<{
   // --- Repository continuity ---
   let sandboxPath: string;
   let repoCloned = false;
+  let githubToken: string | null = null;
 
   if (spec.repository?.githubRepo) {
     sandboxPath = join(EXEC_ROOT, spec.projectId, spec.executionId);
-    const cloneUrl = `https://github.com/${spec.repository.githubRepo}.git`;
-    console.log(`[worker] Cloning: ${spec.repository.githubRepo}`);
+
+    // P11B: Authenticated clone — resolve GitHub credential from control plane.
+    try {
+      const credResult = await apiCall("/api/worker/resolve-github-credential", "POST", {
+        projectId: spec.projectId,
+      }, executionToken);
+      githubToken = credResult.token;
+    } catch {
+      console.log(`[worker] Could not resolve GitHub credential — attempting anonymous clone`);
+    }
+
+    // Build authenticated clone URL (token is never stored in .git/config permanently).
+    const repoSlug = spec.repository.githubRepo;
+    const cloneUrl = githubToken
+      ? `https://x-access-token:${githubToken}@github.com/${repoSlug}.git`
+      : `https://github.com/${repoSlug}.git`;
+    console.log(`[worker] Cloning: ${repoSlug} (authenticated: ${!!githubToken})`);
     repoCloned = gitClone(cloneUrl, sandboxPath);
 
+    // After clone, remove the credential from .git/config for security.
+    if (repoCloned && githubToken) {
+      gitExec(sandboxPath, ["remote", "set-url", "origin", `https://github.com/${repoSlug}.git`]);
+    }
+
     if (!repoCloned) {
-      return blocked("Could not clone repository", `git clone failed for ${spec.repository.githubRepo}`);
+      return blocked("Could not clone repository", `git clone failed for ${repoSlug}`);
     }
 
     gitFetch(sandboxPath);
@@ -289,10 +310,18 @@ Generate the implementation files. Respond with ONLY JSON:
   const diff = gitDiff(sandboxPath, spec.baseCommitSha || undefined);
   const diffStat = gitDiffStat(sandboxPath, spec.baseCommitSha || undefined);
 
-  // --- Push to remote ---
+  // --- Push to remote (authenticated) ---
   let pushedToRemote = false;
   if (repoCloned && commitSha && spec.repository?.githubRepo) {
-    pushedToRemote = gitPush(sandboxPath, branchName);
+    // Re-authenticate for push using the GitHub token.
+    const pushUrl = githubToken
+      ? `https://x-access-token:${githubToken}@github.com/${spec.repository.githubRepo}.git`
+      : `https://github.com/${spec.repository.githubRepo}.git`;
+    pushedToRemote = gitPush(sandboxPath, branchName, pushUrl);
+    // After push, remove the credential from .git/config.
+    if (githubToken) {
+      gitExec(sandboxPath, ["remote", "set-url", "origin", `https://github.com/${spec.repository.githubRepo}.git`]);
+    }
     console.log(`[worker] Push: ${pushedToRemote ? "success" : "failed"}`);
   }
 

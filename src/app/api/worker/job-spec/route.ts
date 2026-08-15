@@ -143,15 +143,8 @@ export async function POST(req: Request) {
             }
           } catch {}
         }
-        // Default plan for Node.js projects.
-        return {
-          runtime: "node",
-          packageManager: "npm",
-          install: ["npm install --silent"],
-          unit: ["npm test -- --json --silent"],
-          build: ["npm run build"],
-          static: ["npm run lint"],
-        };
+        // P11B: No default plan — return null. Worker will BLOCK if missing.
+        return null;
       })(),
 
       // P10-1: Base commit SHA for dependent tasks.
