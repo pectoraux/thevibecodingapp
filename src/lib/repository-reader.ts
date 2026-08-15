@@ -124,6 +124,11 @@ export interface RepoSnapshot {
   unreadableFiles: UnreadableFile[];
   /** Non-null when the snapshot itself is unverified (extraction error, limits exceeded, invalid archive). */
   snapshotError: string | null;
+  // --- Phase 17F: Evidence clarity — distinguish paths from unique files ---
+  /** Total repository paths examined (including symlinks, before dedup). */
+  repositoryPathsExamined: number;
+  /** Unique underlying files actually scanned (after dedup by realpath). */
+  uniqueFilesScanned: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +260,7 @@ async function downloadAndExtractTarball(
   extractedFileCount: number;
   unreadableFiles: UnreadableFile[];
   snapshotError: string | null;
+  repositoryPathsExamined: number;
 }> {
   const tarballUrl = `https://api.github.com/repos/${owner}/${repo}/tarball/${sha}`;
 
@@ -330,6 +336,7 @@ async function downloadAndExtractTarball(
     // Phase 17C: Walk with fail-closed error tracking + resource limits.
     // Phase 17D: + repoRootRealpath for symlink containment.
     // Phase 17E: + visitedRealpaths/visitedFileRealpaths for cycle protection.
+    // Phase 17F: + repositoryPathsExamined for evidence clarity.
     const ctx: WalkContext = {
       files: [],
       unreadableFiles: [],
@@ -340,6 +347,7 @@ async function downloadAndExtractTarball(
       repoRootRealpath: null, // Set after topDir is validated below.
       visitedRealpaths: new Set<string>(),
       visitedFileRealpaths: new Set<string>(),
+      repositoryPathsExamined: 0,
     };
 
     const extractedRoots = readdirSync(extractDir);
@@ -376,6 +384,7 @@ async function downloadAndExtractTarball(
         extractedFileCount: 0,
         unreadableFiles: ctx.unreadableFiles,
         snapshotError: `INVALID_ARCHIVE_STRUCTURE: unexpected top-level file(s) outside repository root: ${unexpectedTopLevelFiles.join(", ")}`,
+        repositoryPathsExamined: 0,
       };
     }
 
@@ -388,6 +397,7 @@ async function downloadAndExtractTarball(
         extractedFileCount: 0,
         unreadableFiles: ctx.unreadableFiles,
         snapshotError: "Invalid archive: no top-level repository directory found after extraction",
+        repositoryPathsExamined: 0,
       };
     }
 
@@ -400,6 +410,7 @@ async function downloadAndExtractTarball(
         extractedFileCount: 0,
         unreadableFiles: ctx.unreadableFiles,
         snapshotError: `INVALID_ARCHIVE_STRUCTURE: multiple top-level repository directories found: ${rootDirs.join(", ")}`,
+        repositoryPathsExamined: 0,
       };
     }
 
@@ -417,6 +428,7 @@ async function downloadAndExtractTarball(
         extractedFileCount: 0,
         unreadableFiles: ctx.unreadableFiles,
         snapshotError: `Failed to resolve repository root realpath: ${err.message ?? String(err)}`,
+        repositoryPathsExamined: 0,
       };
     }
 
@@ -439,6 +451,7 @@ async function downloadAndExtractTarball(
       extractedFileCount: ctx.extractedFileCount,
       unreadableFiles: ctx.unreadableFiles,
       snapshotError,
+      repositoryPathsExamined: ctx.repositoryPathsExamined,
     };
   } finally {
     // Clean up temp directory.
@@ -461,6 +474,8 @@ interface WalkContext {
   visitedRealpaths: Set<string>;
   /** Phase 17E: Set of visited file realpaths — prevents duplicate scanning via multiple symlinks. */
   visitedFileRealpaths: Set<string>;
+  /** Phase 17F: Total repository paths examined (including symlinks, before dedup). */
+  repositoryPathsExamined: number;
 }
 
 /**
@@ -624,6 +639,10 @@ function readFileEntry(
   stat: { size: number },
   ctx: WalkContext
 ): void {
+  // Phase 17F: Count every repository path examined (before dedup).
+  // This distinguishes "repository paths examined" from "unique files scanned".
+  ctx.repositoryPathsExamined++;
+
   // Phase 17E: Deduplicate by canonical realpath.
   // Multiple symlinks to the same file should only scan it once.
   let fileRealpath: string;
@@ -640,6 +659,8 @@ function readFileEntry(
 
   if (ctx.visitedFileRealpaths.has(fileRealpath)) {
     // Already scanned this file (via another path or symlink) — skip.
+    // Note: repositoryPathsExamined was already incremented above, so the
+    // evidence will show this path was examined but not uniquely scanned.
     return;
   }
 
@@ -820,6 +841,9 @@ async function readGitHubSnapshot(
       extractedFileCount: tarballResult.extractedFileCount,
       unreadableFiles: tarballResult.unreadableFiles,
       snapshotError: tarballResult.snapshotError,
+      // Phase 17F: Evidence clarity — paths examined vs unique files scanned.
+      repositoryPathsExamined: tarballResult.repositoryPathsExamined,
+      uniqueFilesScanned: tarballResult.extractedFileCount,
     };
   }
 
@@ -880,6 +904,9 @@ async function readGitHubSnapshot(
     extractedFileCount: files.length,
     unreadableFiles: [],
     snapshotError: null,
+    // Phase 17F: Trees API path — paths = unique files (no dedup at this layer).
+    repositoryPathsExamined: files.length,
+    uniqueFilesScanned: files.length,
   };
 }
 
@@ -1017,6 +1044,9 @@ async function readLocalSnapshot(projectId: string): Promise<RepoSnapshot> {
     extractedFileCount: fileMap.size,
     unreadableFiles: [],
     snapshotError: "LOCAL_ONLY — no canonical repository to extract",
+    // Phase 17F: LOCAL_ONLY — paths = unique files (evidence-derived, no dedup).
+    repositoryPathsExamined: fileMap.size,
+    uniqueFilesScanned: fileMap.size,
   };
 }
 
@@ -1049,6 +1079,9 @@ function emptySnapshot(
     extractedFileCount: 0,
     unreadableFiles: [],
     snapshotError: reason,
+    // Phase 17F: empty snapshot — zero paths/files.
+    repositoryPathsExamined: 0,
+    uniqueFilesScanned: 0,
   };
 }
 

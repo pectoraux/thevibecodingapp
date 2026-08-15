@@ -170,6 +170,10 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
           extractedFileCount: repo.extractedFileCount,
           unreadableFiles: repo.unreadableFiles,
           snapshotError: repo.snapshotError,
+          // Phase 17F: Evidence clarity — paths examined vs unique files scanned.
+          // repositoryPathsExamined >= uniqueFilesScanned when symlinks cause dedup.
+          repositoryPathsExamined: repo.repositoryPathsExamined,
+          uniqueFilesScanned: repo.uniqueFilesScanned,
         },
         failureReason: !passed
           ? repo.snapshotError
@@ -544,6 +548,8 @@ export async function runReadinessGate(projectId: string): Promise<{
         extractedFileCount: 0,
         unreadableFiles: [],
         snapshotError: "Project not found",
+        repositoryPathsExamined: 0,
+        uniqueFilesScanned: 0,
       };
 
   // --- Scan the complete repository content ---
@@ -635,6 +641,8 @@ export async function runReadinessGate(projectId: string): Promise<{
       extractedBytes: repo.extractedBytes,
       extractedFileCount: repo.extractedFileCount,
       unreadableFiles: repo.unreadableFiles,
+      repositoryPathsExamined: repo.repositoryPathsExamined,
+      uniqueFilesScanned: repo.uniqueFilesScanned,
       truncated: repo.truncated,
       scanSummary: {
         totalFiles: scanSummary.totalFiles,

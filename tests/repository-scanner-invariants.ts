@@ -1005,10 +1005,79 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 }
 
 // ===========================================================================
+// PHASE 17F: Evidence clarity — paths examined vs unique files scanned
+// ===========================================================================
+
+// Test 76: RepoSnapshot has repositoryPathsExamined field.
+{
+  const hasField = reader.includes("repositoryPathsExamined: number");
+  record(
+    "RepoSnapshot has repositoryPathsExamined field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 77: RepoSnapshot has uniqueFilesScanned field.
+{
+  const hasField = reader.includes("uniqueFilesScanned: number");
+  record(
+    "RepoSnapshot has uniqueFilesScanned field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 78: WalkContext tracks repositoryPathsExamined.
+{
+  const hasField = reader.includes("repositoryPathsExamined: number") && reader.includes("ctx.repositoryPathsExamined++");
+  record(
+    "WalkContext tracks repositoryPathsExamined (incremented in readFileEntry before dedup)",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 79: Tarball return path sets both evidence fields.
+{
+  const setsPaths = reader.includes("repositoryPathsExamined: tarballResult.repositoryPathsExamined");
+  const setsUnique = reader.includes("uniqueFilesScanned: tarballResult.extractedFileCount");
+  record(
+    "Tarball return sets repositoryPathsExamined + uniqueFilesScanned",
+    setsPaths && setsUnique,
+    `setsPaths: ${setsPaths}, setsUnique: ${setsUnique}`
+  );
+}
+
+// Test 80: Readiness evidence includes both fields.
+{
+  const hasPaths = readiness.includes("repositoryPathsExamined: repo.repositoryPathsExamined");
+  const hasUnique = readiness.includes("uniqueFilesScanned: repo.uniqueFilesScanned");
+  record(
+    "readiness evidence includes repositoryPathsExamined + uniqueFilesScanned",
+    hasPaths && hasUnique,
+    `hasPaths: ${hasPaths}, hasUnique: ${hasUnique}`
+  );
+}
+
+// Test 81: Build event payload includes both fields.
+{
+  const hasPaths = readiness.includes("repositoryPathsExamined: repo.repositoryPathsExamined");
+  const hasUnique = readiness.includes("uniqueFilesScanned: repo.uniqueFilesScanned");
+  const inPayload = readiness.includes("repositoryPathsExamined: repo.repositoryPathsExamined") &&
+    readiness.includes("uniqueFilesScanned: repo.uniqueFilesScanned");
+  record(
+    "build event payload includes repositoryPathsExamined + uniqueFilesScanned",
+    inPayload,
+    `inPayload: ${inPayload}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 17E: Symlink Cycle Protection + File Deduplication ===\n");
+console.log("=== Forge Phase 17F: Evidence Clarity (Paths vs Unique Files) ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {
