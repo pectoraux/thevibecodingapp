@@ -177,11 +177,11 @@ function testWorkerAuthModule() {
 // --- Test 6: Version endpoint must report current version ---
 function testVersionString() {
   const content = readFile("src/app/api/version/route.ts");
-  const hasPhase12 = content.includes('"phase15"') || content.includes("'phase15'");
+  const hasPhase12 = content.includes('"phase15a"') || content.includes("'phase15a'");
   results.push({
-    name: "Version endpoint reports phase15",
+    name: "Version endpoint reports phase15a",
     passed: hasPhase12,
-    details: hasPhase12 ? "Version is phase15" : "Version is NOT phase15 — stale string",
+    details: hasPhase12 ? "Version is phase15a" : "Version is NOT phase15a — stale string",
   });
 }
 

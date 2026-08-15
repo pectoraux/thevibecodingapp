@@ -20,7 +20,7 @@ import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runS
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase15";
+const WORKER_VERSION = "phase15a";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
@@ -322,6 +322,7 @@ Generate the implementation files. Respond with ONLY JSON:
       reviewResult: { verdict: "REJECTED", summary: "Verification failed", findings: [] },
       filesChanged: filesChanged.map((f) => f.path),
       pushedToRemote: false,
+      branchName: null,
       implementationLog: `BLOCKED: VerificationPlan phase failed`,
     };
   }
@@ -395,6 +396,7 @@ Generate the implementation files. Respond with ONLY JSON:
     reviewResult,
     filesChanged: filesChanged.map((f) => f.path),
     pushedToRemote,
+    branchName,
     implementationLog: `Executed in sandbox. Branch: ${branchName}. Commit: ${commitSha?.slice(0, 7) || "none"}. Pushed: ${pushedToRemote}. Deterministic: ${deterministicGuardianResult.verdict}. Semantic: ${semanticGuardianResult.verdict}.`,
   };
 }
@@ -408,6 +410,7 @@ function blocked(summary: string, log: string): any {
     reviewResult: { verdict: "REJECTED", summary: summary, findings: [] },
     filesChanged: [],
     pushedToRemote: false,
+    branchName: null,
     implementationLog: `BLOCKED: ${log}`,
   };
 }
@@ -433,6 +436,8 @@ async function workerLoop(): Promise<void> {
             taskId: job.taskId, projectId: job.projectId,
             commitSha: result.commitSha,
             pushedToRemote: result.pushedToRemote || false,
+            branchName: result.branchName,
+            baseCommitSha: spec.baseCommitSha || null,
             testResults: result.testResults,
             guardianResult: result.guardianResult,
             reviewResult: result.reviewResult,
