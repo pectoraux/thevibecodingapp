@@ -1299,3 +1299,56 @@ Stage Summary:
 - SCANNER SEPARATION: reader obtains snapshot, scanner inspects content. Reader does not import scanner.
 - The readiness gate now has a trustworthy chain: GitHub integration HEAD → exact immutable SHA → complete tarball → deterministic scanner → readiness evidence.
 - Not yet done: scoped GitHub credentials (still uses process.env.GITHUB_PAT), runtime verification, E2E, production sandbox. These are future phases.
+
+---
+Task ID: 17B
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17B — Harden repository snapshot limits and completeness. Three final correctness fixes: (1) streaming byte accounting for tarball download, (2) reframe truncation check to snapshot completeness semantics, (3) reorder scanner to classify binary before size check.
+
+Work Log:
+- Read worklog.md (Phase 17A entry) and verified all three user claims against real source.
+- VERIFIED CLAIM 1 (Content-Length only): TRUE — lines 235-238 checked contentLength from response headers but the streaming pipe (lines 240-248) had no byte counter. If Content-Length was missing (0 from `|| "0"`), the check passed and the full body streamed to disk.
+- VERIFIED CLAIM 2 (truncation check meaningless for readiness): TRUE — downloadAndExtractTarball() always returned truncated: false. The readiness check "Repository tree is not truncated" always passed for the tarball path, giving a false impression of independent validation.
+- VERIFIED CLAIM 3 (size before binary classification): TRUE — scanFile() lines 200-211 checked bytes > MAX_SCANNABLE_BYTES BEFORE classifyFile() at line 213. A 5MB PNG was marked unverified_too_large instead of recognized binary.
+- Fix 1: Streaming byte accounting in repository-reader.ts:
+  * Removed the Content-Length-only check entirely.
+  * Added a byte counter: every 'data' chunk increments bytesDownloaded. When it exceeds MAX_TARBALL_SIZE (200MB), both nodeStream and writeStream are destroyed and the download is aborted with a size-limit error.
+  * The limit is now enforced on the actual byte stream, not a header that may be missing.
+- Fix 2: Complete-snapshot semantics in repository-reader.ts + readiness.ts:
+  * Added snapshotSource field to RepoSnapshot: "GITHUB_TARBALL" | "GITHUB_TREES_API" | "LOCAL_EVIDENCE".
+  * Added snapshotComplete field: true for GITHUB_TARBALL (tarball is always complete), !truncated for GITHUB_TREES_API, false for LOCAL_EVIDENCE.
+  * Renamed readiness check from "Repository tree is not truncated" to "Repository snapshot is complete and verified".
+  * Evidence now includes snapshotSource, repositoryHeadSha, complete, truncated.
+  * The old truncated field is kept for UI diagnostics (Trees API path).
+  * Updated all return paths: emptySnapshot, LOCAL_ONLY, tarball path, Trees API path.
+- Fix 3: Reorder scanFile() in repository-scanner.ts:
+  * classifyFile() now called BEFORE the size check.
+  * Large binaries (PNG, PDF, etc.) are recognized as "binary" and skipped from text scan — NOT marked UNVERIFIED.
+  * Large text/source/config files (>1MB) are still marked UNVERIFIED (fail-closed for files that could contain secrets).
+  * Large unknown files with binary content (null bytes) are classified as binary, not UNVERIFIED.
+  * UNVERIFIED reason now says "Text file is..." (not generic "File is...").
+- Updated tests/repository-scanner-invariants.ts:
+  * Test 8 updated: large TEXT file → UNVERIFIED (was: any large file)
+  * NEW Test 8b: large BINARY file → classified binary (NOT UNVERIFIED)
+  * NEW Test 8c: large binary-content file without extension → binary
+  * Test 9 updated: large text → UNVERIFIED, large binary → binary
+  * Test 21 updated: "Repository snapshot is complete and verified"
+  * NEW Test 30: streaming byte limit (bytesDownloaded, no Content-Length)
+  * NEW Test 31: streams destroyed when limit exceeded
+  * NEW Test 32: RepoSnapshot has snapshotSource field
+  * NEW Test 33: RepoSnapshot has snapshotComplete field
+  * NEW Test 34: readiness uses snapshotComplete + snapshotSource
+  * NEW Test 35: scanner classifyFile() before size check (order verified by index)
+  * NEW Test 36: UNVERIFIED reason specifies "Text file"
+- Ran full test suite: scanner 38/38, readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 155 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as 001290a. Pushed to origin main (b9718ad..001290a). Verified local == remote == 001290a1a2effdcf2f70e408c38a34fd3d6200e3.
+
+Stage Summary:
+- CANONICAL: GitHub main = 001290a, Local = 001290a (MATCH). Deployed = unverified from sandbox.
+- TAR LIMIT: enforced on actual byte stream (bytesDownloaded counter), not Content-Length header. Streams destroyed when limit exceeded.
+- SNAPSHOT COMPLETENESS: snapshotSource (GITHUB_TARBALL | GITHUB_TREES_API | LOCAL_EVIDENCE) + snapshotComplete recorded in evidence. Readiness check reframed to "Repository snapshot is complete and verified".
+- FILE CLASSIFICATION: binary classified before size check. Large binaries → recognized binary (not UNVERIFIED). Large text → UNVERIFIED (fail-closed). Large unknown with binary content → binary.
+- The repository readiness chain is now: GitHub integration HEAD → exact immutable SHA (freshness-verified) → complete tarball (streaming byte-limited) → deterministic scanner (binary-first classification) → readiness evidence (with exact SHA + snapshotSource).
+- Ready for runtime verification as the next milestone.
