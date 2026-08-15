@@ -122,7 +122,7 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
   {
     category: ReadinessCategory.BUILD,
     name: "Canonical HEAD is fresh (matches GitHub branch HEAD)",
-    description: "The cached canonicalHeadSha must equal the actual GitHub integration branch HEAD.",
+    description: "The cached canonicalHeadSha must equal the actual GitHub integration branch HEAD. This is the repositoryRevisionVerified check — distinct from snapshot extraction completeness.",
     required: true,
     check: async (_projectId, repo) => {
       if (repo.mode !== "GITHUB_BACKED") {
@@ -130,7 +130,14 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
       }
       return {
         passed: repo.headVerified,
-        evidence: { head: repo.head, headVerified: repo.headVerified, note: repo.headVerificationNote },
+        evidence: {
+          repositoryHeadSha: repo.head,
+          headVerified: repo.headVerified,
+          headVerificationNote: repo.headVerificationNote,
+          // Phase 17D: Explicit terminology — this checks canonical-revision authority,
+          // NOT extraction completeness (which is checked separately as snapshotComplete).
+          authorityType: "REPOSITORY_REVISION_VERIFIED",
+        },
         failureReason: !repo.headVerified
           ? repo.headVerificationNote ?? "Canonical HEAD verification failed"
           : undefined,
@@ -140,7 +147,7 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
   {
     category: ReadinessCategory.BUILD,
     name: "Repository snapshot is complete and verified",
-    description: "The readiness gate must scan a complete repository snapshot at an exact immutable SHA with no unreadable files or extraction errors.",
+    description: "The readiness gate must scan a complete repository snapshot at an exact immutable SHA with no unreadable files, no symlink escapes, and no extraction errors. This is the snapshotCompleteness check — distinct from canonical-revision authority.",
     required: true,
     check: async (_projectId, repo) => {
       const passed =
@@ -152,7 +159,11 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
         evidence: {
           snapshotSource: repo.snapshotSource,
           repositoryHeadSha: repo.head,
+          // Phase 17D: Explicit distinction — snapshotComplete = extraction succeeded,
+          // NOT canonical-revision authority (which is headVerified, checked separately).
+          // Readiness requires BOTH: headVerified AND snapshotComplete.
           complete: repo.snapshotComplete,
+          authorityAlsoRequired: "headVerified (checked in Canonical HEAD freshness check)",
           truncated: repo.truncated,
           downloadedBytes: repo.downloadedBytes,
           extractedBytes: repo.extractedBytes,

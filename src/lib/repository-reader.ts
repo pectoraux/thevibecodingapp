@@ -29,7 +29,7 @@
 import { db } from "@/lib/db";
 import { Readable } from "node:stream";
 import { createGunzip } from "node:zlib";
-import { createWriteStream, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createWriteStream, mkdirSync, readdirSync, readFileSync, rmSync, statSync, lstatSync, realpathSync } from "node:fs";
 import { join, dirname } from "node:path";
 import * as tar from "tar";
 
@@ -328,6 +328,7 @@ async function downloadAndExtractTarball(
     });
 
     // Phase 17C: Walk with fail-closed error tracking + resource limits.
+    // Phase 17D: + repoRootRealpath for symlink containment.
     const ctx: WalkContext = {
       files: [],
       unreadableFiles: [],
@@ -335,22 +336,26 @@ async function downloadAndExtractTarball(
       extractedFileCount: 0,
       limitExceeded: false,
       limitExceededReason: null,
+      repoRootRealpath: null, // Set after topDir is validated below.
     };
 
     const extractedRoots = readdirSync(extractDir);
 
-    // GitHub tarballs extract to a single top-level directory like
-    // "owner-repo-sha/". We need to strip that prefix.
-    let topDir: string | null = null;
+    // Phase 17D: Archive root validation.
+    // GitHub tarballs extract to a SINGLE top-level directory like "owner-repo-sha/".
+    // Validate that there is exactly one root directory and no unexpected top-level files.
+    const rootDirs: string[] = [];
+    const unexpectedTopLevelFiles: string[] = [];
     for (const d of extractedRoots) {
       try {
         const stat = statSync(join(extractDir, d));
         if (stat.isDirectory()) {
-          topDir = d;
-          break;
+          rootDirs.push(d);
+        } else {
+          // Phase 17D: Unexpected top-level file (outside the repo root directory).
+          unexpectedTopLevelFiles.push(d);
         }
       } catch (err: any) {
-        // Phase 17C: stat failure on top-level entry is a snapshot error.
         ctx.unreadableFiles.push({
           path: d,
           operation: "stat",
@@ -359,7 +364,19 @@ async function downloadAndExtractTarball(
       }
     }
 
-    if (!topDir) {
+    if (unexpectedTopLevelFiles.length > 0) {
+      // Phase 17D: Unexpected top-level files → invalid archive structure.
+      return {
+        files: [],
+        downloadedBytes,
+        extractedBytes: 0,
+        extractedFileCount: 0,
+        unreadableFiles: ctx.unreadableFiles,
+        snapshotError: `INVALID_ARCHIVE_STRUCTURE: unexpected top-level file(s) outside repository root: ${unexpectedTopLevelFiles.join(", ")}`,
+      };
+    }
+
+    if (rootDirs.length === 0) {
       // Phase 17C: No valid repository root → invalid archive.
       return {
         files: [],
@@ -371,7 +388,35 @@ async function downloadAndExtractTarball(
       };
     }
 
+    if (rootDirs.length > 1) {
+      // Phase 17D: Multiple root directories → invalid archive structure.
+      return {
+        files: [],
+        downloadedBytes,
+        extractedBytes: 0,
+        extractedFileCount: 0,
+        unreadableFiles: ctx.unreadableFiles,
+        snapshotError: `INVALID_ARCHIVE_STRUCTURE: multiple top-level repository directories found: ${rootDirs.join(", ")}`,
+      };
+    }
+
+    const topDir = rootDirs[0];
     const repoRoot = join(extractDir, topDir);
+
+    // Phase 17D: Resolve the real path of the repository root for symlink containment.
+    try {
+      ctx.repoRootRealpath = realpathSync(repoRoot);
+    } catch (err: any) {
+      return {
+        files: [],
+        downloadedBytes,
+        extractedBytes: 0,
+        extractedFileCount: 0,
+        unreadableFiles: ctx.unreadableFiles,
+        snapshotError: `Failed to resolve repository root realpath: ${err.message ?? String(err)}`,
+      };
+    }
+
     walkDirectory(repoRoot, "", ctx);
 
     // Phase 17C: Determine snapshot error.
@@ -407,16 +452,27 @@ interface WalkContext {
   extractedFileCount: number;
   limitExceeded: boolean;
   limitExceededReason: string | null;
+  /** Phase 17D: Resolved real path of the repository root for symlink containment. */
+  repoRootRealpath: string | null;
 }
 
 /**
- * Phase 17C: Walk the extracted directory and read all files.
+ * Phase 17D: Walk the extracted directory and read all files.
  *
  * FAIL-CLOSED: readdir/stat/readFile failures are recorded in ctx.unreadableFiles.
  * They are NOT silently skipped. Any unreadable file makes snapshotComplete = false.
  *
  * RESOURCE LIMITS: extracted bytes and file count are tracked. If either limit
  * is exceeded, walking stops and ctx.limitExceeded is set.
+ *
+ * Phase 17D HARDENING:
+ *   1. PRE-READ SIZE CHECK — stat.size is checked BEFORE readFileSync. A file
+ *      larger than the remaining aggregate budget is rejected without being
+ *      loaded into memory.
+ *   2. SYMLINK CONTAINMENT — lstatSync detects symlinks. realpathSync resolves
+ *      the target. If the target escapes the repository root, the entry is
+ *      recorded as untrusted and snapshotComplete = false. Symlinks are NEVER
+ *      followed outside the extraction root.
  */
 function walkDirectory(
   basePath: string,
@@ -449,11 +505,11 @@ function walkDirectory(
     // Skip .git directory — we don't scan git internals.
     if (entry === ".git") continue;
 
-    let stat;
+    // Phase 17D: Use lstatSync (not statSync) to detect symlinks without following.
+    let lstat;
     try {
-      stat = statSync(entryFull);
+      lstat = lstatSync(entryFull);
     } catch (err: any) {
-      // Phase 17C: stat failure is an unreadable file.
       ctx.unreadableFiles.push({
         path: entryRelative,
         operation: "stat",
@@ -462,36 +518,111 @@ function walkDirectory(
       continue;
     }
 
-    if (stat.isDirectory()) {
-      walkDirectory(basePath, entryRelative, ctx);
-    } else if (stat.isFile()) {
-      // Phase 17C: Check file-count limit before reading.
-      if (ctx.extractedFileCount >= MAX_EXTRACTED_FILES) {
+    // Phase 17D: Symlink containment check.
+    if (lstat.isSymbolicLink()) {
+      let resolvedTarget: string | null = null;
+      try {
+        resolvedTarget = realpathSync(entryFull);
+      } catch (err: any) {
+        ctx.unreadableFiles.push({
+          path: entryRelative,
+          operation: "stat",
+          error: `Symlink resolution failed: ${err.message ?? String(err)}`,
+        });
+        continue;
+      }
+
+      // The repo root is ctx.repoRootRealpath (resolved once at the start).
+      // If the symlink target is not inside the repo root, reject it.
+      if (ctx.repoRootRealpath && !resolvedTarget.startsWith(ctx.repoRootRealpath + "/") && resolvedTarget !== ctx.repoRootRealpath) {
+        ctx.unreadableFiles.push({
+          path: entryRelative,
+          operation: "stat",
+          error: `SYMLINK_ESCAPE: symlink target ${resolvedTarget} is outside repository root ${ctx.repoRootRealpath}`,
+        });
+        // Symlink escape is a security violation — mark as snapshot error.
         ctx.limitExceeded = true;
-        ctx.limitExceededReason = `Exceeded MAX_EXTRACTED_FILES limit (${MAX_EXTRACTED_FILES}) at file: ${entryRelative}`;
+        ctx.limitExceededReason = `SYMLINK_ESCAPE at ${entryRelative}: target outside repository root`;
         return;
       }
 
+      // Symlink points inside the repo — follow it (statSync follows symlinks).
+      // This is safe because we've verified the target is contained.
       try {
-        const content = readFileSync(entryFull);
-        // Phase 17C: Check extracted-bytes limit.
-        if (ctx.extractedBytes + content.length > MAX_EXTRACTED_BYTES) {
-          ctx.limitExceeded = true;
-          ctx.limitExceededReason = `Exceeded MAX_EXTRACTED_BYTES limit (${MAX_EXTRACTED_BYTES}) at file: ${entryRelative}`;
-          return;
+        const followedStat = statSync(entryFull);
+        if (followedStat.isDirectory()) {
+          walkDirectory(basePath, entryRelative, ctx);
+        } else if (followedStat.isFile()) {
+          readFileEntry(entryFull, entryRelative, followedStat, ctx);
         }
-        ctx.files.push({ path: entryRelative, content });
-        ctx.extractedBytes += content.length;
-        ctx.extractedFileCount++;
       } catch (err: any) {
-        // Phase 17C: readFile failure is an unreadable file.
         ctx.unreadableFiles.push({
           path: entryRelative,
-          operation: "readFile",
-          error: err.message ?? String(err),
+          operation: "stat",
+          error: `Symlink follow failed: ${err.message ?? String(err)}`,
         });
       }
+      continue;
     }
+
+    // Normal entry (not a symlink).
+    if (lstat.isDirectory()) {
+      walkDirectory(basePath, entryRelative, ctx);
+    } else if (lstat.isFile()) {
+      readFileEntry(entryFull, entryRelative, lstat, ctx);
+    }
+  }
+}
+
+/**
+ * Phase 17D: Read a single file with pre-read size check.
+ *
+ * The file size (from stat) is checked BEFORE readFileSync. If the file would
+ * exceed the remaining aggregate budget, it is rejected without being loaded
+ * into memory. This prevents a single large file from causing an unbounded
+ * memory allocation.
+ */
+function readFileEntry(
+  entryFull: string,
+  entryRelative: string,
+  stat: { size: number },
+  ctx: WalkContext
+): void {
+  // Phase 17C: Check file-count limit before reading.
+  if (ctx.extractedFileCount >= MAX_EXTRACTED_FILES) {
+    ctx.limitExceeded = true;
+    ctx.limitExceededReason = `Exceeded MAX_EXTRACTED_FILES limit (${MAX_EXTRACTED_FILES}) at file: ${entryRelative}`;
+    return;
+  }
+
+  // Phase 17D: PRE-READ SIZE CHECK.
+  // Check stat.size BEFORE readFileSync to avoid loading a file larger than
+  // the remaining aggregate budget into memory.
+  if (ctx.extractedBytes + stat.size > MAX_EXTRACTED_BYTES) {
+    ctx.limitExceeded = true;
+    ctx.limitExceededReason = `File ${entryRelative} is ${stat.size} bytes; remaining budget ${MAX_EXTRACTED_BYTES - ctx.extractedBytes} bytes — would exceed MAX_EXTRACTED_BYTES limit (${MAX_EXTRACTED_BYTES})`;
+    return;
+  }
+
+  try {
+    const content = readFileSync(entryFull);
+    // Double-check after read (stat.size may differ from actual content.length
+    // in edge cases, e.g. file changed between stat and read).
+    if (ctx.extractedBytes + content.length > MAX_EXTRACTED_BYTES) {
+      ctx.limitExceeded = true;
+      ctx.limitExceededReason = `File ${entryRelative} content is ${content.length} bytes — exceeded MAX_EXTRACTED_BYTES limit (${MAX_EXTRACTED_BYTES}) after read`;
+      return;
+    }
+    ctx.files.push({ path: entryRelative, content });
+    ctx.extractedBytes += content.length;
+    ctx.extractedFileCount++;
+  } catch (err: any) {
+    // Phase 17C: readFile failure is an unreadable file.
+    ctx.unreadableFiles.push({
+      path: entryRelative,
+      operation: "readFile",
+      error: err.message ?? String(err),
+    });
   }
 }
 

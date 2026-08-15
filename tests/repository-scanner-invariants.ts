@@ -760,10 +760,158 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 }
 
 // ===========================================================================
+// PHASE 17D: Memory + filesystem boundary hardening
+// ===========================================================================
+
+// Test 54: Pre-read size check — stat.size checked BEFORE readFileSync.
+{
+  const hasPreReadCheck = reader.includes("ctx.extractedBytes + stat.size > MAX_EXTRACTED_BYTES");
+  const hasReadFileEntry = reader.includes("function readFileEntry");
+  const preReadBeforeRead = reader.indexOf("ctx.extractedBytes + stat.size > MAX_EXTRACTED_BYTES") <
+    reader.indexOf("const content = readFileSync(entryFull)");
+  record(
+    "Pre-read size check: stat.size checked BEFORE readFileSync (no unbounded allocation)",
+    hasPreReadCheck && hasReadFileEntry && preReadBeforeRead,
+    `hasPreReadCheck: ${hasPreReadCheck}, hasReadFileEntry: ${hasReadFileEntry}, preReadBeforeRead: ${preReadBeforeRead}`
+  );
+}
+
+// Test 55: readFileEntry extracted as separate function (pre-read check isolation).
+{
+  const hasFunction = reader.includes("function readFileEntry(");
+  record(
+    "readFileEntry is a separate function with pre-read size enforcement",
+    hasFunction,
+    `hasFunction: ${hasFunction}`
+  );
+}
+
+// Test 56: lstatSync used (not statSync) for symlink detection.
+{
+  const usesLstat = reader.includes("lstatSync(entryFull)");
+  const hasSymlinkCheck = reader.includes("lstat.isSymbolicLink()");
+  record(
+    "walkDirectory uses lstatSync (not statSync) + checks isSymbolicLink()",
+    usesLstat && hasSymlinkCheck,
+    `usesLstat: ${usesLstat}, hasSymlinkCheck: ${hasSymlinkCheck}`
+  );
+}
+
+// Test 57: realpathSync used for symlink containment.
+{
+  const usesRealpath = reader.includes("realpathSync(entryFull)");
+  const hasRepoRootRealpath = reader.includes("ctx.repoRootRealpath");
+  record(
+    "Symlink containment: realpathSync resolves target + repoRootRealpath for boundary",
+    usesRealpath && hasRepoRootRealpath,
+    `usesRealpath: ${usesRealpath}, hasRepoRootRealpath: ${hasRepoRootRealpath}`
+  );
+}
+
+// Test 58: SYMLINK_ESCAPE detection and rejection.
+{
+  const hasEscapeDetection = reader.includes("SYMLINK_ESCAPE");
+  const escapeBlocksSnapshot = reader.includes("ctx.limitExceeded = true") &&
+    reader.includes("SYMLINK_ESCAPE at");
+  record(
+    "SYMLINK_ESCAPE detected → snapshot blocked (limitExceeded = true)",
+    hasEscapeDetection && escapeBlocksSnapshot,
+    `hasEscapeDetection: ${hasEscapeDetection}, escapeBlocksSnapshot: ${escapeBlocksSnapshot}`
+  );
+}
+
+// Test 59: Symlink target containment check against repo root.
+{
+  const hasContainmentCheck = reader.includes("resolvedTarget.startsWith(ctx.repoRootRealpath");
+  record(
+    "Symlink target checked against repoRootRealpath (containment enforced)",
+    hasContainmentCheck,
+    `hasContainmentCheck: ${hasContainmentCheck}`
+  );
+}
+
+// Test 60: Archive root validation — exactly one root directory.
+{
+  const hasRootDirs = reader.includes("rootDirs");
+  const hasMultipleRootsCheck = reader.includes("rootDirs.length > 1");
+  const hasMultipleRootsError = reader.includes("INVALID_ARCHIVE_STRUCTURE: multiple top-level");
+  record(
+    "Archive root validation: multiple top-level directories → INVALID_ARCHIVE_STRUCTURE",
+    hasRootDirs && hasMultipleRootsCheck && hasMultipleRootsError,
+    `hasRootDirs: ${hasRootDirs}, hasMultipleRootsCheck: ${hasMultipleRootsCheck}, hasMultipleRootsError: ${hasMultipleRootsError}`
+  );
+}
+
+// Test 61: Unexpected top-level files → INVALID_ARCHIVE_STRUCTURE.
+{
+  const hasUnexpectedFiles = reader.includes("unexpectedTopLevelFiles");
+  const hasUnexpectedFilesError = reader.includes("INVALID_ARCHIVE_STRUCTURE: unexpected top-level file");
+  record(
+    "Unexpected top-level files → INVALID_ARCHIVE_STRUCTURE",
+    hasUnexpectedFiles && hasUnexpectedFilesError,
+    `hasUnexpectedFiles: ${hasUnexpectedFiles}, hasUnexpectedFilesError: ${hasUnexpectedFilesError}`
+  );
+}
+
+// Test 62: repoRootRealpath resolved via realpathSync after root validation.
+{
+  const resolvesAfterValidation = reader.includes("ctx.repoRootRealpath = realpathSync(repoRoot)");
+  record(
+    "repoRootRealpath resolved via realpathSync after archive root validation",
+    resolvesAfterValidation,
+    `resolvesAfterValidation: ${resolvesAfterValidation}`
+  );
+}
+
+// Test 63: Readiness evidence distinguishes headVerified from snapshotComplete.
+{
+  const hasAuthorityType = readiness.includes("authorityType: \"REPOSITORY_REVISION_VERIFIED\"");
+  const hasAuthorityAlsoRequired = readiness.includes("authorityAlsoRequired: \"headVerified");
+  record(
+    "Readiness evidence distinguishes headVerified (authority) from snapshotComplete (extraction)",
+    hasAuthorityType && hasAuthorityAlsoRequired,
+    `hasAuthorityType: ${hasAuthorityType}, hasAuthorityAlsoRequired: ${hasAuthorityAlsoRequired}`
+  );
+}
+
+// Test 64: Readiness check description mentions symlink escapes.
+{
+  const mentionsSymlinkEscapes = readiness.includes("no symlink escapes");
+  record(
+    "Readiness check description mentions symlink escapes",
+    mentionsSymlinkEscapes,
+    `mentionsSymlinkEscapes: ${mentionsSymlinkEscapes}`
+  );
+}
+
+// Test 65: Canonical HEAD check description mentions distinction.
+{
+  const mentionsDistinction = readiness.includes("distinct from snapshot extraction completeness");
+  record(
+    "Canonical HEAD check description distinguishes from extraction completeness",
+    mentionsDistinction,
+    `mentionsDistinction: ${mentionsDistinction}`
+  );
+}
+
+// Test 66: No raw statSync used for entry traversal (lstatSync is the authority).
+{
+  // statSync may still be used for following safe symlinks, but the primary
+  // entry classification must use lstatSync.
+  const lstatForEntries = reader.includes("lstat = lstatSync(entryFull)");
+  const statForFollow = reader.includes("const followedStat = statSync(entryFull)");
+  record(
+    "Entry traversal uses lstatSync; statSync only for following contained symlinks",
+    lstatForEntries && statForFollow,
+    `lstatForEntries: ${lstatForEntries}, statForFollow: ${statForFollow}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 17C: Fail-Closed Repository Snapshot Completeness Invariants ===\n");
+console.log("=== Forge Phase 17D: Snapshot Memory + Filesystem Boundary Hardening ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {
