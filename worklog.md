@@ -1407,3 +1407,51 @@ Stage Summary:
 - FAIL-CLOSED: unreadable file → incomplete. Limit exceeded → incomplete. Invalid archive → incomplete. Empty extraction → incomplete.
 - The repository readiness chain is now genuinely fail-closed: GitHub HEAD → exact SHA → bounded download → bounded extraction → NO skipped files → valid archive → complete snapshot → scanner → readiness evidence.
 - Ready for runtime verification as the next milestone.
+
+---
+Task ID: 17D
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17D — Harden snapshot memory and filesystem boundaries. Four fixes: (1) pre-read file size check, (2) symlink/path containment, (3) headVerified vs snapshotComplete semantics, (4) archive root validation.
+
+Work Log:
+- Read worklog.md (Phase 17C entry) and verified all four user claims against the REAL on-disk source.
+- VERIFIED CLAIM 1 (pre-read size): TRUE — walkDirectory line 476 did readFileSync(entryFull) BEFORE line 478 checked ctx.extractedBytes + content.length > MAX_EXTRACTED_BYTES. A 2GB file would be fully loaded into memory before the limit check.
+- VERIFIED CLAIM 2 (symlink containment): TRUE — line 454 used statSync(entryFull) which follows symlinks. No lstatSync or realpathSync containment check existed. A symlink pointing outside the extraction root would be followed.
+- VERIFIED CLAIM 3 (semantics): TRUE — snapshotComplete was computed from snapshotError + unreadableFiles, but headVerified was separate. The evidence didn't make the distinction explicit.
+- VERIFIED CLAIM 4 (archive root validation): TRUE — lines 344-360 found the FIRST directory and used it. No validation of exactly one root, no detection of unexpected top-level files.
+- Fix 1: Extracted readFileEntry() as a separate function with pre-read size check:
+  * stat.size checked BEFORE readFileSync: if ctx.extractedBytes + stat.size > MAX_EXTRACTED_BYTES, reject without reading.
+  * Post-read double-check remains for edge cases (file changed between stat and read).
+  * No unbounded memory allocation for individual files.
+- Fix 2: Symlink/path containment:
+  * walkDirectory now uses lstatSync (not statSync) for entry classification — detects symlinks without following.
+  * For symlinks: realpathSync resolves the target. ctx.repoRootRealpath (resolved once at start) is the boundary.
+  * If target escapes repo root: SYMLINK_ESCAPE recorded, limitExceeded = true, walking stops.
+  * Safe internal symlinks (target inside repo) are followed via statSync.
+  * Added lstatSync, realpathSync to fs imports.
+  * Added repoRootRealpath to WalkContext interface.
+- Fix 3: headVerified vs snapshotComplete semantics:
+  * Canonical HEAD check evidence now records authorityType: "REPOSITORY_REVISION_VERIFIED".
+  * Snapshot completeness check evidence now records authorityAlsoRequired: "headVerified (checked in Canonical HEAD freshness check)".
+  * Check descriptions updated to mention the distinction.
+  * Readiness requires BOTH: headVerified AND snapshotComplete.
+- Fix 4: Archive root validation:
+  * After extraction, validates EXACTLY ONE top-level root directory.
+  * Zero roots → "Invalid archive: no top-level repository directory"
+  * Multiple roots → "INVALID_ARCHIVE_STRUCTURE: multiple top-level directories"
+  * Unexpected top-level files → "INVALID_ARCHIVE_STRUCTURE: unexpected top-level file(s)"
+  * All three make snapshotComplete = false.
+  * repoRootRealpath resolved via realpathSync AFTER root validation (before walkDirectory).
+- Added 13 new Phase 17D tests (Tests 54-66) in tests/repository-scanner-invariants.ts.
+- Ran full test suite: scanner 68/68, readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 185 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as 8ef366f. Pushed to origin main (aa5c586..8ef366f). Verified local == remote == 8ef366f0ae4846956c59e060461f0ff29dcacfcf.
+
+Stage Summary:
+- CANONICAL: GitHub main = 8ef366f, Local = 8ef366f (MATCH). Deployed = unverified from sandbox.
+- SNAPSHOT: pre-read size enforcement (stat.size before readFileSync), symlink containment (lstatSync + realpathSync + SYMLINK_ESCAPE), archive root validation (exactly one root, no unexpected files).
+- AUTHORITY: headVerified (REPOSITORY_REVISION_VERIFIED) explicitly distinguished from snapshotComplete (extraction completeness). Readiness requires BOTH.
+- RESOURCE LIMITS: tarball 200MB (streaming), extracted bytes 500MB (pre-read checked), file count 100k. All enforced before unbounded allocation.
+- The repository snapshot boundary is now hardened against: unbounded memory allocation, symlink escapes, invalid archive structures, and semantic conflation of authority with completeness.
+- Ready for runtime verification as the next milestone.
