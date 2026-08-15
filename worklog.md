@@ -1491,3 +1491,48 @@ Stage Summary:
 - FILE DEDUPLICATION: visitedFileRealpaths Set prevents repeated scanning of the same file via multiple symlinks.
 - The repository snapshot boundary is now hardened against: unbounded memory allocation, symlink escapes, invalid archive structures, semantic conflation of authority, AND symlink cycles.
 - Ready for runtime verification as the next milestone.
+
+---
+Task ID: 17F
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 17F — Evidence clarity (repositoryPathsExamined vs uniqueFilesScanned) + canonical-state reconciliation via clean-clone verification.
+
+Work Log:
+- CANONICAL-STATE VERIFICATION (third occurrence of stale web view):
+  * User claimed GitHub main = 8ef366f (Phase 17D). Previous turn user claimed f2c9359 (Phase 16D).
+  * Verified via git fetch + git rev-parse: origin/main = 04c2125 (Phase 17E).
+  * Verified via GitHub REST API (api.github.com/repos/pectoraux/thevibecodingapp/branches/main): main HEAD = 04c2125, commit message = "Phase 17E: symlink cycle protection + file deduplication".
+  * 8ef366f (Phase 17D) confirmed as ancestor of 04c2125 — no Phase 17D changes lost.
+  * User's web view is cached/stale (third occurrence).
+- Pushed local worklog commit (4233a0c) to sync.
+- EVIDENCE IMPROVEMENT (user request):
+  * Added repositoryPathsExamined: number to RepoSnapshot — total paths encountered including symlinks, before dedup.
+  * Added uniqueFilesScanned: number to RepoSnapshot — unique underlying files actually scanned after dedup by realpath.
+  * Added repositoryPathsExamined counter to WalkContext, incremented in readFileEntry BEFORE the dedup check.
+  * Updated downloadAndExtractTarball return type + all early-return paths.
+  * Updated all RepoSnapshot return paths: tarball, Trees API, LOCAL_ONLY, emptySnapshot, invalid-archive early returns.
+  * Updated readiness check evidence with both fields.
+  * Updated build event payload with both fields.
+- Added 6 new Phase 17F tests (Tests 76-81).
+- CLEAN-CLONE VERIFICATION:
+  * Cloned GitHub main to /tmp/forge-clean-clone (fresh, depth 1).
+  * Clean clone HEAD = 5a1cdba (matches local + remote + API).
+  * Verified Phase 17E code present: visitedRealpaths (8 hits), visitedFileRealpaths (6 hits).
+  * Verified Phase 17F code present: repositoryPathsExamined (16 hits), uniqueFilesScanned (5 hits).
+  * Ran full test suite from clean clone: scanner 83/83, readiness-source 11/11, repository-source 10/10, architecture 16/16, manifest 40/40, canonical-import 33/33, phase10 7/7 — 200 passed, 0 failed.
+- Lint: same pre-existing evidence.ts:303 require() error (not touched). No new errors.
+- Agent Browser: / route renders cleanly (0 errors).
+- Committed as 5a1cdba. Pushed to origin main (4233a0c..5a1cdba).
+- DUAL SHA VERIFICATION:
+  * git protocol: local HEAD == origin/main == 5a1cdba86c173e4f6786d479a5fcc9de058ebc46
+  * GitHub REST API: main HEAD SHA == 5a1cdba86c173e4f6786d479a5fcc9de058ebc46
+  * Clean clone HEAD == 5a1cdba86c173e4f6786d479a5fcc9de058ebc46
+  * All four sources match.
+
+Stage Summary:
+- CANONICAL: GitHub main = 5a1cdba, Local = 5a1cdba, Clean clone = 5a1cdba, GitHub API = 5a1cdba (ALL MATCH).
+- PHASE 17E: cycle protection (visitedRealpaths) + file deduplication (visitedFileRealpaths) — present on main, verified via clean clone.
+- PHASE 17F: repositoryPathsExamined + uniqueFilesScanned — present on main, verified via clean clone.
+- TESTS: 200 passed, 0 failed from clean clone.
+- The repository snapshot boundary is now: fail-closed, cycle-protected, deduplicated, memory-bounded, filesystem-contained, archive-validated, and evidence-clear.
+- Ready for runtime verification as the next milestone.
