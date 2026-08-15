@@ -140,20 +140,31 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
   {
     category: ReadinessCategory.BUILD,
     name: "Repository snapshot is complete and verified",
-    description: "The readiness gate must scan a complete repository snapshot at an exact immutable SHA.",
+    description: "The readiness gate must scan a complete repository snapshot at an exact immutable SHA with no unreadable files or extraction errors.",
     required: true,
     check: async (_projectId, repo) => {
+      const passed =
+        repo.snapshotComplete &&
+        repo.unreadableFiles.length === 0 &&
+        repo.snapshotError === null;
       return {
-        passed: repo.snapshotComplete,
+        passed,
         evidence: {
           snapshotSource: repo.snapshotSource,
           repositoryHeadSha: repo.head,
           complete: repo.snapshotComplete,
           truncated: repo.truncated,
+          downloadedBytes: repo.downloadedBytes,
+          extractedBytes: repo.extractedBytes,
+          extractedFileCount: repo.extractedFileCount,
+          unreadableFiles: repo.unreadableFiles,
+          snapshotError: repo.snapshotError,
         },
-        failureReason: !repo.snapshotComplete
-          ? repo.snapshotSource === "GITHUB_TREES_API"
-            ? "Repository tree is truncated — file list is incomplete. Readiness requires a complete snapshot (tarball path)."
+        failureReason: !passed
+          ? repo.snapshotError
+            ? `REPOSITORY_SNAPSHOT_UNVERIFIED: ${repo.snapshotError}`
+            : repo.unreadableFiles.length > 0
+            ? `REPOSITORY_SNAPSHOT_UNVERIFIED: ${repo.unreadableFiles.length} unreadable file(s) during extraction`
             : "Repository snapshot is incomplete — readiness cannot verify the complete repository."
           : undefined,
       };
@@ -514,7 +525,14 @@ export async function runReadinessGate(projectId: string): Promise<{
         pullRequests: [],
         unreadable: true,
         unreadableReason: "Project not found",
+        snapshotSource: "LOCAL_EVIDENCE",
+        snapshotComplete: false,
         truncated: false,
+        downloadedBytes: 0,
+        extractedBytes: 0,
+        extractedFileCount: 0,
+        unreadableFiles: [],
+        snapshotError: "Project not found",
       };
 
   // --- Scan the complete repository content ---
@@ -599,6 +617,13 @@ export async function runReadinessGate(projectId: string): Promise<{
       failedCount,
       repositoryHeadSha: repo.head,
       headVerified: repo.headVerified,
+      snapshotSource: repo.snapshotSource,
+      snapshotComplete: repo.snapshotComplete,
+      snapshotError: repo.snapshotError,
+      downloadedBytes: repo.downloadedBytes,
+      extractedBytes: repo.extractedBytes,
+      extractedFileCount: repo.extractedFileCount,
+      unreadableFiles: repo.unreadableFiles,
       truncated: repo.truncated,
       scanSummary: {
         totalFiles: scanSummary.totalFiles,

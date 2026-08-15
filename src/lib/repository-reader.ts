@@ -75,6 +75,12 @@ export interface RepoPullRequestView {
   createdAt: string;
 }
 
+export interface UnreadableFile {
+  path: string;
+  operation: "readdir" | "stat" | "readFile";
+  error: string;
+}
+
 export interface RepoSnapshot {
   mode: "GITHUB_BACKED" | "LOCAL_ONLY";
   /** The exact immutable SHA the snapshot was read from. Recorded for reproducibility. */
@@ -98,16 +104,26 @@ export interface RepoSnapshot {
    */
   snapshotSource: "GITHUB_TARBALL" | "GITHUB_TREES_API" | "LOCAL_EVIDENCE";
   /**
-   * Phase 17B: True when the snapshot represents the COMPLETE repository.
-   * For GITHUB_TARBALL: always true (tarball is complete).
-   * For GITHUB_TREES_API: false when the Trees API returned truncated=true.
-   * For LOCAL_EVIDENCE: false (no complete repository exists).
+   * Phase 17C: True when the snapshot represents the COMPLETE repository with
+   * NO unreadable files, NO resource-limit violations, and a valid archive.
+   * Any unreadable file or extraction error makes this false → readiness fails.
    */
   snapshotComplete: boolean;
   /** True when the Trees API (UI path) returned truncated. Kept for UI diagnostics. */
   truncated: boolean;
   /** Raw file contents (Buffer) from tarball extraction — used by the scanner. */
   rawFiles?: { path: string; content: Buffer }[];
+  // --- Phase 17C: Extraction metadata + fail-closed completeness ---
+  /** Bytes downloaded (compressed tarball). */
+  downloadedBytes: number;
+  /** Total bytes of all extracted files (uncompressed). */
+  extractedBytes: number;
+  /** Number of files extracted from the tarball. */
+  extractedFileCount: number;
+  /** Files that could not be read during extraction (readdir/stat/readFile failures). */
+  unreadableFiles: UnreadableFile[];
+  /** Non-null when the snapshot itself is unverified (extraction error, limits exceeded, invalid archive). */
+  snapshotError: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,26 +227,42 @@ async function verifyCanonicalHeadFreshness(
 // ---------------------------------------------------------------------------
 
 const TARBALL_TIMEOUT_MS = 120000; // 2 minutes
-const MAX_TARBALL_SIZE = 200 * 1024 * 1024; // 200 MB safety limit
+const MAX_TARBALL_SIZE = 200 * 1024 * 1024; // 200 MB compressed download limit
+// Phase 17C: Bounded extraction limits (uncompressed content + file count).
+const MAX_EXTRACTED_BYTES = 500 * 1024 * 1024; // 500 MB total extracted content
+const MAX_EXTRACTED_FILES = 100_000; // 100k files max
 
 /**
  * Download the GitHub repository tarball at the exact SHA and extract all
  * file contents. This gives COMPLETE repository coverage in one download —
  * no per-file API calls, no 50-file cap, no tree truncation.
  *
- * Returns an array of { path, content: Buffer } for every file in the repo.
+ * Phase 17C: Extraction is fail-closed. Unreadable files, resource-limit
+ * violations, and invalid archives all produce a snapshotError and make
+ * snapshotComplete = false.
+ *
+ * Returns extraction metadata + files.
  */
 async function downloadAndExtractTarball(
   owner: string,
   repo: string,
   sha: string,
   headers: Record<string, string>
-): Promise<{ files: { path: string; content: Buffer }[]; truncated: boolean }> {
+): Promise<{
+  files: { path: string; content: Buffer }[];
+  downloadedBytes: number;
+  extractedBytes: number;
+  extractedFileCount: number;
+  unreadableFiles: UnreadableFile[];
+  snapshotError: string | null;
+}> {
   const tarballUrl = `https://api.github.com/repos/${owner}/${repo}/tarball/${sha}`;
 
   const tempDir = `/tmp/forge-tarball-${sha.slice(0, 12)}-${Date.now()}`;
   const tarballPath = join(tempDir, "repo.tar.gz");
   const extractDir = join(tempDir, "extracted");
+
+  let downloadedBytes = 0;
 
   try {
     mkdirSync(tempDir, { recursive: true });
@@ -252,7 +284,6 @@ async function downloadAndExtractTarball(
     const writeStream = createWriteStream(tarballPath);
     const nodeStream = Readable.fromWeb(response.body as any);
 
-    let bytesDownloaded = 0;
     const sizeLimitError = new Error(
       `Tarball exceeded size limit: >${MAX_TARBALL_SIZE} bytes streamed (limit: ${MAX_TARBALL_SIZE})`
     );
@@ -260,11 +291,10 @@ async function downloadAndExtractTarball(
     await new Promise<void>((resolve, reject) => {
       let rejected = false;
       const onChunk = (chunk: Buffer) => {
-        bytesDownloaded += chunk.length;
-        if (bytesDownloaded > MAX_TARBALL_SIZE) {
+        downloadedBytes += chunk.length;
+        if (downloadedBytes > MAX_TARBALL_SIZE) {
           if (!rejected) {
             rejected = true;
-            // Destroy both streams to abort the download.
             nodeStream.destroy(sizeLimitError);
             writeStream.destroy();
             reject(sizeLimitError);
@@ -297,25 +327,71 @@ async function downloadAndExtractTarball(
       gzip: true,
     });
 
-    // Walk extracted directory and read all files.
-    const files: { path: string; content: Buffer }[] = [];
+    // Phase 17C: Walk with fail-closed error tracking + resource limits.
+    const ctx: WalkContext = {
+      files: [],
+      unreadableFiles: [],
+      extractedBytes: 0,
+      extractedFileCount: 0,
+      limitExceeded: false,
+      limitExceededReason: null,
+    };
+
     const extractedRoots = readdirSync(extractDir);
 
     // GitHub tarballs extract to a single top-level directory like
     // "owner-repo-sha/". We need to strip that prefix.
-    const topDir = extractedRoots.find((d) => {
-      const stat = statSync(join(extractDir, d));
-      return stat.isDirectory();
-    });
+    let topDir: string | null = null;
+    for (const d of extractedRoots) {
+      try {
+        const stat = statSync(join(extractDir, d));
+        if (stat.isDirectory()) {
+          topDir = d;
+          break;
+        }
+      } catch (err: any) {
+        // Phase 17C: stat failure on top-level entry is a snapshot error.
+        ctx.unreadableFiles.push({
+          path: d,
+          operation: "stat",
+          error: err.message ?? String(err),
+        });
+      }
+    }
 
     if (!topDir) {
-      return { files: [], truncated: false };
+      // Phase 17C: No valid repository root → invalid archive.
+      return {
+        files: [],
+        downloadedBytes,
+        extractedBytes: 0,
+        extractedFileCount: 0,
+        unreadableFiles: ctx.unreadableFiles,
+        snapshotError: "Invalid archive: no top-level repository directory found after extraction",
+      };
     }
 
     const repoRoot = join(extractDir, topDir);
-    walkDirectory(repoRoot, "", files);
+    walkDirectory(repoRoot, "", ctx);
 
-    return { files, truncated: false };
+    // Phase 17C: Determine snapshot error.
+    let snapshotError: string | null = null;
+    if (ctx.limitExceeded) {
+      snapshotError = ctx.limitExceededReason;
+    } else if (ctx.unreadableFiles.length > 0) {
+      snapshotError = `${ctx.unreadableFiles.length} unreadable file(s) during extraction`;
+    } else if (ctx.files.length === 0) {
+      snapshotError = "Archive extracted but contained zero files";
+    }
+
+    return {
+      files: ctx.files,
+      downloadedBytes,
+      extractedBytes: ctx.extractedBytes,
+      extractedFileCount: ctx.extractedFileCount,
+      unreadableFiles: ctx.unreadableFiles,
+      snapshotError,
+    };
   } finally {
     // Clean up temp directory.
     try {
@@ -324,20 +400,49 @@ async function downloadAndExtractTarball(
   }
 }
 
+interface WalkContext {
+  files: { path: string; content: Buffer }[];
+  unreadableFiles: UnreadableFile[];
+  extractedBytes: number;
+  extractedFileCount: number;
+  limitExceeded: boolean;
+  limitExceededReason: string | null;
+}
+
+/**
+ * Phase 17C: Walk the extracted directory and read all files.
+ *
+ * FAIL-CLOSED: readdir/stat/readFile failures are recorded in ctx.unreadableFiles.
+ * They are NOT silently skipped. Any unreadable file makes snapshotComplete = false.
+ *
+ * RESOURCE LIMITS: extracted bytes and file count are tracked. If either limit
+ * is exceeded, walking stops and ctx.limitExceeded is set.
+ */
 function walkDirectory(
   basePath: string,
   relativePath: string,
-  files: { path: string; content: Buffer }[]
+  ctx: WalkContext
 ): void {
+  // Stop if a limit was already exceeded.
+  if (ctx.limitExceeded) return;
+
   const fullPath = relativePath ? join(basePath, relativePath) : basePath;
   let entries: string[];
   try {
     entries = readdirSync(fullPath);
-  } catch {
+  } catch (err: any) {
+    // Phase 17C: readdir failure is an unreadable file (directory).
+    ctx.unreadableFiles.push({
+      path: relativePath || ".",
+      operation: "readdir",
+      error: err.message ?? String(err),
+    });
     return;
   }
 
   for (const entry of entries) {
+    if (ctx.limitExceeded) return;
+
     const entryRelative = relativePath ? `${relativePath}/${entry}` : entry;
     const entryFull = join(fullPath, entry);
 
@@ -347,18 +452,44 @@ function walkDirectory(
     let stat;
     try {
       stat = statSync(entryFull);
-    } catch {
+    } catch (err: any) {
+      // Phase 17C: stat failure is an unreadable file.
+      ctx.unreadableFiles.push({
+        path: entryRelative,
+        operation: "stat",
+        error: err.message ?? String(err),
+      });
       continue;
     }
 
     if (stat.isDirectory()) {
-      walkDirectory(basePath, entryRelative, files);
+      walkDirectory(basePath, entryRelative, ctx);
     } else if (stat.isFile()) {
+      // Phase 17C: Check file-count limit before reading.
+      if (ctx.extractedFileCount >= MAX_EXTRACTED_FILES) {
+        ctx.limitExceeded = true;
+        ctx.limitExceededReason = `Exceeded MAX_EXTRACTED_FILES limit (${MAX_EXTRACTED_FILES}) at file: ${entryRelative}`;
+        return;
+      }
+
       try {
         const content = readFileSync(entryFull);
-        files.push({ path: entryRelative, content });
-      } catch {
-        // Skip unreadable files.
+        // Phase 17C: Check extracted-bytes limit.
+        if (ctx.extractedBytes + content.length > MAX_EXTRACTED_BYTES) {
+          ctx.limitExceeded = true;
+          ctx.limitExceededReason = `Exceeded MAX_EXTRACTED_BYTES limit (${MAX_EXTRACTED_BYTES}) at file: ${entryRelative}`;
+          return;
+        }
+        ctx.files.push({ path: entryRelative, content });
+        ctx.extractedBytes += content.length;
+        ctx.extractedFileCount++;
+      } catch (err: any) {
+        // Phase 17C: readFile failure is an unreadable file.
+        ctx.unreadableFiles.push({
+          path: entryRelative,
+          operation: "readFile",
+          error: err.message ?? String(err),
+        });
       }
     }
   }
@@ -437,7 +568,14 @@ async function readGitHubSnapshot(
   if (withContent) {
     // --- COMPLETE content via tarball (Phase 17A) ---
     // No 50-file cap. Downloads the entire repo at the exact SHA.
-    let tarballResult: { files: { path: string; content: Buffer }[]; truncated: boolean };
+    let tarballResult: {
+      files: { path: string; content: Buffer }[];
+      downloadedBytes: number;
+      extractedBytes: number;
+      extractedFileCount: number;
+      unreadableFiles: UnreadableFile[];
+      snapshotError: string | null;
+    };
     try {
       tarballResult = await downloadAndExtractTarball(owner, repo, sha, headers);
     } catch (err: any) {
@@ -445,6 +583,7 @@ async function readGitHubSnapshot(
         ...emptySnapshot("GITHUB_BACKED", true, `Tarball download/extraction failed: ${err.message}`),
         headVerified,
         headVerificationNote,
+        head: sha,
       };
     }
 
@@ -466,6 +605,12 @@ async function readGitHubSnapshot(
       fetchPullRequests(owner, repo, headers),
     ]);
 
+    // Phase 17C: snapshotComplete is true ONLY when there are no unreadable files,
+    // no snapshot error, and the archive was valid.
+    const snapshotComplete =
+      tarballResult.snapshotError === null &&
+      tarballResult.unreadableFiles.length === 0;
+
     return {
       mode: "GITHUB_BACKED",
       head: sha,
@@ -477,11 +622,15 @@ async function readGitHubSnapshot(
       pullRequests,
       unreadable: false,
       unreadableReason: null,
-      // Phase 17B: tarball is the complete snapshot source.
       snapshotSource: "GITHUB_TARBALL",
-      snapshotComplete: true,
-      truncated: false, // Tarball extraction is never truncated.
+      snapshotComplete,
+      truncated: false,
       rawFiles: tarballResult.files,
+      downloadedBytes: tarballResult.downloadedBytes,
+      extractedBytes: tarballResult.extractedBytes,
+      extractedFileCount: tarballResult.extractedFileCount,
+      unreadableFiles: tarballResult.unreadableFiles,
+      snapshotError: tarballResult.snapshotError,
     };
   }
 
@@ -536,6 +685,12 @@ async function readGitHubSnapshot(
     snapshotSource: "GITHUB_TREES_API",
     snapshotComplete: !treeResult.truncated,
     truncated: treeResult.truncated,
+    // Phase 17C: Trees API path doesn't extract content.
+    downloadedBytes: 0,
+    extractedBytes: 0,
+    extractedFileCount: files.length,
+    unreadableFiles: [],
+    snapshotError: null,
   };
 }
 
@@ -667,6 +822,12 @@ async function readLocalSnapshot(projectId: string): Promise<RepoSnapshot> {
     snapshotSource: "LOCAL_EVIDENCE",
     snapshotComplete: false, // No complete repository exists for LOCAL_ONLY
     truncated: false,
+    // Phase 17C: LOCAL_ONLY has no tarball extraction.
+    downloadedBytes: 0,
+    extractedBytes: 0,
+    extractedFileCount: fileMap.size,
+    unreadableFiles: [],
+    snapshotError: "LOCAL_ONLY — no canonical repository to extract",
   };
 }
 
@@ -693,6 +854,12 @@ function emptySnapshot(
     snapshotSource: mode === "GITHUB_BACKED" ? "GITHUB_TARBALL" : "LOCAL_EVIDENCE",
     snapshotComplete: false,
     truncated: false,
+    // Phase 17C: empty snapshot metadata.
+    downloadedBytes: 0,
+    extractedBytes: 0,
+    extractedFileCount: 0,
+    unreadableFiles: [],
+    snapshotError: reason,
   };
 }
 

@@ -496,11 +496,11 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 
 // Test 30: Reader enforces streaming byte limit (not just Content-Length).
 {
-  const hasStreamingLimit = reader.includes("bytesDownloaded") && reader.includes("MAX_TARBALL_SIZE");
+  const hasStreamingLimit = reader.includes("downloadedBytes") && reader.includes("MAX_TARBALL_SIZE");
   const hasContentLengthCheck = reader.includes("content-length");
-  // Phase 17B: streaming byte counter is the authority. Content-Length check is removed.
+  // Phase 17B/17C: streaming byte counter is the authority. Content-Length check is removed.
   record(
-    "repository-reader.ts enforces streaming byte limit (bytesDownloaded counter, not Content-Length)",
+    "repository-reader.ts enforces streaming byte limit (downloadedBytes counter, not Content-Length)",
     hasStreamingLimit && !hasContentLengthCheck,
     `streaming: ${hasStreamingLimit}, contentLengthCheckRemoved: ${!hasContentLengthCheck}`
   );
@@ -528,11 +528,15 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 
 // Test 33: RepoSnapshot has snapshotComplete field.
 {
-  const hasSnapshotComplete = reader.includes("snapshotComplete:") && reader.includes("snapshotComplete: true");
+  // Phase 17C: snapshotComplete is now computed from snapshotError + unreadableFiles,
+  // not a hardcoded literal. Check the type declaration + the conditional assignment.
+  const hasFieldType = reader.includes("snapshotComplete: boolean");
+  const hasConditional = reader.includes("tarballResult.snapshotError === null") &&
+    reader.includes("tarballResult.unreadableFiles.length === 0");
   record(
-    "RepoSnapshot has snapshotComplete field (true for tarball path)",
-    hasSnapshotComplete,
-    `hasSnapshotComplete: ${hasSnapshotComplete}`
+    "RepoSnapshot has snapshotComplete field (computed from snapshotError + unreadableFiles)",
+    hasFieldType && hasConditional,
+    `fieldType: ${hasFieldType}, conditional: ${hasConditional}`
   );
 }
 
@@ -571,10 +575,195 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 }
 
 // ===========================================================================
+// PHASE 17C: Fail-closed snapshot completeness
+// ===========================================================================
+
+// Test 37: RepoSnapshot has downloadedBytes field.
+{
+  const hasField = reader.includes("downloadedBytes:") && reader.includes("downloadedBytes: number");
+  record(
+    "RepoSnapshot has downloadedBytes field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 38: RepoSnapshot has extractedBytes field.
+{
+  const hasField = reader.includes("extractedBytes:") && reader.includes("extractedBytes: number");
+  record(
+    "RepoSnapshot has extractedBytes field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 39: RepoSnapshot has extractedFileCount field.
+{
+  const hasField = reader.includes("extractedFileCount:") && reader.includes("extractedFileCount: number");
+  record(
+    "RepoSnapshot has extractedFileCount field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 40: RepoSnapshot has unreadableFiles field.
+{
+  const hasField = reader.includes("unreadableFiles:") && reader.includes("unreadableFiles: UnreadableFile[]");
+  record(
+    "RepoSnapshot has unreadableFiles field (UnreadableFile[])",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 41: RepoSnapshot has snapshotError field.
+{
+  const hasField = reader.includes("snapshotError:") && reader.includes("snapshotError: string | null");
+  record(
+    "RepoSnapshot has snapshotError field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 42: walkDirectory records unreadable files (no silent skip).
+{
+  const walkCode = reader.includes("ctx.unreadableFiles.push");
+  const hasReaddirError = reader.includes('operation: "readdir"');
+  const hasStatError = reader.includes('operation: "stat"');
+  const hasReadFileError = reader.includes('operation: "readFile"');
+  const noSilentSkip = !reader.includes("// Skip unreadable files");
+  record(
+    "walkDirectory records unreadable files (readdir/stat/readFile) — no silent skip",
+    walkCode && hasReaddirError && hasStatError && hasReadFileError && noSilentSkip,
+    `push: ${walkCode}, readdir: ${hasReaddirError}, stat: ${hasStatError}, readFile: ${hasReadFileError}, noSilentSkip: ${noSilentSkip}`
+  );
+}
+
+// Test 43: MAX_EXTRACTED_BYTES limit exists.
+{
+  const hasLimit = reader.includes("MAX_EXTRACTED_BYTES");
+  record(
+    "repository-reader.ts has MAX_EXTRACTED_BYTES extraction limit",
+    hasLimit,
+    `hasLimit: ${hasLimit}`
+  );
+}
+
+// Test 44: MAX_EXTRACTED_FILES limit exists.
+{
+  const hasLimit = reader.includes("MAX_EXTRACTED_FILES");
+  record(
+    "repository-reader.ts has MAX_EXTRACTED_FILES extraction limit",
+    hasLimit,
+    `hasLimit: ${hasLimit}`
+  );
+}
+
+// Test 45: walkDirectory checks limits during extraction (not just download).
+{
+  const checksBytes = reader.includes("ctx.extractedBytes + content.length > MAX_EXTRACTED_BYTES");
+  const checksCount = reader.includes("ctx.extractedFileCount >= MAX_EXTRACTED_FILES");
+  record(
+    "walkDirectory checks extracted-bytes and file-count limits during extraction",
+    checksBytes && checksCount,
+    `checksBytes: ${checksBytes}, checksCount: ${checksCount}`
+  );
+}
+
+// Test 46: Invalid archive (no topDir) returns snapshotError.
+{
+  const hasInvalidArchiveError = reader.includes("Invalid archive: no top-level repository directory");
+  record(
+    "Invalid archive (no top-level dir) returns snapshotError",
+    hasInvalidArchiveError,
+    `hasInvalidArchiveError: ${hasInvalidArchiveError}`
+  );
+}
+
+// Test 47: Empty extraction (zero files) returns snapshotError.
+{
+  const hasEmptyError = reader.includes("Archive extracted but contained zero files");
+  record(
+    "Empty extraction (zero files) returns snapshotError",
+    hasEmptyError,
+    `hasEmptyError: ${hasEmptyError}`
+  );
+}
+
+// Test 48: snapshotComplete is false when snapshotError exists.
+{
+  const conditionalComplete = reader.includes("tarballResult.snapshotError === null") &&
+    reader.includes("tarballResult.unreadableFiles.length === 0");
+  record(
+    "snapshotComplete is false when snapshotError exists or unreadableFiles > 0",
+    conditionalComplete,
+    `conditionalComplete: ${conditionalComplete}`
+  );
+}
+
+// Test 49: Readiness check fails on snapshotError.
+{
+  const failsOnError = readiness.includes("repo.snapshotError === null") &&
+    readiness.includes("REPOSITORY_SNAPSHOT_UNVERIFIED");
+  record(
+    "readiness check fails on snapshotError (REPOSITORY_SNAPSHOT_UNVERIFIED)",
+    failsOnError,
+    `failsOnError: ${failsOnError}`
+  );
+}
+
+// Test 50: Readiness check fails on unreadableFiles.
+{
+  const failsOnUnreadable = readiness.includes("repo.unreadableFiles.length === 0");
+  record(
+    "readiness check fails when unreadableFiles.length > 0",
+    failsOnUnreadable,
+    `failsOnUnreadable: ${failsOnUnreadable}`
+  );
+}
+
+// Test 51: Readiness evidence includes extraction metadata.
+{
+  const hasDownloadedBytes = readiness.includes("downloadedBytes: repo.downloadedBytes");
+  const hasExtractedBytes = readiness.includes("extractedBytes: repo.extractedBytes");
+  const hasExtractedFileCount = readiness.includes("extractedFileCount: repo.extractedFileCount");
+  const hasUnreadableFiles = readiness.includes("unreadableFiles: repo.unreadableFiles");
+  const hasSnapshotError = readiness.includes("snapshotError: repo.snapshotError");
+  record(
+    "readiness evidence includes downloadedBytes, extractedBytes, extractedFileCount, unreadableFiles, snapshotError",
+    hasDownloadedBytes && hasExtractedBytes && hasExtractedFileCount && hasUnreadableFiles && hasSnapshotError,
+    `downloadedBytes: ${hasDownloadedBytes}, extractedBytes: ${hasExtractedBytes}, extractedFileCount: ${hasExtractedFileCount}, unreadableFiles: ${hasUnreadableFiles}, snapshotError: ${hasSnapshotError}`
+  );
+}
+
+// Test 52: No silent "// Skip unreadable files" comment remains.
+{
+  const hasSilentSkip = reader.includes("// Skip unreadable files") || reader.includes("// Skip unreadable");
+  record(
+    "No 'Skip unreadable files' comment remains in repository-reader.ts",
+    !hasSilentSkip,
+    `hasSilentSkip: ${hasSilentSkip}`
+  );
+}
+
+// Test 53: WalkContext interface tracks limitExceeded.
+{
+  const hasLimitExceeded = reader.includes("limitExceeded: boolean") && reader.includes("limitExceededReason");
+  record(
+    "WalkContext tracks limitExceeded + limitExceededReason",
+    hasLimitExceeded,
+    `hasLimitExceeded: ${hasLimitExceeded}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 17B: Repository Snapshot Limits & Completeness Invariants ===\n");
+console.log("=== Forge Phase 17C: Fail-Closed Repository Snapshot Completeness Invariants ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {
