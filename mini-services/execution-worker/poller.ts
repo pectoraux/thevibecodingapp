@@ -20,7 +20,7 @@ import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runS
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase15b";
+const WORKER_VERSION = "phase15c";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
@@ -433,7 +433,6 @@ async function workerLoop(): Promise<void> {
           // It uses canCompleteTask() with remote verification.
           // The worker uses the response from submit-evidence, not its own check.
           const evidenceResponse = await submitEvidence({
-            taskId: job.taskId, projectId: job.projectId,
             commitSha: result.commitSha,
             pushedToRemote: result.pushedToRemote || false,
             testResults: result.testResults,

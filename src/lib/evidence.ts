@@ -294,61 +294,36 @@ export async function getProjectEvidence(projectId: string): Promise<TaskEvidenc
 }
 
 // ---------------------------------------------------------------------------
-// hasSufficientEvidence — a task may transition to COMPLETED only when its
-// MOST RECENT evidence record satisfies ALL of:
-//   1. commitSha is set (real git commit exists).
-//   2. testRuns has at least one entry with passes=true (real tests ran and passed).
-//   3. guardianResults shows no VIOLATION (deterministic + LLM layers).
-//   4. reviewResults shows APPROVED.
-//
-// IMPORTANT: any missing field counts as INSUFFICIENT. We never infer a pass
-// from absence — absence is treated as failure (closed-world).
+// P15C: hasSufficientEvidence now DELEGATES to canCompleteTask().
+// There is ONE completion authority: canCompleteTask() in completion-policy.ts.
+// This function exists for backward compatibility with callers that don't have
+// project mode context. The submit-evidence endpoint calls canCompleteTask()
+// directly with the correct mode (GITHUB_BACKED or LOCAL_ONLY).
 // ---------------------------------------------------------------------------
 
 export function hasSufficientEvidence(evidence: TaskEvidence): boolean {
-  // 1. Real commit.
-  if (!evidence.commitSha || evidence.commitSha.trim().length === 0) {
-    return false;
-  }
+  // P15C: Delegate to the canonical canCompleteTask().
+  const { canCompleteTask } = require("@/lib/completion-policy") as typeof import("@/lib/completion-policy");
 
-  // 2. At least one passing test.
   const tests = decodeArray<TestRunResult>(evidence.testRuns);
-  if (!tests.some((t) => t && t.passes === true)) {
-    return false;
-  }
+  const testsPassed = tests.length > 0 && tests.every((t) => t && t.passes === true);
 
-  // 3. Guardian did NOT return VIOLATION.
   const guardian = decodeObject<GuardianEvidencePayload>(evidence.guardianResults);
-  if (guardian) {
-    const det = guardian.deterministic?.verdict;
-    const llm = guardian.llm?.verdict;
-    const combined = guardian.combinedVerdict;
-    // Worst-case: if ANY layer says VIOLATION, insufficient.
-    if (det === "VIOLATION" || llm === "VIOLATION" || combined === "VIOLATION") {
-      return false;
-    }
-    // If only one layer ran and it wasn't PASS/WARNING, insufficient.
-    // (e.g. ARCHITECTURE_CHANGE_REQUIRED from LLM is a non-pass.)
-    const verdictsSeen = [det, llm, combined].filter(Boolean) as string[];
-    if (verdictsSeen.length > 0) {
-      const allOk = verdictsSeen.every((v) => v === "PASS" || v === "WARNING");
-      if (!allOk) return false;
-    } else {
-      // guardianResults was set but had no verdict at all → treat as insufficient.
-      return false;
-    }
-  } else {
-    // No guardian evidence at all → insufficient.
-    return false;
-  }
+  const guardianVerdict = guardian?.combinedVerdict || guardian?.deterministic?.verdict || "UNVERIFIED";
 
-  // 4. Reviewer APPROVED.
   const review = decodeObject<ReviewEvidencePayload>(evidence.reviewResults);
-  if (!review || review.verdict !== "APPROVED") {
-    return false;
-  }
+  const reviewVerdict = review?.verdict || "REJECTED";
 
-  return true;
+  return canCompleteTask({
+    commitSha: evidence.commitSha,
+    pushedToRemote: evidence.pushedToRemote,
+    remoteCommitVerified: evidence.remoteCommitVerified,
+    baseCommitSha: evidence.baseCommitSha,
+    guardianVerdict,
+    reviewVerdict,
+    testsPassed,
+    evidencePersisted: true,
+  }, "LOCAL_ONLY");
 }
 
 // ---------------------------------------------------------------------------

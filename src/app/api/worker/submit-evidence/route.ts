@@ -30,18 +30,28 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Execution token required" }, { status: 403 });
     }
 
-    // P15B: Derive ALL identity from the execution token.
+    // P15C: Derive ALL identity from the execution token AND verify the lease.
     const executionJob = await db.executionJob.findUnique({
       where: { executionId: token.executionId },
-      select: { id: true, taskId: true, projectId: true, workerId: true, attempt: true },
+      select: { id: true, taskId: true, projectId: true, workerId: true, attempt: true, leaseId: true, leaseExpiresAt: true },
     });
 
     if (!executionJob) {
       return NextResponse.json({ error: "Execution job not found for token" }, { status: 403 });
     }
 
+    // P15C: Verify worker owns this execution.
     if (executionJob.workerId !== token.workerId) {
       return NextResponse.json({ error: "Worker does not own this execution" }, { status: 403 });
+    }
+
+    // P15C: Verify the lease is still valid.
+    if (executionJob.leaseId !== token.leaseId) {
+      return NextResponse.json({ error: "Lease mismatch — token lease does not match execution lease" }, { status: 403 });
+    }
+
+    if (executionJob.leaseExpiresAt && executionJob.leaseExpiresAt < new Date()) {
+      return NextResponse.json({ error: "Lease expired — evidence submission rejected" }, { status: 403 });
     }
 
     const taskId = executionJob.taskId;
@@ -63,8 +73,13 @@ export async function POST(req: Request) {
     // Do NOT trust body.branchName.
     const expectedBranch = `forge/${task.code.toLowerCase()}/attempt-${executionJob.attempt}`;
 
-    // P15B: Derive expected baseCommitSha from the task graph.
-    // Find the most recent completed dependency's commit.
+    // P15C: Derive expected baseCommitSha from the task graph.
+    // For tasks with multiple dependencies, ALL must be completed.
+    // The base is the MOST RECENT commit across all completed dependencies.
+    // (In a sequential merge model, the project HEAD advances after each merge,
+    // so the latest dependency commit represents the canonical base.)
+    // If any dependency is NOT completed, the base is null → ancestry check
+    // is skipped, but the task should not have been claimed in the first place.
     let expectedBaseCommitSha: string | null = null;
     const deps = JSON.parse(task.dependencies || "[]") as string[];
     if (deps.length > 0) {
@@ -76,10 +91,22 @@ export async function POST(req: Request) {
           commitSha: { not: null },
         },
         orderBy: { completedAt: "desc" },
-        take: 1,
       });
-      if (depTasks.length > 0 && depTasks[0].commitSha) {
-        expectedBaseCommitSha = depTasks[0].commitSha;
+
+      // P15C: Verify ALL dependencies are completed.
+      if (depTasks.length === deps.length) {
+        // All deps complete — use the most recent commit as the base.
+        // In a sequential model, this is the project's current HEAD.
+        if (depTasks.length > 0 && depTasks[0].commitSha) {
+          expectedBaseCommitSha = depTasks[0].commitSha;
+        }
+      } else {
+        // Not all dependencies are completed — this is a scheduling error.
+        // The task should not have been claimed. Mark as BLOCKED.
+        const missing = deps.filter(d => !depTasks.some(dt => dt.code === d));
+        return NextResponse.json({
+          error: `BLOCKED: Dependencies not completed: ${missing.join(", ")}`,
+        }, { status: 403 });
       }
     }
 
