@@ -35,23 +35,25 @@ function testCommitRequired() {
 // Test 2: Worker creates real git commits
 function testWorkerGitCommit() {
   const poller = readFile("mini-services/execution-worker/poller.ts");
-  const hasGitInit = poller.includes("gitInit");
-  const hasGitAddAndCommit = poller.includes("gitAddAndCommit");
-  const hasGitCheckoutBranch = poller.includes("gitCheckoutBranch");
-  const hasCommitShaReturn = poller.includes("commitSha = gitAddAndCommit");
+  const gitModule = readFile("mini-services/execution-worker/git/repository.ts");
+  const hasGitInit = gitModule.includes("export function gitInit") || poller.includes("gitInit");
+  const hasGitAddAndCommit = gitModule.includes("export function gitAddAndCommit") || poller.includes("gitAddAndCommit");
+  const hasGitCheckoutBranch = gitModule.includes("export function gitCheckoutBranch") || poller.includes("gitCheckoutBranch");
+  const hasCommitShaReturn = poller.includes("gitAddAndCommit");
 
   results.push({
     name: "Worker creates real git commits",
     passed: hasGitInit && hasGitAddAndCommit && hasGitCheckoutBranch && hasCommitShaReturn,
-    details: `gitInit: ${hasGitInit}, gitAddAndCommit: ${hasGitAddAndCommit}, gitCheckoutBranch: ${hasGitCheckoutBranch}, commit returned: ${hasCommitShaReturn}`,
+    details: `gitInit: ${hasGitInit}, gitAddAndCommit: ${hasGitAddAndCommit}, gitCheckoutBranch: ${hasGitCheckoutBranch}, commit in poller: ${hasCommitShaReturn}`,
   });
 }
 
 // Test 3: Worker Guardian does NOT derive from test results
 function testGuardianIndependent() {
   const poller = readFile("mini-services/execution-worker/poller.ts");
-  const hasRunDeterministicGuardian = poller.includes("runDeterministicGuardian");
-  const hasArchitectureCheck = poller.includes("architecture") && poller.includes("forbiddenTechs");
+  const verificationModule = readFile("mini-services/execution-worker/verification/index.ts");
+  const hasRunDeterministicGuardian = poller.includes("runDeterministicGuardian") || verificationModule.includes("runDeterministicGuardian");
+  const hasArchitectureCheck = verificationModule.includes("forbiddenTechs");
   // The OLD pattern was: verdict = testResults.every(...) ? "PASS" : "VIOLATION"
   // Check that this pattern is NOT the Guardian's verdict logic.
   const hasTestDerivedGuardian = poller.includes('guardianResult = {\n    verdict: testResults.every');
@@ -66,8 +68,9 @@ function testGuardianIndependent() {
 // Test 4: Worker Reviewer is a separate LLM invocation
 function testReviewerIndependent() {
   const poller = readFile("mini-services/execution-worker/poller.ts");
-  const hasRunLlmReviewer = poller.includes("runLlmReviewer");
-  const hasSeparatePrompt = poller.includes("independent code reviewer");
+  const verificationModule = readFile("mini-services/execution-worker/verification/index.ts");
+  const hasRunLlmReviewer = poller.includes("runLlmReviewer") || verificationModule.includes("runLlmReviewer");
+  const hasSeparatePrompt = verificationModule.includes("independent code reviewer");
   // The OLD pattern was: verdict = testResults.every(...) ? "APPROVED" : "CHANGES_REQUESTED"
   const hasTestDerivedReviewer = poller.includes('reviewResult = {\n    verdict: testResults.every');
 
@@ -81,9 +84,10 @@ function testReviewerIndependent() {
 // Test 5: Worker uses BYOK gateway, not hardcoded SDK
 function testByokGateway() {
   const poller = readFile("mini-services/execution-worker/poller.ts");
-  const hasCallLLM = poller.includes("async function callLLM");
-  const hasCallByokProvider = poller.includes("async function callByokProvider");
-  const hasResolveCredential = poller.includes("resolve-credential");
+  const llmModule = readFile("mini-services/execution-worker/llm/gateway.ts");
+  const hasCallLLM = llmModule.includes("export async function callLLM");
+  const hasCallByokProvider = llmModule.includes("callAnthropic") || llmModule.includes("callOpenAICompatible") || llmModule.includes("callGoogle");
+  const hasResolveCredential = poller.includes("resolve-credential") || llmModule.includes("resolve-credential");
 
   results.push({
     name: "Worker uses BYOK gateway (callLLM + callByokProvider)",

@@ -1,8 +1,11 @@
 {
-  "architectureVersion": "phase11",
-  "description": "Phase 11 — Real Repository Continuity: clone/fetch, base commit verification, no silent fallback, safe git arguments, push to remote, no npm fallback for VerificationPlan",
+  "architectureVersion": "phase11a",
+  "description": "Phase 11A — Modular worker with real repository continuity, safe git, BYOK provider adapters, no silent fallbacks",
   "requiredFiles": [
     "mini-services/execution-worker/poller.ts",
+    "mini-services/execution-worker/git/repository.ts",
+    "mini-services/execution-worker/llm/gateway.ts",
+    "mini-services/execution-worker/verification/index.ts",
     "src/app/api/worker/job-spec/route.ts",
     "src/app/api/worker/submit-evidence/route.ts",
     "src/app/api/worker/resolve-credential/route.ts",
@@ -15,8 +18,8 @@
     "tests/phase10-invariants.ts"
   ],
   "requiredInvariants": {
-    "workerVersion": "phase11",
-    "versionEndpoint": "phase11",
+    "workerVersion": "phase11a",
+    "versionEndpoint": "phase11a",
     "realGit": true,
     "realCommit": true,
     "baseCommitPropagation": true,
