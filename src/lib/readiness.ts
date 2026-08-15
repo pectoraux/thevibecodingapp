@@ -1,16 +1,23 @@
 // Forge — credential preflight & readiness gate.
 //
-// Preflight: runs BEFORE Start Build. Verifies every required credential in
-// the manifest is configured (production, test, or sandbox). Blocks Start
-// Build until green.
+// Phase 17: The readiness gate reads repository state from the CANONICAL
+// repository adapter (src/lib/repository-reader.ts), NOT from the legacy
+// DB-backed RepoFile/RepoCommit models. This ensures the gate reflects the
+// ACTUAL Git/GitHub repository that the worker modifies.
 //
+// For GITHUB_BACKED: reads real GitHub repository contents.
+// For LOCAL_ONLY: derives a best-available view from TaskEvidence
+//   (file contents are not persisted — content-based checks honestly report
+//   that they require GitHub connection for verification).
+//
+// Preflight: runs BEFORE Start Build. Verifies every required credential.
 // Readiness Gate: runs AFTER all tasks complete. Verifies the project has
-// real evidence across 12 categories. Only when every required check PASSES
-// may the project enter PRODUCTION_READY.
+// real evidence across 12 categories.
 
 import { db } from "@/lib/db";
 import { ReadinessCategory, BuildEventType } from "@/lib/types";
 import { ensureBuildEvent } from "@/lib/events";
+import { getRepositorySnapshot, type RepoSnapshot } from "@/lib/repository-reader";
 
 // ---------------------------------------------------------------------------
 // Preflight
@@ -58,37 +65,39 @@ export interface ReadinessCheckDef {
   name: string;
   description: string;
   required: boolean;
-  // returns { passed, evidence, failureReason? }
-  check: (projectId: string) => Promise<{
+  check: (projectId: string, repo: RepoSnapshot) => Promise<{
     passed: boolean;
     evidence?: any;
     failureReason?: string;
   }>;
 }
 
-// Helpers
-async function getProjectData(projectId: string) {
-  const [files, tasks, commits, prs, creds, architecture] = await Promise.all([
-    db.repoFile.findMany({ where: { projectId } }),
+// Load DB-only project data (tasks, creds, architecture).
+// The canonical repository snapshot is fetched SEPARATELY in runReadinessGate
+// and passed to checks via the `repo` parameter — avoids redundant GitHub API calls.
+async function getProjectDbData(projectId: string): Promise<{
+  tasks: any[];
+  creds: any[];
+  architecture: any;
+}> {
+  const [tasks, creds, architecture] = await Promise.all([
     db.task.findMany({ where: { projectId } }),
-    db.repoCommit.findMany({ where: { projectId } }),
-    db.pullRequest.findMany({ where: { projectId } }),
     db.credential.findMany({ where: { projectId } }),
     db.architecture.findUnique({ where: { projectId } }),
   ]);
-  return { files, tasks, commits, prs, creds, architecture };
+  return { tasks, creds, architecture };
 }
 
-// Definitions — each check produces real evidence from the DB.
+// Definitions — each check produces real evidence from canonical sources.
 export const READINESS_CHECKS: ReadinessCheckDef[] = [
   {
     category: ReadinessCategory.BUILD,
     name: "Application files present",
     description: "Repository contains application source files (not just README).",
     required: true,
-    check: async (projectId) => {
-      const { files } = await getProjectData(projectId);
-      const appFiles = files.filter(
+    check: async (_projectId, repo) => {
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      const appFiles = repo.files.filter(
         (f) => !f.path.startsWith(".") && f.path !== "README.md" && f.path !== "package.json"
       );
       return {
@@ -104,9 +113,9 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "package.json / dependency manifest exists",
     description: "Repository declares its dependencies.",
     required: true,
-    check: async (projectId) => {
-      const { files } = await getProjectData(projectId);
-      const pkg = files.find((f) => f.path === "package.json" || f.path === "requirements.txt" || f.path === "go.mod" || f.path === "Cargo.toml");
+    check: async (_projectId, repo) => {
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      const pkg = repo.files.find((f) => f.path === "package.json" || f.path === "requirements.txt" || f.path === "go.mod" || f.path === "Cargo.toml");
       return {
         passed: !!pkg,
         evidence: pkg ? { path: pkg.path } : null,
@@ -119,15 +128,21 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "No high-severity suspicious patterns in production paths",
     description: "Fake Implementation Detector found no TODO/mock/stub/placeholder in app code.",
     required: true,
-    check: async (projectId) => {
-      const { files } = await getProjectData(projectId);
+    check: async (_projectId, repo) => {
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      if (repo.mode === "LOCAL_ONLY") {
+        return {
+          passed: false,
+          evidence: { mode: "LOCAL_ONLY", reason: "File contents not persisted for local-only projects" },
+          failureReason: "Cannot scan file contents — connect GitHub for production readiness verification",
+        };
+      }
       const offenders: { path: string; patterns: string[] }[] = [];
-      for (const f of files) {
+      for (const f of repo.files) {
         if (f.path === "README.md" || f.path.startsWith(".git")) continue;
-        const pats = JSON.parse(f.suspiciousPatterns || "[]");
-        if (Array.isArray(pats) && pats.length > 0) {
-          // Only flag high-severity patterns in production paths.
-          const high = pats.filter((p: string) =>
+        if (f.content === null) continue; // content not fetched (non-source or over cap)
+        if (f.suspiciousPatterns.length > 0) {
+          const high = f.suspiciousPatterns.filter((p) =>
             ["mock (commented)", "stub (commented)", "fake (commented)", "dummy (commented)", "not implemented", "not implemented throw", "hardcoded response", "coming soon"].includes(p)
           );
           if (high.length > 0) offenders.push({ path: f.path, patterns: high });
@@ -149,7 +164,7 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     description: "Every task in the task graph reached COMPLETED state.",
     required: true,
     check: async (projectId) => {
-      const { tasks } = await getProjectData(projectId);
+      const { tasks } = await getProjectDbData(projectId);
       const incomplete = tasks.filter((t) => t.status !== "COMPLETED");
       return {
         passed: tasks.length > 0 && incomplete.length === 0,
@@ -164,7 +179,7 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     description: "Tasks recorded test results and they pass.",
     required: true,
     check: async (projectId) => {
-      const { tasks } = await getProjectData(projectId);
+      const { tasks } = await getProjectDbData(projectId);
       let total = 0, passing = 0;
       for (const t of tasks) {
         const results = JSON.parse(t.testResultsJson || "[]") as any[];
@@ -185,9 +200,9 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "Application entrypoint defined",
     description: "Repository has a runnable entrypoint (server.js / main.py / index.ts / etc).",
     required: true,
-    check: async (projectId) => {
-      const { files } = await getProjectData(projectId);
-      const entry = files.find((f) =>
+    check: async (_projectId, repo) => {
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      const entry = repo.files.find((f) =>
         ["server.js", "src/index.ts", "src/main.ts", "main.py", "app.py", "cmd/main.go", "src/main.rs"].includes(f.path)
       );
       return {
@@ -202,9 +217,9 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "Database schema defined",
     description: "Repository declares its data models / schema.",
     required: true,
-    check: async (projectId) => {
-      const { files, architecture } = await getProjectData(projectId);
-      const schemaFile = files.find((f) =>
+    check: async (projectId, repo) => {
+      const { architecture } = await getProjectDbData(projectId);
+      const schemaFile = repo.files.find((f) =>
         f.path.includes("schema") || f.path.endsWith("prisma") || f.path.endsWith(".sql") || f.path.includes("models/")
       );
       const archDataModels = architecture ? JSON.parse(architecture.dataModels || "[]") : [];
@@ -220,9 +235,9 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "Authentication implemented",
     description: "Repository contains auth implementation (login/session/jwt route).",
     required: true,
-    check: async (projectId) => {
-      const { files, architecture } = await getProjectData(projectId);
-      const authFile = files.find((f) =>
+    check: async (projectId, repo) => {
+      const { architecture } = await getProjectDbData(projectId);
+      const authFile = repo.files.find((f) =>
         f.path.toLowerCase().includes("auth") ||
         f.path.toLowerCase().includes("login") ||
         f.path.toLowerCase().includes("session")
@@ -242,7 +257,7 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     description: "Every integration named in the architecture has its required credential set.",
     required: true,
     check: async (projectId) => {
-      const { architecture, creds } = await getProjectData(projectId);
+      const { architecture, creds } = await getProjectDbData(projectId);
       const integrations = architecture ? JSON.parse(architecture.integrations || "[]") : [];
       const missing: string[] = [];
       for (const integ of integrations) {
@@ -263,12 +278,21 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "Error handling present",
     description: "Implementation includes error-handling patterns (try/catch or equivalent).",
     required: true,
-    check: async (projectId) => {
-      const { files } = await getProjectData(projectId);
-      const appFiles = files.filter((f) => [".ts", ".tsx", ".js", ".jsx", ".py", ".go"].some((ext) => f.path.endsWith(ext)));
+    check: async (_projectId, repo) => {
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      if (repo.mode === "LOCAL_ONLY") {
+        return {
+          passed: false,
+          evidence: { mode: "LOCAL_ONLY", reason: "File contents not persisted for local-only projects" },
+          failureReason: "Cannot scan file contents — connect GitHub for production readiness verification",
+        };
+      }
       let errorHandlers = 0;
-      for (const f of appFiles) {
-        if (/try\s*\{|except\s+\w+|catch\s*\(|\.catch\(/i.test(f.content)) errorHandlers++;
+      for (const f of repo.files) {
+        if (f.content === null) continue;
+        if ([".ts", ".tsx", ".js", ".jsx", ".py", ".go"].some((ext) => f.path.endsWith(ext))) {
+          if (/try\s*\{|except\s+\w+|catch\s*\(|\.catch\(/i.test(f.content)) errorHandlers++;
+        }
       }
       return {
         passed: errorHandlers > 0,
@@ -282,14 +306,15 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "Health check endpoint",
     description: "Repository exposes a /health or /healthz endpoint.",
     required: true,
-    check: async (projectId) => {
-      const { files, architecture } = await getProjectData(projectId);
-      const healthFile = files.find((f) => /health/i.test(f.path) || /health/i.test(f.content.slice(0, 2000)));
+    check: async (projectId, repo) => {
+      const { architecture } = await getProjectDbData(projectId);
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      const healthFile = repo.files.find((f) => /health/i.test(f.path) || (f.content && /health/i.test(f.content.slice(0, 2000))));
       const archApis = architecture ? JSON.parse(architecture.apiContracts || "[]") : [];
       const healthApi = archApis.find((a: any) => /health/i.test(a.path));
       return {
         passed: !!healthFile || !!healthApi,
-        evidence: { healthFile: healthFile?.path, healthApi: healthApi?.path },
+        evidence: { healthFile: healthFile?.path, healthApiPath: healthApi?.path },
         failureReason: !healthFile && !healthApi ? "No health endpoint" : undefined,
       };
     },
@@ -299,11 +324,19 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "No committed secrets",
     description: "No file content contains obvious secret patterns (sk_live_, AKIA, etc).",
     required: true,
-    check: async (projectId) => {
-      const { files } = await getProjectData(projectId);
+    check: async (_projectId, repo) => {
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      if (repo.mode === "LOCAL_ONLY") {
+        return {
+          passed: false,
+          evidence: { mode: "LOCAL_ONLY", reason: "File contents not persisted for local-only projects" },
+          failureReason: "Cannot scan file contents — connect GitHub for production readiness verification",
+        };
+      }
       const secretPatterns = [/sk_live_[A-Za-z0-9]{16,}/, /sk_test_[A-Za-z0-9]{16,}/, /AKIA[0-9A-Z]{16}/, /-----BEGIN (RSA |EC )?PRIVATE KEY-----/];
       const offenders: string[] = [];
-      for (const f of files) {
+      for (const f of repo.files) {
+        if (f.content === null) continue;
         for (const p of secretPatterns) {
           if (p.test(f.content)) offenders.push(f.path);
         }
@@ -320,9 +353,9 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "Environment configuration documented",
     description: "Repository includes .env.example or environment documentation.",
     required: true,
-    check: async (projectId) => {
-      const { files } = await getProjectData(projectId);
-      const env = files.find((f) => f.path === ".env.example" || f.path === "ENVIRONMENT.md" || f.path === "docs/environment.md");
+    check: async (_projectId, repo) => {
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      const env = repo.files.find((f) => f.path === ".env.example" || f.path === "ENVIRONMENT.md" || f.path === "docs/environment.md");
       return {
         passed: !!env,
         evidence: env ? { path: env.path } : null,
@@ -335,9 +368,9 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "Deployment configuration exists",
     description: "Repository has Dockerfile, docker-compose, or equivalent deployment config.",
     required: true,
-    check: async (projectId) => {
-      const { files } = await getProjectData(projectId);
-      const deploy = files.find((f) =>
+    check: async (_projectId, repo) => {
+      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
+      const deploy = repo.files.find((f) =>
         ["Dockerfile", "docker-compose.yml", "docker-compose.yaml", "vercel.json", "netlify.toml", "fly.toml", "render.yaml", "Procfile"].includes(f.path)
       );
       return {
@@ -353,7 +386,7 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     description: "Every task passed Architecture Guardian verification (PASS, not VIOLATION).",
     required: true,
     check: async (projectId) => {
-      const { tasks } = await getProjectData(projectId);
+      const { tasks } = await getProjectDbData(projectId);
       const offenders = tasks.filter((t) => t.architectureStatus === "VIOLATION" || t.architectureStatus === "PENDING");
       return {
         passed: offenders.length === 0,
@@ -368,7 +401,7 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     description: "Every task passed independent code review (PASSED, not FAILED).",
     required: true,
     check: async (projectId) => {
-      const { tasks } = await getProjectData(projectId);
+      const { tasks } = await getProjectDbData(projectId);
       const offenders = tasks.filter((t) => t.reviewStatus === "FAILED" || t.reviewStatus === "PENDING");
       return {
         passed: offenders.length === 0,
@@ -389,9 +422,34 @@ export async function runReadinessGate(projectId: string): Promise<{
   failedCount: number;
   results: any[];
 }> {
+  // Fetch the canonical repository snapshot ONCE (with content) and share
+  // it across all checks — avoids redundant GitHub API calls.
+  const project = await db.project.findUnique({
+    where: { id: projectId },
+    select: {
+      id: true,
+      githubConnected: true,
+      githubRepo: true,
+      githubDefaultBranch: true,
+      canonicalHeadSha: true,
+    },
+  });
+  const repo: RepoSnapshot = project
+    ? await getRepositorySnapshot(project, true)
+    : {
+        mode: "LOCAL_ONLY",
+        head: null,
+        branches: [],
+        files: [],
+        commits: [],
+        pullRequests: [],
+        unreadable: true,
+        unreadableReason: "Project not found",
+      };
+
   const results: any[] = [];
   for (const def of READINESS_CHECKS) {
-    const r = await def.check(projectId);
+    const r = await def.check(projectId, repo);
     const status = r.passed ? "PASSED" : "FAILED";
     results.push({
       category: def.category,

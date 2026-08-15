@@ -56,7 +56,7 @@ model Project {
 
   @@index([userId])
 
-  // GitHub connection (simulated, DB-backed virtual repo)
+  // GitHub connection (real GitHub repository — canonical source of code)
   githubRepo        String?            // owner/name
   githubConnected   Boolean  @default(false)
   githubDefaultBranch String  @default("main")
@@ -75,6 +75,8 @@ model Project {
   agents            AgentAssignment[]
   credentials       Credential[]
   events            BuildEvent[]
+  // LEGACY metadata relations — NOT canonical repository state.
+  // Real Git/GitHub is the canonical source (read via repository-reader.ts).
   files             RepoFile[]
   branches          RepoBranch[]
   commits           RepoCommit[]
@@ -337,7 +339,12 @@ model Credential {
 }
 
 // ---------------------------------------------------------------------------
-// Virtual Repository (DB-backed GitHub simulation)
+// Legacy repository metadata / cache.
+//
+// NOT canonical repository state. Never written by execution/integration paths.
+// Canonical source is real Git/GitHub (read via src/lib/repository-reader.ts).
+// These models may hold historical metadata but must NEVER be used as the
+// source of truth for readiness decisions or repository display.
 // ---------------------------------------------------------------------------
 
 model RepoBranch {
