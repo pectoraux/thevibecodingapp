@@ -1,4 +1,4 @@
-// Forge — Phase 17: Canonical Repository Read Adapter.
+// Forge — Phase 17A: Canonical Repository Read Adapter.
 //
 // This is the ONE canonical reader for repository state used by:
 //   - the Production Readiness Gate (src/lib/readiness.ts)
@@ -7,20 +7,31 @@
 // CANONICAL SOURCE INVARIANT:
 //   GITHUB_BACKED → reads the ACTUAL GitHub repository (integration branch).
 //   LOCAL_ONLY    → derives a best-available view from TaskEvidence
-//                   (there is no persistent local repo — the worker's /tmp
+//                   (there is no persistent repo — the worker's /tmp
 //                   checkout is deleted after execution).
 //
-// This module NEVER writes to RepoBranch/RepoCommit/RepoFile/PullRequest.
-// Those DB models are legacy metadata only (see prisma/schema.prisma).
+// PHASE 17A CORRECTNESS GUARANTEES:
+//   1. COMPLETE CONTENT — downloads the GitHub tarball at the exact canonical
+//      SHA. No arbitrary file-count cap. Every text file is scanned.
+//   2. TREE TRUNCATION — if the GitHub Trees API is used (for the UI list
+//      view without content), a `truncated: true` response makes the snapshot
+//      UNVERIFIED. The tarball approach (used for readiness) is not subject
+//      to tree truncation.
+//   3. CANONICAL HEAD FRESHNESS — before readiness scanning, the reader
+//      verifies that `project.canonicalHeadSha` equals the actual GitHub
+//      integration branch HEAD. If they differ → CANONICAL_HEAD_STALE.
+//   4. EXACT REVISION — the verified SHA is recorded in every snapshot and
+//      propagated to readiness results for reproducibility.
 //
-// Evidence vs Repository distinction:
-//   TaskEvidence = what Forge observed (immutable ledger)
-//   GitHub       = what the repository actually contains
-// For GITHUB_BACKED, repository truth comes from GitHub. For LOCAL_ONLY,
-// there is no persistent repository, so evidence is the best-available source.
+// This module NEVER writes to RepoBranch/RepoCommit/RepoFile/PullRequest.
+// Content scanning is delegated to src/lib/repository-scanner.ts.
 
 import { db } from "@/lib/db";
-import { SUSPICIOUS_PATTERNS } from "@/lib/types";
+import { Readable } from "node:stream";
+import { createGunzip } from "node:zlib";
+import { createWriteStream, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { join, dirname } from "node:path";
+import * as tar from "tar";
 
 // ---------------------------------------------------------------------------
 // View types — match the frontend API contract (components/forge/lib/types.ts)
@@ -38,7 +49,7 @@ export interface RepoFileView {
   path: string;
   language: string | null;
   bytes: number;
-  content: string | null; // null when unavailable (LOCAL_ONLY, binary, or too large)
+  content: string | null;
   suspiciousPatterns: string[];
   branch: string | null;
   commitSha: string | null;
@@ -66,7 +77,12 @@ export interface RepoPullRequestView {
 
 export interface RepoSnapshot {
   mode: "GITHUB_BACKED" | "LOCAL_ONLY";
+  /** The exact immutable SHA the snapshot was read from. Recorded for reproducibility. */
   head: string | null;
+  /** True when the canonicalHeadSha was verified to equal the GitHub branch HEAD. */
+  headVerified: boolean;
+  /** When headVerified is false, explains why (STALE, UNREACHABLE, etc.). */
+  headVerificationNote: string | null;
   branches: RepoBranchView[];
   files: RepoFileView[];
   commits: RepoCommitView[];
@@ -74,21 +90,10 @@ export interface RepoSnapshot {
   /** True when the canonical source was unreachable (GitHub API error, no PAT, etc.). */
   unreadable: boolean;
   unreadableReason: string | null;
-}
-
-// ---------------------------------------------------------------------------
-// Suspicious-pattern scanner (pure utility — operates on content)
-// ---------------------------------------------------------------------------
-
-export function scanSuspiciousPatterns(content: string): string[] {
-  const found: string[] = [];
-  const lower = content.toLowerCase();
-  for (const p of SUSPICIOUS_PATTERNS) {
-    if (lower.includes(p.pattern.toLowerCase())) {
-      found.push(p.label);
-    }
-  }
-  return found;
+  /** True when the tree was truncated (incomplete file list). Readiness must fail. */
+  truncated: boolean;
+  /** Raw file contents (Buffer) from tarball extraction — used by the scanner. */
+  rawFiles?: { path: string; content: Buffer }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +112,7 @@ export function getProjectMode(project: {
 }
 
 // ---------------------------------------------------------------------------
-// GitHub API helpers (consistent with submit-evidence / merge route pattern)
+// GitHub API helpers
 // ---------------------------------------------------------------------------
 
 function githubHeaders(): Record<string, string> | null {
@@ -123,65 +128,201 @@ function githubHeaders(): Record<string, string> | null {
 function inferLanguage(path: string): string | null {
   const ext = path.split(".").pop()?.toLowerCase();
   const map: Record<string, string> = {
-    ts: "typescript",
-    tsx: "typescript",
-    js: "javascript",
-    jsx: "javascript",
-    py: "python",
-    go: "go",
-    rs: "rust",
-    rb: "ruby",
-    java: "java",
-    kt: "kotlin",
-    swift: "swift",
-    md: "markdown",
-    json: "json",
-    yml: "yaml",
-    yaml: "yaml",
-    toml: "toml",
-    sql: "sql",
-    sh: "shell",
-    css: "css",
-    html: "html",
-    prisma: "prisma",
+    ts: "typescript", tsx: "typescript",
+    js: "javascript", jsx: "javascript",
+    py: "python", go: "go", rs: "rust", rb: "ruby",
+    java: "java", kt: "kotlin", swift: "swift",
+    md: "markdown", json: "json", yml: "yaml", yaml: "yaml",
+    toml: "toml", sql: "sql", sh: "shell",
+    css: "css", html: "html", prisma: "prisma",
   };
   return ext ? map[ext] ?? null : null;
 }
 
-const SOURCE_EXTENSIONS = new Set([
-  "ts",
-  "tsx",
-  "js",
-  "jsx",
-  "py",
-  "go",
-  "rs",
-  "rb",
-  "java",
-  "kt",
-  "swift",
-  "sh",
-  "css",
-  "html",
-  "sql",
-  "prisma",
-  "md",
-  "json",
-  "yml",
-  "yaml",
-  "toml",
-]);
+// ---------------------------------------------------------------------------
+// Canonical HEAD freshness verification
+// ---------------------------------------------------------------------------
 
-function isSourceFile(path: string): boolean {
-  const ext = path.split(".").pop()?.toLowerCase();
-  return ext ? SOURCE_EXTENSIONS.has(ext) : false;
+/**
+ * Verify that project.canonicalHeadSha equals the actual GitHub integration
+ * branch HEAD. If they differ, the cached SHA is stale — readiness must block.
+ *
+ * Returns the verified HEAD SHA, or null if verification failed.
+ */
+async function verifyCanonicalHeadFreshness(
+  owner: string,
+  repo: string,
+  branch: string,
+  cachedHeadSha: string | null,
+  headers: Record<string, string>
+): Promise<{ sha: string | null; verified: boolean; note: string | null }> {
+  try {
+    const branchRes = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`,
+      { headers, signal: AbortSignal.timeout(10000) }
+    );
+
+    if (!branchRes.ok) {
+      if (branchRes.status === 404) {
+        return { sha: null, verified: false, note: `GitHub branch '${branch}' not found` };
+      }
+      return { sha: null, verified: false, note: `GitHub API returned HTTP ${branchRes.status}` };
+    }
+
+    const branchData = await branchRes.json();
+    const actualHead = branchData.commit?.sha ?? null;
+
+    if (!actualHead) {
+      return { sha: null, verified: false, note: "GitHub branch HEAD is null" };
+    }
+
+    if (cachedHeadSha && cachedHeadSha !== actualHead) {
+      // CANONICAL_HEAD_STALE — the cached SHA doesn't match the real branch HEAD.
+      return {
+        sha: actualHead,
+        verified: false,
+        note: `CANONICAL_HEAD_STALE: cached ${cachedHeadSha.slice(0, 7)} != branch HEAD ${actualHead.slice(0, 7)}`,
+      };
+    }
+
+    // Either no cached SHA (first time) or it matches.
+    return { sha: actualHead, verified: true, note: null };
+  } catch (err: any) {
+    return { sha: null, verified: false, note: `GitHub API unreachable: ${err.message}` };
+  }
 }
 
-// Max files to fetch individual content for (avoids rate-limit exhaustion).
-const MAX_CONTENT_FETCHES = 50;
+// ---------------------------------------------------------------------------
+// Tarball download + extraction — COMPLETE repository content
+// ---------------------------------------------------------------------------
+
+const TARBALL_TIMEOUT_MS = 120000; // 2 minutes
+const MAX_TARBALL_SIZE = 200 * 1024 * 1024; // 200 MB safety limit
+
+/**
+ * Download the GitHub repository tarball at the exact SHA and extract all
+ * file contents. This gives COMPLETE repository coverage in one download —
+ * no per-file API calls, no 50-file cap, no tree truncation.
+ *
+ * Returns an array of { path, content: Buffer } for every file in the repo.
+ */
+async function downloadAndExtractTarball(
+  owner: string,
+  repo: string,
+  sha: string,
+  headers: Record<string, string>
+): Promise<{ files: { path: string; content: Buffer }[]; truncated: boolean }> {
+  const tarballUrl = `https://api.github.com/repos/${owner}/${repo}/tarball/${sha}`;
+
+  const tempDir = `/tmp/forge-tarball-${sha.slice(0, 12)}-${Date.now()}`;
+  const tarballPath = join(tempDir, "repo.tar.gz");
+  const extractDir = join(tempDir, "extracted");
+
+  try {
+    mkdirSync(tempDir, { recursive: true });
+    mkdirSync(extractDir, { recursive: true });
+
+    // Download tarball.
+    const response = await fetch(tarballUrl, {
+      headers,
+      signal: AbortSignal.timeout(TARBALL_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      throw new Error(`GitHub tarball download failed: HTTP ${response.status}`);
+    }
+
+    const contentLength = parseInt(response.headers.get("content-length") || "0", 10);
+    if (contentLength > MAX_TARBALL_SIZE) {
+      throw new Error(`Tarball too large: ${contentLength} bytes (limit: ${MAX_TARBALL_SIZE})`);
+    }
+
+    // Write tarball to disk (streaming).
+    const writeStream = createWriteStream(tarballPath);
+    const nodeStream = Readable.fromWeb(response.body as any);
+    await new Promise<void>((resolve, reject) => {
+      nodeStream.pipe(writeStream);
+      nodeStream.on("error", reject);
+      writeStream.on("error", reject);
+      writeStream.on("finish", resolve);
+    });
+
+    // Extract tarball.
+    await tar.x({
+      file: tarballPath,
+      Cwd: extractDir,
+      gzip: true,
+    });
+
+    // Walk extracted directory and read all files.
+    const files: { path: string; content: Buffer }[] = [];
+    const extractedRoots = readdirSync(extractDir);
+
+    // GitHub tarballs extract to a single top-level directory like
+    // "owner-repo-sha/". We need to strip that prefix.
+    const topDir = extractedRoots.find((d) => {
+      const stat = statSync(join(extractDir, d));
+      return stat.isDirectory();
+    });
+
+    if (!topDir) {
+      return { files: [], truncated: false };
+    }
+
+    const repoRoot = join(extractDir, topDir);
+    walkDirectory(repoRoot, "", files);
+
+    return { files, truncated: false };
+  } finally {
+    // Clean up temp directory.
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+function walkDirectory(
+  basePath: string,
+  relativePath: string,
+  files: { path: string; content: Buffer }[]
+): void {
+  const fullPath = relativePath ? join(basePath, relativePath) : basePath;
+  let entries: string[];
+  try {
+    entries = readdirSync(fullPath);
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    const entryRelative = relativePath ? `${relativePath}/${entry}` : entry;
+    const entryFull = join(fullPath, entry);
+
+    // Skip .git directory — we don't scan git internals.
+    if (entry === ".git") continue;
+
+    let stat;
+    try {
+      stat = statSync(entryFull);
+    } catch {
+      continue;
+    }
+
+    if (stat.isDirectory()) {
+      walkDirectory(basePath, entryRelative, files);
+    } else if (stat.isFile()) {
+      try {
+        const content = readFileSync(entryFull);
+        files.push({ path: entryRelative, content });
+      } catch {
+        // Skip unreadable files.
+      }
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
-// GITHUB_BACKED reader — reads the ACTUAL GitHub repository
+// GITHUB_BACKED reader — tarball-based COMPLETE content
 // ---------------------------------------------------------------------------
 
 async function readGitHubSnapshot(
@@ -191,7 +332,8 @@ async function readGitHubSnapshot(
     githubDefaultBranch: string;
     canonicalHeadSha: string | null;
   },
-  withContent: boolean
+  withContent: boolean,
+  verifyFreshness: boolean
 ): Promise<RepoSnapshot> {
   const headers = githubHeaders();
   if (!headers) {
@@ -200,146 +342,209 @@ async function readGitHubSnapshot(
 
   const [owner, repo] = project.githubRepo.split("/");
   const branch = project.githubDefaultBranch || "main";
-  const ref = project.canonicalHeadSha || branch;
 
-  // 1. Determine HEAD SHA.
-  let headSha = project.canonicalHeadSha;
-  if (!headSha) {
-    try {
-      const branchRes = await fetch(
-        `https://api.github.com/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`,
-        { headers, signal: AbortSignal.timeout(10000) }
-      );
-      if (branchRes.ok) {
-        const bd = await branchRes.json();
-        headSha = bd.commit?.sha ?? null;
-      } else if (branchRes.status === 404) {
-        return emptySnapshot("GITHUB_BACKED", true, `GitHub repository or branch not found: ${owner}/${repo}:${branch}`);
-      }
-    } catch {
-      return emptySnapshot("GITHUB_BACKED", true, `GitHub API unreachable (branch lookup failed)`);
+  // --- Canonical HEAD freshness verification (Phase 17A) ---
+  let verifiedSha = project.canonicalHeadSha;
+  let headVerified = true;
+  let headVerificationNote: string | null = null;
+
+  if (verifyFreshness) {
+    const result = await verifyCanonicalHeadFreshness(
+      owner, repo, branch, project.canonicalHeadSha, headers
+    );
+    verifiedSha = result.sha;
+    headVerified = result.verified;
+    headVerificationNote = result.note;
+
+    if (!verifiedSha) {
+      return {
+        ...emptySnapshot("GITHUB_BACKED", true, headVerificationNote ?? "Canonical HEAD verification failed"),
+        headVerified: false,
+        headVerificationNote,
+      };
     }
-  }
 
-  // 2. Fetch tree (file paths + sizes) — one API call.
-  let treeEntries: { path: string; type: string; size?: number; sha?: string }[] = [];
-  if (headSha) {
-    try {
-      const treeRes = await fetch(
-        `https://api.github.com/repos/${owner}/${repo}/git/trees/${headSha}?recursive=1`,
-        { headers, signal: AbortSignal.timeout(15000) }
-      );
-      if (treeRes.ok) {
-        const treeData = await treeRes.json();
-        treeEntries = (treeData.tree || []).filter((e: any) => e.type === "blob");
-      }
-    } catch {
-      // Non-fatal — files will be empty but head/commits may still work.
+    if (!headVerified) {
+      // CANONICAL_HEAD_STALE — return readable snapshot but mark as not verified.
+      // Readiness will block on headVerified === false.
     }
-  }
-
-  // 3. Fetch file contents for source files (capped) if requested.
-  const files: RepoFileView[] = [];
-  const sourceEntries = withContent
-    ? treeEntries.filter((e) => isSourceFile(e.path)).slice(0, MAX_CONTENT_FETCHES)
-    : [];
-
-  // Build file views: all tree entries get path/size; source entries get content.
-  const contentMap = new Map<string, string>();
-  if (withContent) {
-    for (const entry of sourceEntries) {
+  } else {
+    // No freshness verification requested (UI list view).
+    // Still need to resolve a SHA if canonicalHeadSha is null.
+    if (!verifiedSha) {
       try {
-        const contentRes = await fetch(
-          `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(entry.path)}?ref=${headSha}`,
+        const branchRes = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`,
           { headers, signal: AbortSignal.timeout(10000) }
         );
-        if (contentRes.ok) {
-          const contentData = await contentRes.json();
-          if (contentData.encoding === "base64" && contentData.content) {
-            contentMap.set(entry.path, Buffer.from(contentData.content, "base64").toString("utf-8"));
-          }
+        if (branchRes.ok) {
+          const bd = await branchRes.json();
+          verifiedSha = bd.commit?.sha ?? null;
+        } else if (branchRes.status === 404) {
+          return emptySnapshot("GITHUB_BACKED", true, `GitHub repository or branch not found: ${owner}/${repo}:${branch}`);
         }
       } catch {
-        // Non-fatal per-file — skip.
+        return emptySnapshot("GITHUB_BACKED", true, "GitHub API unreachable (branch lookup failed)");
       }
     }
   }
 
-  for (const entry of treeEntries) {
-    const content = contentMap.get(entry.path) ?? null;
-    files.push({
-      id: entry.path,
-      path: entry.path,
-      language: inferLanguage(entry.path),
-      bytes: entry.size ?? 0,
-      content,
-      suspiciousPatterns: content ? scanSuspiciousPatterns(content) : [],
+  const sha = verifiedSha!;
+
+  if (withContent) {
+    // --- COMPLETE content via tarball (Phase 17A) ---
+    // No 50-file cap. Downloads the entire repo at the exact SHA.
+    let tarballResult: { files: { path: string; content: Buffer }[]; truncated: boolean };
+    try {
+      tarballResult = await downloadAndExtractTarball(owner, repo, sha, headers);
+    } catch (err: any) {
+      return {
+        ...emptySnapshot("GITHUB_BACKED", true, `Tarball download/extraction failed: ${err.message}`),
+        headVerified,
+        headVerificationNote,
+      };
+    }
+
+    // Build file views from raw tarball content.
+    const files: RepoFileView[] = tarballResult.files.map((f) => ({
+      id: f.path,
+      path: f.path,
+      language: inferLanguage(f.path),
+      bytes: f.content.length,
+      content: null, // Content is in rawFiles for the scanner; UI list doesn't need it here.
+      suspiciousPatterns: [], // Computed by the scanner, not the reader.
       branch,
-      commitSha: headSha,
-    });
+      commitSha: sha,
+    }));
+
+    // Fetch commits and PRs for UI display (non-fatal if they fail).
+    const [commits, pullRequests] = await Promise.all([
+      fetchCommits(owner, repo, branch, headers),
+      fetchPullRequests(owner, repo, headers),
+    ]);
+
+    return {
+      mode: "GITHUB_BACKED",
+      head: sha,
+      headVerified,
+      headVerificationNote,
+      branches: [{ id: branch, name: branch, headSha: sha, isDefault: true }],
+      files,
+      commits,
+      pullRequests,
+      unreadable: false,
+      unreadableReason: null,
+      truncated: tarballResult.truncated,
+      rawFiles: tarballResult.files,
+    };
   }
 
-  // 4. Fetch commits (capped at 50).
-  let commits: RepoCommitView[] = [];
+  // --- List-only view (no content) — uses Trees API with truncation detection ---
+  let treeResult: { entries: { path: string; size?: number }[]; truncated: boolean };
   try {
-    const commitsRes = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(branch)}&per_page=50`,
-      { headers, signal: AbortSignal.timeout(10000) }
+    const treeRes = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`,
+      { headers, signal: AbortSignal.timeout(15000) }
     );
-    if (commitsRes.ok) {
-      const commitsData = await commitsRes.json();
-      commits = (commitsData as any[]).map((c) => ({
-        id: c.sha,
-        sha: c.sha,
-        branch,
-        message: c.commit?.message?.split("\n")[0] ?? "",
-        author: c.commit?.author?.name ?? "unknown",
-        createdAt: c.commit?.author?.date ?? new Date().toISOString(),
-        filesChanged: [],
-      }));
+    if (treeRes.ok) {
+      const treeData = await treeRes.json();
+      treeResult = {
+        entries: (treeData.tree || []).filter((e: any) => e.type === "blob").map((e: any) => ({ path: e.path, size: e.size })),
+        truncated: treeData.truncated === true,
+      };
+    } else {
+      treeResult = { entries: [], truncated: false };
     }
   } catch {
-    // Non-fatal.
+    treeResult = { entries: [], truncated: false };
   }
 
-  // 5. Fetch pull requests (open + recently merged).
-  let pullRequests: RepoPullRequestView[] = [];
-  try {
-    const prsRes = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&per_page=30&sort=updated&direction=desc`,
-      { headers, signal: AbortSignal.timeout(10000) }
-    );
-    if (prsRes.ok) {
-      const prsData = await prsRes.json();
-      pullRequests = (prsData as any[]).map((p) => ({
-        id: String(p.number),
-        number: p.number,
-        title: p.title,
-        sourceBranch: p.head?.ref ?? "",
-        targetBranch: p.base?.ref ?? "",
-        state: (p.merged_at ? "MERGED" : p.state?.toUpperCase()) ?? "OPEN",
-        createdAt: p.created_at ?? new Date().toISOString(),
-      }));
-    }
-  } catch {
-    // Non-fatal.
-  }
+  const files: RepoFileView[] = treeResult.entries.map((e) => ({
+    id: e.path,
+    path: e.path,
+    language: inferLanguage(e.path),
+    bytes: e.size ?? 0,
+    content: null,
+    suspiciousPatterns: [],
+    branch,
+    commitSha: sha,
+  }));
 
-  // 6. Branches — just the default + any forge/* branches from PRs.
-  const branches: RepoBranchView[] = [
-    { id: branch, name: branch, headSha, isDefault: true },
-  ];
+  const [commits, pullRequests] = await Promise.all([
+    fetchCommits(owner, repo, branch, headers),
+    fetchPullRequests(owner, repo, headers),
+  ]);
 
   return {
     mode: "GITHUB_BACKED",
-    head: headSha,
-    branches,
+    head: sha,
+    headVerified,
+    headVerificationNote,
+    branches: [{ id: branch, name: branch, headSha: sha, isDefault: true }],
     files,
     commits,
     pullRequests,
     unreadable: false,
     unreadableReason: null,
+    truncated: treeResult.truncated,
   };
+}
+
+// ---------------------------------------------------------------------------
+// GitHub commits + PRs fetch (shared, non-fatal)
+// ---------------------------------------------------------------------------
+
+async function fetchCommits(
+  owner: string,
+  repo: string,
+  branch: string,
+  headers: Record<string, string>
+): Promise<RepoCommitView[]> {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(branch)}&per_page=50`,
+      { headers, signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data as any[]).map((c) => ({
+      id: c.sha,
+      sha: c.sha,
+      branch,
+      message: c.commit?.message?.split("\n")[0] ?? "",
+      author: c.commit?.author?.name ?? "unknown",
+      createdAt: c.commit?.author?.date ?? new Date().toISOString(),
+      filesChanged: [],
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function fetchPullRequests(
+  owner: string,
+  repo: string,
+  headers: Record<string, string>
+): Promise<RepoPullRequestView[]> {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&per_page=30&sort=updated&direction=desc`,
+      { headers, signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data as any[]).map((p) => ({
+      id: String(p.number),
+      number: p.number,
+      title: p.title,
+      sourceBranch: p.head?.ref ?? "",
+      targetBranch: p.base?.ref ?? "",
+      state: (p.merged_at ? "MERGED" : p.state?.toUpperCase()) ?? "OPEN",
+      createdAt: p.created_at ?? new Date().toISOString(),
+    }));
+  } catch {
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +565,6 @@ async function readLocalSnapshot(projectId: string): Promise<RepoSnapshot> {
     },
   });
 
-  // Also pull task-level metadata for richer commit messages.
   const tasks = await db.task.findMany({
     where: { projectId },
     orderBy: { createdAt: "asc" },
@@ -383,19 +587,18 @@ async function readLocalSnapshot(projectId: string): Promise<RepoSnapshot> {
       createdAt: ev.createdAt.toISOString(),
       filesChanged: changedFiles.map((p) => ({ path: p, action: "update" })),
     });
+    // Phase 17A: NEWEST evidence for a path wins (was: first occurrence).
     for (const path of changedFiles) {
-      if (!fileMap.has(path)) {
-        fileMap.set(path, {
-          id: path,
-          path,
-          language: inferLanguage(path),
-          bytes: 0, // unknown — content not persisted
-          content: null, // LOCAL_ONLY: content not available
-          suspiciousPatterns: [], // cannot scan without content
-          branch: ev.branchName,
-          commitSha: ev.commitSha,
-        });
-      }
+      fileMap.set(path, {
+        id: path,
+        path,
+        language: inferLanguage(path),
+        bytes: 0,
+        content: null, // LOCAL_ONLY: content not persisted
+        suspiciousPatterns: [],
+        branch: ev.branchName,
+        commitSha: ev.commitSha,
+      });
     }
   }
 
@@ -404,12 +607,15 @@ async function readLocalSnapshot(projectId: string): Promise<RepoSnapshot> {
   return {
     mode: "LOCAL_ONLY",
     head,
+    headVerified: false, // No GitHub to verify against
+    headVerificationNote: "LOCAL_ONLY — no canonical HEAD to verify",
     branches: head ? [{ id: "main", name: "main", headSha: head, isDefault: true }] : [],
     files: Array.from(fileMap.values()).sort((a, b) => a.path.localeCompare(b.path)),
     commits: commits.reverse(), // newest first
-    pullRequests: [], // no PRs for local-only
+    pullRequests: [],
     unreadable: false,
     unreadableReason: null,
+    truncated: false,
   };
 }
 
@@ -425,22 +631,27 @@ function emptySnapshot(
   return {
     mode,
     head: null,
+    headVerified: false,
+    headVerificationNote: reason,
     branches: [],
     files: [],
     commits: [],
     pullRequests: [],
     unreadable,
     unreadableReason: reason,
+    truncated: false,
   };
 }
 
 /**
  * Get the canonical repository snapshot.
  *
- * @param project The project (must include githubConnected, githubRepo, etc.)
- * @param withContent When true, fetches file contents for source files
- *                    (GITHUB_BACKED only; capped at 50 files). Use false for
- *                    list views, true for content-based readiness checks.
+ * @param project The project.
+ * @param withContent When true, downloads the COMPLETE repository tarball
+ *                    (GITHUB_BACKED only). No file-count cap.
+ * @param verifyFreshness When true, verifies canonicalHeadSha equals the
+ *                        actual GitHub branch HEAD. Use true for readiness
+ *                        (fail-closed on staleness), false for UI display.
  */
 export async function getRepositorySnapshot(
   project: {
@@ -450,18 +661,19 @@ export async function getRepositorySnapshot(
     githubDefaultBranch: string;
     canonicalHeadSha: string | null;
   },
-  withContent = false
+  withContent = false,
+  verifyFreshness = false
 ): Promise<RepoSnapshot> {
   const mode = getProjectMode(project);
   if (mode === "GITHUB_BACKED") {
-    return readGitHubSnapshot(project, withContent);
+    return readGitHubSnapshot(project, withContent, verifyFreshness);
   }
   return readLocalSnapshot(project.id);
 }
 
 /**
  * Get a single file's content from the canonical source.
- * Used by the file-detail UI route and content-based readiness checks.
+ * Used by the file-detail UI route.
  */
 export async function getFileContent(
   project: {
@@ -497,7 +709,7 @@ export async function getFileContent(
         language: inferLanguage(path),
         bytes: data.size ?? (content?.length ?? 0),
         content,
-        suspiciousPatterns: content ? scanSuspiciousPatterns(content) : [],
+        suspiciousPatterns: [], // Computed by scanner, not reader
         branch: project.githubDefaultBranch,
         commitSha: ref,
       };
@@ -517,7 +729,7 @@ export async function getFileContent(
     path,
     language: inferLanguage(path),
     bytes: 0,
-    content: null, // LOCAL_ONLY: content not available
+    content: null,
     suspiciousPatterns: [],
     branch: ev.branchName,
     commitSha: ev.commitSha,

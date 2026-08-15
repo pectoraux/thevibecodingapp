@@ -42,7 +42,34 @@ export function enforceProductionMode(): ProductionCheckResult {
 /**
  * Check if the production readiness gate should refuse based on execution mode.
  * LOCAL_UNSANDBOXED can never reach PRODUCTION_READY.
+ *
+ * Phase 17A: Also blocks LOCAL_ONLY projects — the worker's /tmp checkout is
+ * ephemeral and file contents are not persisted, so content-based readiness
+ * checks cannot verify the actual repository. A GitHub connection is required
+ * for PRODUCTION_READY.
  */
-export function canReachProductionReady(): boolean {
-  return FORGE_EXECUTION_MODE === "sandbox";
+export function canReachProductionReady(projectMode?: "LOCAL_ONLY" | "GITHUB_BACKED"): boolean {
+  // Execution mode must be sandboxed.
+  if (FORGE_EXECUTION_MODE !== "sandbox") return false;
+
+  // Project mode must be GITHUB_BACKED (Phase 17A).
+  // LOCAL_ONLY cannot reach PRODUCTION_READY — no persistent repository.
+  if (projectMode === "LOCAL_ONLY") return false;
+
+  return true;
+}
+
+/**
+ * Phase 17A: Explicit LOCAL_ONLY production-ready policy.
+ *
+ * LOCAL_ONLY projects:
+ *   ✅ can develop and test
+ *   ✅ can complete tasks
+ *   ❌ cannot reach PRODUCTION_READY
+ *
+ * This is enforced structurally in the readiness gate (a dedicated check
+ * fails for LOCAL_ONLY) AND here as a policy function.
+ */
+export function getLocalOnlyPolicyReason(): string {
+  return "LOCAL_ONLY projects cannot reach PRODUCTION_READY — the worker's /tmp checkout is ephemeral and file contents are not persisted. Connect a GitHub repository to enable production readiness verification.";
 }

@@ -192,14 +192,15 @@ const reader = readFile("src/lib/repository-reader.ts");
 }
 
 // R9: repository-reader.ts exports the canonical interface.
+// Phase 17A: scanSuspiciousPatterns moved to repository-scanner.ts (separation of concerns).
 {
   const exportsGetSnapshot = reader.includes("export async function getRepositorySnapshot");
   const exportsGetFile = reader.includes("export async function getFileContent");
-  const exportsScanPatterns = reader.includes("export function scanSuspiciousPatterns");
+  const doesNotExportScanPatterns = !reader.includes("export function scanSuspiciousPatterns");
   results.push({
-    name: "repository-reader.ts exports getRepositorySnapshot, getFileContent, scanSuspiciousPatterns",
-    passed: exportsGetSnapshot && exportsGetFile && exportsScanPatterns,
-    details: `getRepositorySnapshot: ${exportsGetSnapshot}, getFileContent: ${exportsGetFile}, scanSuspiciousPatterns: ${exportsScanPatterns}`,
+    name: "repository-reader.ts exports getRepositorySnapshot, getFileContent (scanner separated to repository-scanner.ts)",
+    passed: exportsGetSnapshot && exportsGetFile && doesNotExportScanPatterns,
+    details: `getRepositorySnapshot: ${exportsGetSnapshot}, getFileContent: ${exportsGetFile}, scanSuspiciousPatterns NOT in reader: ${doesNotExportScanPatterns}`,
   });
 }
 

@@ -1,14 +1,13 @@
 // Forge — credential preflight & readiness gate.
 //
-// Phase 17: The readiness gate reads repository state from the CANONICAL
-// repository adapter (src/lib/repository-reader.ts), NOT from the legacy
-// DB-backed RepoFile/RepoCommit models. This ensures the gate reflects the
-// ACTUAL Git/GitHub repository that the worker modifies.
-//
-// For GITHUB_BACKED: reads real GitHub repository contents.
-// For LOCAL_ONLY: derives a best-available view from TaskEvidence
-//   (file contents are not persisted — content-based checks honestly report
-//   that they require GitHub connection for verification).
+// Phase 17A: The readiness gate now:
+//   1. Uses the canonical repository-reader (tarball-based, COMPLETE content).
+//   2. Uses the repository-scanner (secrets, suspicious patterns, binary detection).
+//   3. Verifies canonical HEAD freshness — blocks on CANONICAL_HEAD_STALE.
+//   4. Detects tree truncation — blocks when tree is incomplete.
+//   5. Records the exact immutable SHA in every readiness result.
+//   6. Explicitly blocks LOCAL_ONLY from reaching PRODUCTION_READY.
+//   7. Marks files too large to scan as UNVERIFIED — fails (never silently skips).
 //
 // Preflight: runs BEFORE Start Build. Verifies every required credential.
 // Readiness Gate: runs AFTER all tasks complete. Verifies the project has
@@ -17,7 +16,20 @@
 import { db } from "@/lib/db";
 import { ReadinessCategory, BuildEventType } from "@/lib/types";
 import { ensureBuildEvent } from "@/lib/events";
-import { getRepositorySnapshot, type RepoSnapshot } from "@/lib/repository-reader";
+import {
+  getRepositorySnapshot,
+  type RepoSnapshot,
+  type ProjectMode,
+  getProjectMode,
+} from "@/lib/repository-reader";
+import {
+  scanRepository,
+  summarizeScan,
+  hasErrorHandling,
+  getHighSeverityPatterns,
+  type ScannedFile,
+  type ScanSummary,
+} from "@/lib/repository-scanner";
 
 // ---------------------------------------------------------------------------
 // Preflight
@@ -65,7 +77,7 @@ export interface ReadinessCheckDef {
   name: string;
   description: string;
   required: boolean;
-  check: (projectId: string, repo: RepoSnapshot) => Promise<{
+  check: (projectId: string, repo: RepoSnapshot, scan: ScanSummary, scannedFiles: ScannedFile[]) => Promise<{
     passed: boolean;
     evidence?: any;
     failureReason?: string;
@@ -73,8 +85,6 @@ export interface ReadinessCheckDef {
 }
 
 // Load DB-only project data (tasks, creds, architecture).
-// The canonical repository snapshot is fetched SEPARATELY in runReadinessGate
-// and passed to checks via the `repo` parameter — avoids redundant GitHub API calls.
 async function getProjectDbData(projectId: string): Promise<{
   tasks: any[];
   creds: any[];
@@ -90,6 +100,81 @@ async function getProjectDbData(projectId: string): Promise<{
 
 // Definitions — each check produces real evidence from canonical sources.
 export const READINESS_CHECKS: ReadinessCheckDef[] = [
+  // ======================================================================
+  // PHASE 17A: Structural gate checks (run before content checks)
+  // ======================================================================
+
+  {
+    category: ReadinessCategory.BUILD,
+    name: "Repository is GitHub-backed (not LOCAL_ONLY)",
+    description: "LOCAL_ONLY projects cannot reach PRODUCTION_READY — the worker's /tmp checkout is ephemeral and content is not persisted.",
+    required: true,
+    check: async (_projectId, repo) => {
+      return {
+        passed: repo.mode === "GITHUB_BACKED",
+        evidence: { mode: repo.mode },
+        failureReason: repo.mode === "LOCAL_ONLY"
+          ? "LOCAL_ONLY projects cannot reach PRODUCTION_READY — connect a GitHub repository"
+          : undefined,
+      };
+    },
+  },
+  {
+    category: ReadinessCategory.BUILD,
+    name: "Canonical HEAD is fresh (matches GitHub branch HEAD)",
+    description: "The cached canonicalHeadSha must equal the actual GitHub integration branch HEAD.",
+    required: true,
+    check: async (_projectId, repo) => {
+      if (repo.mode !== "GITHUB_BACKED") {
+        return { passed: false, evidence: { mode: repo.mode }, failureReason: "Not GitHub-backed" };
+      }
+      return {
+        passed: repo.headVerified,
+        evidence: { head: repo.head, headVerified: repo.headVerified, note: repo.headVerificationNote },
+        failureReason: !repo.headVerified
+          ? repo.headVerificationNote ?? "Canonical HEAD verification failed"
+          : undefined,
+      };
+    },
+  },
+  {
+    category: ReadinessCategory.BUILD,
+    name: "Repository tree is not truncated",
+    description: "GitHub Trees API must return a complete file list. A truncated tree means files may be missing from the scan.",
+    required: true,
+    check: async (_projectId, repo) => {
+      return {
+        passed: !repo.truncated,
+        evidence: { truncated: repo.truncated },
+        failureReason: repo.truncated
+          ? "Repository tree is truncated — file list is incomplete. Readiness cannot verify the complete repository."
+          : undefined,
+      };
+    },
+  },
+  {
+    category: ReadinessCategory.BUILD,
+    name: "No unscannable files (too large)",
+    description: "Every file in the repository must be scannable. Files exceeding the scan limit are marked UNVERIFIED.",
+    required: true,
+    check: async (_projectId, _repo, scan) => {
+      return {
+        passed: scan.unverifiedFiles === 0,
+        evidence: {
+          unverifiedCount: scan.unverifiedFiles,
+          unverifiedFiles: scan.unverifiedFileDetails,
+        },
+        failureReason: scan.unverifiedFiles > 0
+          ? `${scan.unverifiedFiles} file(s) are too large to scan — readiness cannot verify them`
+          : undefined,
+      };
+    },
+  },
+
+  // ======================================================================
+  // Content-based checks (operate on complete scan results)
+  // ======================================================================
+
   {
     category: ReadinessCategory.BUILD,
     name: "Application files present",
@@ -126,34 +211,15 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
   {
     category: ReadinessCategory.STATIC,
     name: "No high-severity suspicious patterns in production paths",
-    description: "Fake Implementation Detector found no TODO/mock/stub/placeholder in app code.",
+    description: "Fake Implementation Detector found no TODO/mock/stub/placeholder in app code (complete repository scan).",
     required: true,
-    check: async (_projectId, repo) => {
-      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
-      if (repo.mode === "LOCAL_ONLY") {
-        return {
-          passed: false,
-          evidence: { mode: "LOCAL_ONLY", reason: "File contents not persisted for local-only projects" },
-          failureReason: "Cannot scan file contents — connect GitHub for production readiness verification",
-        };
-      }
-      const offenders: { path: string; patterns: string[] }[] = [];
-      for (const f of repo.files) {
-        if (f.path === "README.md" || f.path.startsWith(".git")) continue;
-        if (f.content === null) continue; // content not fetched (non-source or over cap)
-        if (f.suspiciousPatterns.length > 0) {
-          const high = f.suspiciousPatterns.filter((p) =>
-            ["mock (commented)", "stub (commented)", "fake (commented)", "dummy (commented)", "not implemented", "not implemented throw", "hardcoded response", "coming soon"].includes(p)
-          );
-          if (high.length > 0) offenders.push({ path: f.path, patterns: high });
-        }
-      }
+    check: async (_projectId, _repo, scan) => {
       return {
-        passed: offenders.length === 0,
-        evidence: { offenders },
+        passed: scan.filesWithHighSeverityPatterns.length === 0,
+        evidence: { offenders: scan.filesWithHighSeverityPatterns },
         failureReason:
-          offenders.length > 0
-            ? `${offenders.length} file(s) contain high-severity fake-impl patterns`
+          scan.filesWithHighSeverityPatterns.length > 0
+            ? `${scan.filesWithHighSeverityPatterns.length} file(s) contain high-severity fake-impl patterns`
             : undefined,
       };
     },
@@ -276,22 +342,14 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
   {
     category: ReadinessCategory.ERRORS,
     name: "Error handling present",
-    description: "Implementation includes error-handling patterns (try/catch or equivalent).",
+    description: "Implementation includes error-handling patterns (try/catch or equivalent) in source files.",
     required: true,
-    check: async (_projectId, repo) => {
-      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
-      if (repo.mode === "LOCAL_ONLY") {
-        return {
-          passed: false,
-          evidence: { mode: "LOCAL_ONLY", reason: "File contents not persisted for local-only projects" },
-          failureReason: "Cannot scan file contents — connect GitHub for production readiness verification",
-        };
-      }
+    check: async (_projectId, _repo, _scan, scannedFiles) => {
       let errorHandlers = 0;
-      for (const f of repo.files) {
+      for (const f of scannedFiles) {
         if (f.content === null) continue;
         if ([".ts", ".tsx", ".js", ".jsx", ".py", ".go"].some((ext) => f.path.endsWith(ext))) {
-          if (/try\s*\{|except\s+\w+|catch\s*\(|\.catch\(/i.test(f.content)) errorHandlers++;
+          if (hasErrorHandling(f.content)) errorHandlers++;
         }
       }
       return {
@@ -306,45 +364,45 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
     name: "Health check endpoint",
     description: "Repository exposes a /health or /healthz endpoint.",
     required: true,
-    check: async (projectId, repo) => {
+    check: async (projectId, repo, _scan, scannedFiles) => {
       const { architecture } = await getProjectDbData(projectId);
       if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
-      const healthFile = repo.files.find((f) => /health/i.test(f.path) || (f.content && /health/i.test(f.content.slice(0, 2000))));
+      // Check file paths first (fast).
+      const healthFile = repo.files.find((f) => /health/i.test(f.path));
+      // Then check file contents (complete scan).
+      let healthInContent = false;
+      if (!healthFile) {
+        for (const f of scannedFiles) {
+          if (f.content && /health/i.test(f.content.slice(0, 2000))) {
+            healthInContent = true;
+            break;
+          }
+        }
+      }
       const archApis = architecture ? JSON.parse(architecture.apiContracts || "[]") : [];
       const healthApi = archApis.find((a: any) => /health/i.test(a.path));
       return {
-        passed: !!healthFile || !!healthApi,
-        evidence: { healthFile: healthFile?.path, healthApiPath: healthApi?.path },
-        failureReason: !healthFile && !healthApi ? "No health endpoint" : undefined,
+        passed: !!healthFile || healthInContent || !!healthApi,
+        evidence: { healthFile: healthFile?.path, healthInContent, healthApiPath: healthApi?.path },
+        failureReason: !healthFile && !healthInContent && !healthApi ? "No health endpoint" : undefined,
       };
     },
   },
   {
     category: ReadinessCategory.SECURITY,
-    name: "No committed secrets",
-    description: "No file content contains obvious secret patterns (sk_live_, AKIA, etc).",
+    name: "No committed secrets (complete repository scan)",
+    description: "No file content contains obvious secret patterns (API keys, private keys, JWTs, etc). Scans ALL text files in the repository.",
     required: true,
-    check: async (_projectId, repo) => {
-      if (repo.unreadable) return { passed: false, evidence: { unreadable: repo.unreadableReason }, failureReason: `Repository unreadable: ${repo.unreadableReason}` };
-      if (repo.mode === "LOCAL_ONLY") {
-        return {
-          passed: false,
-          evidence: { mode: "LOCAL_ONLY", reason: "File contents not persisted for local-only projects" },
-          failureReason: "Cannot scan file contents — connect GitHub for production readiness verification",
-        };
-      }
-      const secretPatterns = [/sk_live_[A-Za-z0-9]{16,}/, /sk_test_[A-Za-z0-9]{16,}/, /AKIA[0-9A-Z]{16}/, /-----BEGIN (RSA |EC )?PRIVATE KEY-----/];
-      const offenders: string[] = [];
-      for (const f of repo.files) {
-        if (f.content === null) continue;
-        for (const p of secretPatterns) {
-          if (p.test(f.content)) offenders.push(f.path);
-        }
-      }
+    check: async (_projectId, _repo, scan) => {
       return {
-        passed: offenders.length === 0,
-        evidence: { offenders },
-        failureReason: offenders.length > 0 ? `Secrets detected in: ${offenders.join(", ")}` : undefined,
+        passed: scan.filesWithSecrets.length === 0,
+        evidence: {
+          offenders: scan.filesWithSecrets,
+          findings: scan.filesWithSecretFindings.map((f) => ({ path: f.path, pattern: f.pattern, line: f.line })),
+        },
+        failureReason: scan.filesWithSecrets.length > 0
+          ? `Secrets detected in ${scan.filesWithSecrets.length} file(s): ${scan.filesWithSecrets.join(", ")}`
+          : undefined,
       };
     },
   },
@@ -420,10 +478,11 @@ export async function runReadinessGate(projectId: string): Promise<{
   total: number;
   passedCount: number;
   failedCount: number;
+  /** The exact immutable SHA the readiness gate scanned. For reproducibility. */
+  repositoryHeadSha: string | null;
   results: any[];
 }> {
-  // Fetch the canonical repository snapshot ONCE (with content) and share
-  // it across all checks — avoids redundant GitHub API calls.
+  // --- Fetch the canonical repository snapshot WITH content + freshness verification ---
   const project = await db.project.findUnique({
     where: { id: projectId },
     select: {
@@ -434,22 +493,47 @@ export async function runReadinessGate(projectId: string): Promise<{
       canonicalHeadSha: true,
     },
   });
+
   const repo: RepoSnapshot = project
-    ? await getRepositorySnapshot(project, true)
+    ? await getRepositorySnapshot(project, true, true) // withContent=true, verifyFreshness=true
     : {
         mode: "LOCAL_ONLY",
         head: null,
+        headVerified: false,
+        headVerificationNote: "Project not found",
         branches: [],
         files: [],
         commits: [],
         pullRequests: [],
         unreadable: true,
         unreadableReason: "Project not found",
+        truncated: false,
       };
 
+  // --- Scan the complete repository content ---
+  let scannedFiles: ScannedFile[] = [];
+  let scanSummary: ScanSummary;
+  if (repo.rawFiles && repo.rawFiles.length > 0) {
+    scannedFiles = scanRepository(repo.rawFiles);
+    scanSummary = summarizeScan(scannedFiles);
+  } else {
+    // LOCAL_ONLY or unreadable — no raw files to scan.
+    scanSummary = {
+      totalFiles: 0,
+      textFiles: 0,
+      binaryFiles: 0,
+      unverifiedFiles: 0,
+      filesWithSecrets: [],
+      filesWithHighSeverityPatterns: [],
+      filesWithSecretFindings: [],
+      unverifiedFileDetails: [],
+    };
+  }
+
+  // --- Run all readiness checks ---
   const results: any[] = [];
   for (const def of READINESS_CHECKS) {
-    const r = await def.check(projectId, repo);
+    const r = await def.check(projectId, repo, scanSummary, scannedFiles);
     const status = r.passed ? "PASSED" : "FAILED";
     results.push({
       category: def.category,
@@ -461,6 +545,11 @@ export async function runReadinessGate(projectId: string): Promise<{
       failureReason: r.failureReason ?? null,
       checkedAt: new Date().toISOString(),
     });
+  }
+
+  // --- Record the exact SHA in every result (for reproducibility) ---
+  for (const r of results) {
+    r.repositoryHeadSha = repo.head;
   }
 
   // Upsert readiness checks in DB.
@@ -494,10 +583,34 @@ export async function runReadinessGate(projectId: string): Promise<{
     type: passed ? BuildEventType.READINESS_GATE_PASSED : BuildEventType.READINESS_GATE_FAILED,
     level: passed ? "success" : "error",
     message: passed
-      ? `Production Readiness Gate PASSED — ${passedCount}/${results.length} checks`
-      : `Production Readiness Gate FAILED — ${failedCount} of ${results.length} checks failed`,
-    payload: JSON.stringify({ passed, total: results.length, passedCount, failedCount, results }),
+      ? `Production Readiness Gate PASSED — ${passedCount}/${results.length} checks (SHA: ${repo.head?.slice(0, 7) ?? "none"})`
+      : `Production Readiness Gate FAILED — ${failedCount} of ${results.length} checks failed (SHA: ${repo.head?.slice(0, 7) ?? "none"})`,
+    payload: JSON.stringify({
+      passed,
+      total: results.length,
+      passedCount,
+      failedCount,
+      repositoryHeadSha: repo.head,
+      headVerified: repo.headVerified,
+      truncated: repo.truncated,
+      scanSummary: {
+        totalFiles: scanSummary.totalFiles,
+        textFiles: scanSummary.textFiles,
+        binaryFiles: scanSummary.binaryFiles,
+        unverifiedFiles: scanSummary.unverifiedFiles,
+        filesWithSecrets: scanSummary.filesWithSecrets,
+        filesWithHighSeverityPatterns: scanSummary.filesWithHighSeverityPatterns,
+      },
+      results,
+    }),
   });
 
-  return { passed, total: results.length, passedCount, failedCount, results };
+  return {
+    passed,
+    total: results.length,
+    passedCount,
+    failedCount,
+    repositoryHeadSha: repo.head,
+    results,
+  };
 }

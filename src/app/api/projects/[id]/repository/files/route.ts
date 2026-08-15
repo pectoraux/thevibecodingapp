@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { requireUserId } from "@/lib/auth";
 import { getFileContent } from "@/lib/repository-reader";
+import { scanSuspiciousPatterns } from "@/lib/repository-scanner";
 
 // GET /api/projects/[id]/repository/files?path=...
 //
@@ -35,6 +36,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const file = await getFileContent(project, path);
     if (!file) {
       return NextResponse.json({ error: "File not found" }, { status: 404 });
+    }
+    // Phase 17A: scanning is delegated to repository-scanner.ts (separation of concerns).
+    if (file.content) {
+      file.suspiciousPatterns = scanSuspiciousPatterns(file.content);
     }
     return NextResponse.json({ file });
   } catch (e: any) {
