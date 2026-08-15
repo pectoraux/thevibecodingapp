@@ -81,6 +81,15 @@ export interface UnreadableFile {
   error: string;
 }
 
+/** Phase 17G: An archive entry rejected as unsafe during tar extraction. */
+export interface UnsafeArchiveEntry {
+  path: string;
+  type: string;
+  reason: string;
+  /** The symlink/hardlink target if applicable. */
+  linkpath?: string;
+}
+
 export interface RepoSnapshot {
   mode: "GITHUB_BACKED" | "LOCAL_ONLY";
   /** The exact immutable SHA the snapshot was read from. Recorded for reproducibility. */
@@ -124,11 +133,15 @@ export interface RepoSnapshot {
   unreadableFiles: UnreadableFile[];
   /** Non-null when the snapshot itself is unverified (extraction error, limits exceeded, invalid archive). */
   snapshotError: string | null;
-  // --- Phase 17F: Evidence clarity — distinguish paths from unique files ---
-  /** Total repository paths examined (including symlinks, before dedup). */
-  repositoryPathsExamined: number;
+  // --- Phase 17G: Corrected evidence semantics ---
+  /** Every repository entry encountered (dirs, files, symlinks — not .git). */
+  repositoryEntriesExamined: number;
+  /** Every file path considered before dedup (superset of uniqueFilesScanned). */
+  filePathsExamined: number;
   /** Unique underlying files actually scanned (after dedup by realpath). */
   uniqueFilesScanned: number;
+  /** Phase 17G: Archive entries rejected as unsafe during extraction. */
+  unsafeArchiveEntries: UnsafeArchiveEntry[];
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +273,9 @@ async function downloadAndExtractTarball(
   extractedFileCount: number;
   unreadableFiles: UnreadableFile[];
   snapshotError: string | null;
-  repositoryPathsExamined: number;
+  repositoryEntriesExamined: number;
+  filePathsExamined: number;
+  unsafeArchiveEntries: UnsafeArchiveEntry[];
 }> {
   const tarballUrl = `https://api.github.com/repos/${owner}/${repo}/tarball/${sha}`;
 
@@ -326,17 +341,83 @@ async function downloadAndExtractTarball(
       nodeStream.pipe(writeStream);
     });
 
-    // Extract tarball.
+    // Phase 17G: Safe tar extraction — validate EVERY entry before materializing.
+    // The tar library's filter option is called for each entry. We reject:
+    //   - absolute paths (e.g., /etc/passwd)
+    //   - .. traversal (e.g., ../../outside)
+    //   - hardlink entries (type 'Link' / code '1')
+    //   - symlink entries whose linkpath escapes the extraction root
+    //   - special file types (CharacterDevice, BlockDevice, FIFO, etc.)
+    // preservePaths: false (explicit) — the tar library strips ../ and leading /
+    //   from paths, but we also validate via filter for defense-in-depth.
+    const unsafeArchiveEntries: UnsafeArchiveEntry[] = [];
+
+    // Allowed entry types for a normal repository archive.
+    const ALLOWED_ENTRY_TYPES = new Set([
+      "File", "OldFile", "ContiguousFile", "Directory", "SymbolicLink",
+    ]);
+
     await tar.x({
       file: tarballPath,
       Cwd: extractDir,
       gzip: true,
+      preservePaths: false, // Strip ../ and leading / — explicit defense-in-depth.
+      filter: (entryPath: string, entry: any) => {
+        const entryType = entry.type || "Unknown";
+        const linkpath = entry.linkpath || entry.link || "";
+
+        // Reject non-allowed entry types (hardlinks, devices, FIFOs, etc.).
+        if (!ALLOWED_ENTRY_TYPES.has(entryType)) {
+          unsafeArchiveEntries.push({
+            path: entryPath,
+            type: entryType,
+            reason: `UNSAFE_ENTRY_TYPE: ${entryType} entries are not allowed in repository archives`,
+            linkpath: linkpath || undefined,
+          });
+          return false;
+        }
+
+        // Reject absolute paths (defense-in-depth — preservePaths should strip these).
+        if (entryPath.startsWith("/")) {
+          unsafeArchiveEntries.push({
+            path: entryPath,
+            type: entryType,
+            reason: "ABSOLUTE_PATH: archive entry has absolute path",
+          });
+          return false;
+        }
+
+        // Reject .. traversal (defense-in-depth — preservePaths should strip these).
+        if (entryPath.includes("../") || entryPath === ".." || entryPath.startsWith("../")) {
+          unsafeArchiveEntries.push({
+            path: entryPath,
+            type: entryType,
+            reason: "PATH_TRAVERSAL: archive entry contains .. traversal",
+          });
+          return false;
+        }
+
+        // For symlinks, reject if linkpath is absolute or contains ..
+        if (entryType === "SymbolicLink" && linkpath) {
+          if (linkpath.startsWith("/") || linkpath.includes("../") || linkpath === "..") {
+            unsafeArchiveEntries.push({
+              path: entryPath,
+              type: entryType,
+              reason: `SYMLINK_UNSAFE_TARGET: symlink target '${linkpath}' is absolute or traverses outside archive root`,
+              linkpath,
+            });
+            return false;
+          }
+        }
+
+        return true; // Allow this entry.
+      },
     });
 
     // Phase 17C: Walk with fail-closed error tracking + resource limits.
     // Phase 17D: + repoRootRealpath for symlink containment.
     // Phase 17E: + visitedRealpaths/visitedFileRealpaths for cycle protection.
-    // Phase 17F: + repositoryPathsExamined for evidence clarity.
+    // Phase 17G: + repositoryEntriesExamined/filePathsExamined/unsafeArchiveEntries.
     const ctx: WalkContext = {
       files: [],
       unreadableFiles: [],
@@ -347,7 +428,9 @@ async function downloadAndExtractTarball(
       repoRootRealpath: null, // Set after topDir is validated below.
       visitedRealpaths: new Set<string>(),
       visitedFileRealpaths: new Set<string>(),
-      repositoryPathsExamined: 0,
+      repositoryEntriesExamined: 0,
+      filePathsExamined: 0,
+      unsafeArchiveEntries,
     };
 
     const extractedRoots = readdirSync(extractDir);
@@ -384,7 +467,9 @@ async function downloadAndExtractTarball(
         extractedFileCount: 0,
         unreadableFiles: ctx.unreadableFiles,
         snapshotError: `INVALID_ARCHIVE_STRUCTURE: unexpected top-level file(s) outside repository root: ${unexpectedTopLevelFiles.join(", ")}`,
-        repositoryPathsExamined: 0,
+        repositoryEntriesExamined: 0,
+        filePathsExamined: 0,
+        unsafeArchiveEntries: ctx.unsafeArchiveEntries,
       };
     }
 
@@ -397,7 +482,9 @@ async function downloadAndExtractTarball(
         extractedFileCount: 0,
         unreadableFiles: ctx.unreadableFiles,
         snapshotError: "Invalid archive: no top-level repository directory found after extraction",
-        repositoryPathsExamined: 0,
+        repositoryEntriesExamined: 0,
+        filePathsExamined: 0,
+        unsafeArchiveEntries: ctx.unsafeArchiveEntries,
       };
     }
 
@@ -410,7 +497,9 @@ async function downloadAndExtractTarball(
         extractedFileCount: 0,
         unreadableFiles: ctx.unreadableFiles,
         snapshotError: `INVALID_ARCHIVE_STRUCTURE: multiple top-level repository directories found: ${rootDirs.join(", ")}`,
-        repositoryPathsExamined: 0,
+        repositoryEntriesExamined: 0,
+        filePathsExamined: 0,
+        unsafeArchiveEntries: ctx.unsafeArchiveEntries,
       };
     }
 
@@ -428,7 +517,9 @@ async function downloadAndExtractTarball(
         extractedFileCount: 0,
         unreadableFiles: ctx.unreadableFiles,
         snapshotError: `Failed to resolve repository root realpath: ${err.message ?? String(err)}`,
-        repositoryPathsExamined: 0,
+        repositoryEntriesExamined: 0,
+        filePathsExamined: 0,
+        unsafeArchiveEntries: ctx.unsafeArchiveEntries,
       };
     }
 
@@ -451,7 +542,9 @@ async function downloadAndExtractTarball(
       extractedFileCount: ctx.extractedFileCount,
       unreadableFiles: ctx.unreadableFiles,
       snapshotError,
-      repositoryPathsExamined: ctx.repositoryPathsExamined,
+      repositoryEntriesExamined: ctx.repositoryEntriesExamined,
+      filePathsExamined: ctx.filePathsExamined,
+      unsafeArchiveEntries: ctx.unsafeArchiveEntries,
     };
   } finally {
     // Clean up temp directory.
@@ -474,8 +567,12 @@ interface WalkContext {
   visitedRealpaths: Set<string>;
   /** Phase 17E: Set of visited file realpaths — prevents duplicate scanning via multiple symlinks. */
   visitedFileRealpaths: Set<string>;
-  /** Phase 17F: Total repository paths examined (including symlinks, before dedup). */
-  repositoryPathsExamined: number;
+  /** Phase 17G: Every repository entry encountered (dirs, files, symlinks — not .git). */
+  repositoryEntriesExamined: number;
+  /** Phase 17G: Every file path considered before dedup (superset of uniqueFilesScanned). */
+  filePathsExamined: number;
+  /** Phase 17G: Archive entries rejected as unsafe during extraction. */
+  unsafeArchiveEntries: UnsafeArchiveEntry[];
 }
 
 /**
@@ -549,6 +646,9 @@ function walkDirectory(
 
     // Skip .git directory — we don't scan git internals.
     if (entry === ".git") continue;
+
+    // Phase 17G: Count every repository entry examined (dirs, files, symlinks).
+    ctx.repositoryEntriesExamined++;
 
     // Phase 17D: Use lstatSync (not statSync) to detect symlinks without following.
     let lstat;
@@ -639,9 +739,9 @@ function readFileEntry(
   stat: { size: number },
   ctx: WalkContext
 ): void {
-  // Phase 17F: Count every repository path examined (before dedup).
-  // This distinguishes "repository paths examined" from "unique files scanned".
-  ctx.repositoryPathsExamined++;
+  // Phase 17G: Count every file path examined (before dedup).
+  // This is a subset of repositoryEntriesExamined (which also counts dirs/symlinks).
+  ctx.filePathsExamined++;
 
   // Phase 17E: Deduplicate by canonical realpath.
   // Multiple symlinks to the same file should only scan it once.
@@ -841,9 +941,11 @@ async function readGitHubSnapshot(
       extractedFileCount: tarballResult.extractedFileCount,
       unreadableFiles: tarballResult.unreadableFiles,
       snapshotError: tarballResult.snapshotError,
-      // Phase 17F: Evidence clarity — paths examined vs unique files scanned.
-      repositoryPathsExamined: tarballResult.repositoryPathsExamined,
+      // Phase 17G: Corrected evidence semantics.
+      repositoryEntriesExamined: tarballResult.repositoryEntriesExamined,
+      filePathsExamined: tarballResult.filePathsExamined,
       uniqueFilesScanned: tarballResult.extractedFileCount,
+      unsafeArchiveEntries: tarballResult.unsafeArchiveEntries,
     };
   }
 
@@ -904,9 +1006,11 @@ async function readGitHubSnapshot(
     extractedFileCount: files.length,
     unreadableFiles: [],
     snapshotError: null,
-    // Phase 17F: Trees API path — paths = unique files (no dedup at this layer).
-    repositoryPathsExamined: files.length,
+    // Phase 17G: Trees API path — entries = file paths = unique files (no extraction/dedup).
+    repositoryEntriesExamined: files.length,
+    filePathsExamined: files.length,
     uniqueFilesScanned: files.length,
+    unsafeArchiveEntries: [],
   };
 }
 
@@ -1044,9 +1148,11 @@ async function readLocalSnapshot(projectId: string): Promise<RepoSnapshot> {
     extractedFileCount: fileMap.size,
     unreadableFiles: [],
     snapshotError: "LOCAL_ONLY — no canonical repository to extract",
-    // Phase 17F: LOCAL_ONLY — paths = unique files (evidence-derived, no dedup).
-    repositoryPathsExamined: fileMap.size,
+    // Phase 17G: LOCAL_ONLY — entries = file paths = unique files (evidence-derived, no extraction).
+    repositoryEntriesExamined: fileMap.size,
+    filePathsExamined: fileMap.size,
     uniqueFilesScanned: fileMap.size,
+    unsafeArchiveEntries: [],
   };
 }
 
@@ -1079,9 +1185,11 @@ function emptySnapshot(
     extractedFileCount: 0,
     unreadableFiles: [],
     snapshotError: reason,
-    // Phase 17F: empty snapshot — zero paths/files.
-    repositoryPathsExamined: 0,
+    // Phase 17G: empty snapshot — zero entries/files.
+    repositoryEntriesExamined: 0,
+    filePathsExamined: 0,
     uniqueFilesScanned: 0,
+    unsafeArchiveEntries: [],
   };
 }
 

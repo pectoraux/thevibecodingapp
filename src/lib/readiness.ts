@@ -170,10 +170,13 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
           extractedFileCount: repo.extractedFileCount,
           unreadableFiles: repo.unreadableFiles,
           snapshotError: repo.snapshotError,
-          // Phase 17F: Evidence clarity — paths examined vs unique files scanned.
-          // repositoryPathsExamined >= uniqueFilesScanned when symlinks cause dedup.
-          repositoryPathsExamined: repo.repositoryPathsExamined,
+          // Phase 17G: Corrected evidence semantics.
+          // repositoryEntriesExamined >= filePathsExamined >= uniqueFilesScanned
+          // when symlinks/dirs cause counting differences.
+          repositoryEntriesExamined: repo.repositoryEntriesExamined,
+          filePathsExamined: repo.filePathsExamined,
           uniqueFilesScanned: repo.uniqueFilesScanned,
+          unsafeArchiveEntries: repo.unsafeArchiveEntries,
         },
         failureReason: !passed
           ? repo.snapshotError
@@ -548,8 +551,10 @@ export async function runReadinessGate(projectId: string): Promise<{
         extractedFileCount: 0,
         unreadableFiles: [],
         snapshotError: "Project not found",
-        repositoryPathsExamined: 0,
+        repositoryEntriesExamined: 0,
+        filePathsExamined: 0,
         uniqueFilesScanned: 0,
+        unsafeArchiveEntries: [],
       };
 
   // --- Scan the complete repository content ---
@@ -641,8 +646,10 @@ export async function runReadinessGate(projectId: string): Promise<{
       extractedBytes: repo.extractedBytes,
       extractedFileCount: repo.extractedFileCount,
       unreadableFiles: repo.unreadableFiles,
-      repositoryPathsExamined: repo.repositoryPathsExamined,
+      repositoryEntriesExamined: repo.repositoryEntriesExamined,
+      filePathsExamined: repo.filePathsExamined,
       uniqueFilesScanned: repo.uniqueFilesScanned,
+      unsafeArchiveEntries: repo.unsafeArchiveEntries,
       truncated: repo.truncated,
       scanSummary: {
         totalFiles: scanSummary.totalFiles,

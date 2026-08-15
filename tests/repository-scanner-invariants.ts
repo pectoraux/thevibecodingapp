@@ -1005,71 +1005,202 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 }
 
 // ===========================================================================
-// PHASE 17F: Evidence clarity — paths examined vs unique files scanned
+// PHASE 17G: Corrected evidence semantics + archive entry safety
 // ===========================================================================
 
-// Test 76: RepoSnapshot has repositoryPathsExamined field.
+// Test 76: RepoSnapshot has repositoryEntriesExamined (all entries, not just files).
 {
-  const hasField = reader.includes("repositoryPathsExamined: number");
+  const hasField = reader.includes("repositoryEntriesExamined: number");
   record(
-    "RepoSnapshot has repositoryPathsExamined field",
+    "RepoSnapshot has repositoryEntriesExamined field (all entries: dirs + files + symlinks)",
     hasField,
     `hasField: ${hasField}`
   );
 }
 
-// Test 77: RepoSnapshot has uniqueFilesScanned field.
+// Test 77: RepoSnapshot has filePathsExamined (files before dedup).
+{
+  const hasField = reader.includes("filePathsExamined: number");
+  record(
+    "RepoSnapshot has filePathsExamined field (file paths before dedup)",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 78: RepoSnapshot has uniqueFilesScanned (after dedup).
 {
   const hasField = reader.includes("uniqueFilesScanned: number");
   record(
-    "RepoSnapshot has uniqueFilesScanned field",
+    "RepoSnapshot has uniqueFilesScanned field (unique files after dedup)",
     hasField,
     `hasField: ${hasField}`
   );
 }
 
-// Test 78: WalkContext tracks repositoryPathsExamined.
+// Test 79: Old repositoryPathsExamined field is GONE (renamed).
 {
-  const hasField = reader.includes("repositoryPathsExamined: number") && reader.includes("ctx.repositoryPathsExamined++");
+  const hasOldField = reader.includes("repositoryPathsExamined:");
   record(
-    "WalkContext tracks repositoryPathsExamined (incremented in readFileEntry before dedup)",
-    hasField,
-    `hasField: ${hasField}`
+    "Old repositoryPathsExamined field is removed (renamed to corrected semantics)",
+    !hasOldField,
+    `hasOldField: ${hasOldField}`
   );
 }
 
-// Test 79: Tarball return path sets both evidence fields.
+// Test 80: WalkContext tracks repositoryEntriesExamined (incremented in walkDirectory).
 {
-  const setsPaths = reader.includes("repositoryPathsExamined: tarballResult.repositoryPathsExamined");
+  const hasField = reader.includes("repositoryEntriesExamined: number");
+  const incrementedInWalk = reader.includes("ctx.repositoryEntriesExamined++");
+  record(
+    "WalkContext tracks repositoryEntriesExamined (incremented in walkDirectory for every entry)",
+    hasField && incrementedInWalk,
+    `hasField: ${hasField}, incrementedInWalk: ${incrementedInWalk}`
+  );
+}
+
+// Test 81: WalkContext tracks filePathsExamined (incremented in readFileEntry).
+{
+  const hasField = reader.includes("filePathsExamined: number");
+  const incrementedInRead = reader.includes("ctx.filePathsExamined++");
+  record(
+    "WalkContext tracks filePathsExamined (incremented in readFileEntry before dedup)",
+    hasField && incrementedInRead,
+    `hasField: ${hasField}, incrementedInRead: ${incrementedInRead}`
+  );
+}
+
+// Test 82: Tarball return path sets all three evidence fields.
+{
+  const setsEntries = reader.includes("repositoryEntriesExamined: tarballResult.repositoryEntriesExamined");
+  const setsPaths = reader.includes("filePathsExamined: tarballResult.filePathsExamined");
   const setsUnique = reader.includes("uniqueFilesScanned: tarballResult.extractedFileCount");
   record(
-    "Tarball return sets repositoryPathsExamined + uniqueFilesScanned",
-    setsPaths && setsUnique,
-    `setsPaths: ${setsPaths}, setsUnique: ${setsUnique}`
+    "Tarball return sets repositoryEntriesExamined + filePathsExamined + uniqueFilesScanned",
+    setsEntries && setsPaths && setsUnique,
+    `entries: ${setsEntries}, paths: ${setsPaths}, unique: ${setsUnique}`
   );
 }
 
-// Test 80: Readiness evidence includes both fields.
+// Test 83: Readiness evidence includes all three fields.
 {
-  const hasPaths = readiness.includes("repositoryPathsExamined: repo.repositoryPathsExamined");
+  const hasEntries = readiness.includes("repositoryEntriesExamined: repo.repositoryEntriesExamined");
+  const hasPaths = readiness.includes("filePathsExamined: repo.filePathsExamined");
   const hasUnique = readiness.includes("uniqueFilesScanned: repo.uniqueFilesScanned");
   record(
-    "readiness evidence includes repositoryPathsExamined + uniqueFilesScanned",
-    hasPaths && hasUnique,
-    `hasPaths: ${hasPaths}, hasUnique: ${hasUnique}`
+    "readiness evidence includes repositoryEntriesExamined + filePathsExamined + uniqueFilesScanned",
+    hasEntries && hasPaths && hasUnique,
+    `entries: ${hasEntries}, paths: ${hasPaths}, unique: ${hasUnique}`
   );
 }
 
-// Test 81: Build event payload includes both fields.
+// ===========================================================================
+// PHASE 17G: Archive entry safety (tar extraction filter)
+// ===========================================================================
+
+// Test 84: Tar extraction uses filter option for entry validation.
 {
-  const hasPaths = readiness.includes("repositoryPathsExamined: repo.repositoryPathsExamined");
-  const hasUnique = readiness.includes("uniqueFilesScanned: repo.uniqueFilesScanned");
-  const inPayload = readiness.includes("repositoryPathsExamined: repo.repositoryPathsExamined") &&
-    readiness.includes("uniqueFilesScanned: repo.uniqueFilesScanned");
+  const hasFilter = reader.includes("filter: (entryPath: string, entry: any)");
   record(
-    "build event payload includes repositoryPathsExamined + uniqueFilesScanned",
-    inPayload,
-    `inPayload: ${inPayload}`
+    "tar.x() uses filter option to validate each entry during extraction",
+    hasFilter,
+    `hasFilter: ${hasFilter}`
+  );
+}
+
+// Test 85: Tar extraction explicitly sets preservePaths: false.
+{
+  const hasPreservePaths = reader.includes("preservePaths: false");
+  record(
+    "tar.x() explicitly sets preservePaths: false (strips ../ and leading /)",
+    hasPreservePaths,
+    `hasPreservePaths: ${hasPreservePaths}`
+  );
+}
+
+// Test 86: Filter rejects absolute paths.
+{
+  const rejectsAbsolute = reader.includes("ABSOLUTE_PATH");
+  record(
+    "tar filter rejects absolute paths (ABSOLUTE_PATH)",
+    rejectsAbsolute,
+    `rejectsAbsolute: ${rejectsAbsolute}`
+  );
+}
+
+// Test 87: Filter rejects .. traversal.
+{
+  const rejectsTraversal = reader.includes("PATH_TRAVERSAL");
+  record(
+    "tar filter rejects .. traversal (PATH_TRAVERSAL)",
+    rejectsTraversal,
+    `rejectsTraversal: ${rejectsTraversal}`
+  );
+}
+
+// Test 88: Filter rejects unsafe entry types (hardlinks, devices, FIFOs).
+{
+  const rejectsTypes = reader.includes("UNSAFE_ENTRY_TYPE");
+  const hasAllowedSet = reader.includes("ALLOWED_ENTRY_TYPES");
+  record(
+    "tar filter rejects unsafe entry types (UNSAFE_ENTRY_TYPE) with allowed-types whitelist",
+    rejectsTypes && hasAllowedSet,
+    `rejectsTypes: ${rejectsTypes}, hasAllowedSet: ${hasAllowedSet}`
+  );
+}
+
+// Test 89: Filter rejects symlinks with unsafe targets.
+{
+  const rejectsSymlinks = reader.includes("SYMLINK_UNSAFE_TARGET");
+  record(
+    "tar filter rejects symlinks with absolute/traversal targets (SYMLINK_UNSAFE_TARGET)",
+    rejectsSymlinks,
+    `rejectsSymlinks: ${rejectsSymlinks}`
+  );
+}
+
+// Test 90: UnsafeArchiveEntry type exists.
+{
+  const hasType = reader.includes("interface UnsafeArchiveEntry");
+  record(
+    "UnsafeArchiveEntry interface exists",
+    hasType,
+    `hasType: ${hasType}`
+  );
+}
+
+// Test 91: RepoSnapshot has unsafeArchiveEntries field.
+{
+  const hasField = reader.includes("unsafeArchiveEntries: UnsafeArchiveEntry[]");
+  record(
+    "RepoSnapshot has unsafeArchiveEntries field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 92: Readiness evidence includes unsafeArchiveEntries.
+{
+  const hasField = readiness.includes("unsafeArchiveEntries: repo.unsafeArchiveEntries");
+  record(
+    "readiness evidence includes unsafeArchiveEntries",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 93: Allowed entry types whitelist excludes hardlinks.
+{
+  const allowedSet = reader.includes('"File"') && reader.includes('"Directory"') && reader.includes('"SymbolicLink"');
+  const excludesHardlinks = !reader.includes('"Link"') || !reader.includes("ALLOWED_ENTRY_TYPES.has");
+  // 'Link' is the hardlink type — it should NOT be in the allowed set.
+  const allowedLine = reader.match(/ALLOWED_ENTRY_TYPES = new Set\(\[([\s\S]*?)\]\)/);
+  const allowedContent = allowedLine ? allowedLine[1] : "";
+  const hasNoHardlink = !allowedContent.includes('"Link"');
+  record(
+    "Allowed entry types whitelist excludes hardlinks (Link type not allowed)",
+    allowedSet && hasNoHardlink,
+    `allowedSet: ${allowedSet}, hasNoHardlink: ${hasNoHardlink}`
   );
 }
 
@@ -1077,7 +1208,7 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 17F: Evidence Clarity (Paths vs Unique Files) ===\n");
+console.log("=== Forge Phase 17G: Corrected Evidence Semantics + Archive Entry Safety ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {
