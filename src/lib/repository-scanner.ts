@@ -190,29 +190,25 @@ export function hasErrorHandling(content: string): boolean {
  * Scan a single file's content for security and quality issues.
  * Returns a ScannedFile with classification and all findings.
  *
+ * Phase 17B CLASSIFICATION ORDER:
+ *   1. Classify binary first (by content/extension).
+ *      - Binary → recognized binary, skipped from text scan (NOT UNVERIFIED).
+ *   2. If text and exceeds MAX_SCANNABLE_BYTES → UNVERIFIED (fail-closed).
+ *   3. Otherwise scan as text.
+ *
+ * This avoids blocking on large known binaries (PNG, PDF, etc.) while still
+ * blocking large unknown/text files that could contain secrets.
+ *
  * @param path File path (for reporting).
  * @param rawContent Raw file content as a Buffer (from tarball extraction).
  */
 export function scanFile(path: string, rawContent: Buffer): ScannedFile {
   const bytes = rawContent.length;
 
-  // Large-file policy: mark UNVERIFIED, do not silently skip.
-  if (bytes > MAX_SCANNABLE_BYTES) {
-    return {
-      path,
-      bytes,
-      fileClass: "unverified_too_large",
-      content: null,
-      suspiciousPatterns: [],
-      secretFindings: [],
-      unverified: true,
-      unverifiedReason: `File is ${bytes} bytes (exceeds ${MAX_SCANNABLE_BYTES} byte scan limit)`,
-    };
-  }
-
+  // Phase 17B: classify binary BEFORE size check.
+  // Large binaries are recognized binaries, not UNVERIFIED.
   const fileClass = classifyFile(path, rawContent);
 
-  // Binary files: no content scan needed.
   if (fileClass === "binary") {
     return {
       path,
@@ -226,7 +222,21 @@ export function scanFile(path: string, rawContent: Buffer): ScannedFile {
     };
   }
 
-  // Text file: decode and scan.
+  // Text file: enforce size limit (fail-closed for large text/source/config).
+  if (bytes > MAX_SCANNABLE_BYTES) {
+    return {
+      path,
+      bytes,
+      fileClass: "unverified_too_large",
+      content: null,
+      suspiciousPatterns: [],
+      secretFindings: [],
+      unverified: true,
+      unverifiedReason: `Text file is ${bytes} bytes (exceeds ${MAX_SCANNABLE_BYTES} byte scan limit)`,
+    };
+  }
+
+  // Text file within scan limit: decode and scan.
   const content = rawContent.toString("utf-8");
   const suspiciousPatterns = scanSuspiciousPatterns(content);
   const secretFindings = scanForSecrets(path, content);

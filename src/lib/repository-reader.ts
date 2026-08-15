@@ -90,7 +90,21 @@ export interface RepoSnapshot {
   /** True when the canonical source was unreachable (GitHub API error, no PAT, etc.). */
   unreadable: boolean;
   unreadableReason: string | null;
-  /** True when the tree was truncated (incomplete file list). Readiness must fail. */
+  /**
+   * Phase 17B: What source produced this snapshot.
+   * - GITHUB_TARBALL: complete tarball at exact SHA (readiness path) — always complete.
+   * - GITHUB_TREES_API: Trees API (UI list-only view) — may be truncated.
+   * - LOCAL_EVIDENCE: TaskEvidence-derived (LOCAL_ONLY) — no canonical repo.
+   */
+  snapshotSource: "GITHUB_TARBALL" | "GITHUB_TREES_API" | "LOCAL_EVIDENCE";
+  /**
+   * Phase 17B: True when the snapshot represents the COMPLETE repository.
+   * For GITHUB_TARBALL: always true (tarball is complete).
+   * For GITHUB_TREES_API: false when the Trees API returned truncated=true.
+   * For LOCAL_EVIDENCE: false (no complete repository exists).
+   */
+  snapshotComplete: boolean;
+  /** True when the Trees API (UI path) returned truncated. Kept for UI diagnostics. */
   truncated: boolean;
   /** Raw file contents (Buffer) from tarball extraction — used by the scanner. */
   rawFiles?: { path: string; content: Buffer }[];
@@ -232,19 +246,48 @@ async function downloadAndExtractTarball(
       throw new Error(`GitHub tarball download failed: HTTP ${response.status}`);
     }
 
-    const contentLength = parseInt(response.headers.get("content-length") || "0", 10);
-    if (contentLength > MAX_TARBALL_SIZE) {
-      throw new Error(`Tarball too large: ${contentLength} bytes (limit: ${MAX_TARBALL_SIZE})`);
-    }
-
-    // Write tarball to disk (streaming).
+    // Phase 17B: Hard streaming byte limit — enforce during download, not just
+    // from Content-Length. Chunked responses or missing Content-Length must not
+    // bypass the safety boundary.
     const writeStream = createWriteStream(tarballPath);
     const nodeStream = Readable.fromWeb(response.body as any);
+
+    let bytesDownloaded = 0;
+    const sizeLimitError = new Error(
+      `Tarball exceeded size limit: >${MAX_TARBALL_SIZE} bytes streamed (limit: ${MAX_TARBALL_SIZE})`
+    );
+
     await new Promise<void>((resolve, reject) => {
+      let rejected = false;
+      const onChunk = (chunk: Buffer) => {
+        bytesDownloaded += chunk.length;
+        if (bytesDownloaded > MAX_TARBALL_SIZE) {
+          if (!rejected) {
+            rejected = true;
+            // Destroy both streams to abort the download.
+            nodeStream.destroy(sizeLimitError);
+            writeStream.destroy();
+            reject(sizeLimitError);
+          }
+        }
+      };
+      nodeStream.on("data", onChunk);
+      nodeStream.on("error", (err) => {
+        if (!rejected) {
+          rejected = true;
+          reject(err);
+        }
+      });
+      writeStream.on("error", (err) => {
+        if (!rejected) {
+          rejected = true;
+          reject(err);
+        }
+      });
+      writeStream.on("finish", () => {
+        if (!rejected) resolve();
+      });
       nodeStream.pipe(writeStream);
-      nodeStream.on("error", reject);
-      writeStream.on("error", reject);
-      writeStream.on("finish", resolve);
     });
 
     // Extract tarball.
@@ -434,7 +477,10 @@ async function readGitHubSnapshot(
       pullRequests,
       unreadable: false,
       unreadableReason: null,
-      truncated: tarballResult.truncated,
+      // Phase 17B: tarball is the complete snapshot source.
+      snapshotSource: "GITHUB_TARBALL",
+      snapshotComplete: true,
+      truncated: false, // Tarball extraction is never truncated.
       rawFiles: tarballResult.files,
     };
   }
@@ -486,6 +532,9 @@ async function readGitHubSnapshot(
     pullRequests,
     unreadable: false,
     unreadableReason: null,
+    // Phase 17B: Trees API path (UI list-only). May be truncated.
+    snapshotSource: "GITHUB_TREES_API",
+    snapshotComplete: !treeResult.truncated,
     truncated: treeResult.truncated,
   };
 }
@@ -615,6 +664,8 @@ async function readLocalSnapshot(projectId: string): Promise<RepoSnapshot> {
     pullRequests: [],
     unreadable: false,
     unreadableReason: null,
+    snapshotSource: "LOCAL_EVIDENCE",
+    snapshotComplete: false, // No complete repository exists for LOCAL_ONLY
     truncated: false,
   };
 }
@@ -639,6 +690,8 @@ function emptySnapshot(
     pullRequests: [],
     unreadable,
     unreadableReason: reason,
+    snapshotSource: mode === "GITHUB_BACKED" ? "GITHUB_TARBALL" : "LOCAL_EVIDENCE",
+    snapshotComplete: false,
     truncated: false,
   };
 }

@@ -187,34 +187,65 @@ function record(name: string, passed: boolean, details: string) {
 }
 
 // ===========================================================================
-// SCANNER: Large-file policy (UNVERIFIED, not silently skipped)
+// SCANNER: Large-file policy (Phase 17B — binary classified before size check)
 // ===========================================================================
 
-// Test 8: Large file marked UNVERIFIED.
+// Test 8: Large TEXT file (>1MB) marked UNVERIFIED.
 {
-  const largeContent = Buffer.alloc(MAX_SCANNABLE_BYTES + 1, 0x41); // Just over the limit
+  const largeContent = Buffer.alloc(MAX_SCANNABLE_BYTES + 1, 0x41); // 'A' — no null bytes = text
   const scanned = scanFile("large.ts", largeContent);
 
   record(
-    "Large file (>1MB) marked UNVERIFIED (not silently skipped)",
+    "Large TEXT file (>1MB) marked UNVERIFIED (not silently skipped)",
     scanned.unverified === true && scanned.fileClass === "unverified_too_large",
     `unverified: ${scanned.unverified}, fileClass: ${scanned.fileClass}, reason: ${scanned.unverifiedReason}`
   );
 }
 
-// Test 9: Large file in repository scan is counted in summary.
+// Test 8b: Large BINARY file (>1MB) classified as binary, NOT UNVERIFIED.
+{
+  // PNG header + padding to exceed 1MB. Binary by content (null bytes).
+  const pngHeader = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  const largeBinary = Buffer.alloc(MAX_SCANNABLE_BYTES + 100, 0x00);
+  Buffer.from(pngHeader).copy(largeBinary);
+  const scanned = scanFile("assets/large.png", largeBinary);
+
+  record(
+    "Large BINARY file (>1MB) classified as binary (NOT UNVERIFIED)",
+    scanned.fileClass === "binary" && scanned.unverified === false,
+    `fileClass: ${scanned.fileClass}, unverified: ${scanned.unverified}`
+  );
+}
+
+// Test 8c: Large file with binary content but no recognized extension → binary.
+{
+  // ZIP header (PK) + null bytes, no extension.
+  const zipHeader = [0x50, 0x4b, 0x03, 0x04];
+  const largeBinary = Buffer.alloc(MAX_SCANNABLE_BYTES + 50, 0x00);
+  Buffer.from(zipHeader).copy(largeBinary);
+  const scanned = scanFile("data-blob", largeBinary);
+
+  record(
+    "Large binary-content file without extension → binary (NOT UNVERIFIED)",
+    scanned.fileClass === "binary" && scanned.unverified === false,
+    `fileClass: ${scanned.fileClass}, unverified: ${scanned.unverified}`
+  );
+}
+
+// Test 9: Large text file in repository scan is counted in summary.
 {
   const files = [
     { path: "normal.ts", content: Buffer.from("export const x = 1;\n") },
-    { path: "huge.ts", content: Buffer.alloc(MAX_SCANNABLE_BYTES + 100, 0x42) },
+    { path: "huge.ts", content: Buffer.alloc(MAX_SCANNABLE_BYTES + 100, 0x42) }, // 'B' = text
+    { path: "big.png", content: Buffer.alloc(MAX_SCANNABLE_BYTES + 100, 0x00) }, // binary
   ];
   const scanned = scanRepository(files);
   const summary = summarizeScan(scanned);
 
   record(
-    "Large file counted in scan summary (unverifiedFiles > 0)",
-    summary.unverifiedFiles === 1,
-    `unverifiedFiles: ${summary.unverifiedFiles}, unverifiedFileDetails: ${JSON.stringify(summary.unverifiedFileDetails)}`
+    "Large text file counted as UNVERIFIED; large binary counted as binary (not UNVERIFIED)",
+    summary.unverifiedFiles === 1 && summary.binaryFiles === 1,
+    `unverifiedFiles: ${summary.unverifiedFiles}, binaryFiles: ${summary.binaryFiles}`
   );
 }
 
@@ -350,13 +381,13 @@ const readiness = readFile("src/lib/readiness.ts");
   );
 }
 
-// Test 21: Readiness has tree truncation check.
+// Test 21: Readiness has snapshot completeness check (Phase 17B reframed).
 {
-  const hasTruncationCheck = readiness.includes("Repository tree is not truncated");
+  const hasCompletenessCheck = readiness.includes("Repository snapshot is complete and verified");
   record(
-    "readiness.ts has tree truncation check",
-    hasTruncationCheck,
-    `hasTruncationCheck: ${hasTruncationCheck}`
+    "readiness.ts has 'Repository snapshot is complete and verified' check (Phase 17B)",
+    hasCompletenessCheck,
+    `hasCompletenessCheck: ${hasCompletenessCheck}`
   );
 }
 
@@ -460,10 +491,90 @@ const scannerModule = readFile("src/lib/repository-scanner.ts");
 }
 
 // ===========================================================================
+// PHASE 17B: Streaming byte accounting + snapshot completeness semantics
+// ===========================================================================
+
+// Test 30: Reader enforces streaming byte limit (not just Content-Length).
+{
+  const hasStreamingLimit = reader.includes("bytesDownloaded") && reader.includes("MAX_TARBALL_SIZE");
+  const hasContentLengthCheck = reader.includes("content-length");
+  // Phase 17B: streaming byte counter is the authority. Content-Length check is removed.
+  record(
+    "repository-reader.ts enforces streaming byte limit (bytesDownloaded counter, not Content-Length)",
+    hasStreamingLimit && !hasContentLengthCheck,
+    `streaming: ${hasStreamingLimit}, contentLengthCheckRemoved: ${!hasContentLengthCheck}`
+  );
+}
+
+// Test 31: Reader destroys streams when limit exceeded.
+{
+  const hasDestroy = reader.includes("nodeStream.destroy") && reader.includes("writeStream.destroy");
+  record(
+    "repository-reader.ts destroys both streams when byte limit exceeded",
+    hasDestroy,
+    `hasDestroy: ${hasDestroy}`
+  );
+}
+
+// Test 32: RepoSnapshot has snapshotSource field.
+{
+  const hasSnapshotSource = reader.includes("snapshotSource:") && reader.includes("GITHUB_TARBALL") && reader.includes("GITHUB_TREES_API") && reader.includes("LOCAL_EVIDENCE");
+  record(
+    "RepoSnapshot has snapshotSource field (GITHUB_TARBALL | GITHUB_TREES_API | LOCAL_EVIDENCE)",
+    hasSnapshotSource,
+    `hasSnapshotSource: ${hasSnapshotSource}`
+  );
+}
+
+// Test 33: RepoSnapshot has snapshotComplete field.
+{
+  const hasSnapshotComplete = reader.includes("snapshotComplete:") && reader.includes("snapshotComplete: true");
+  record(
+    "RepoSnapshot has snapshotComplete field (true for tarball path)",
+    hasSnapshotComplete,
+    `hasSnapshotComplete: ${hasSnapshotComplete}`
+  );
+}
+
+// Test 34: Readiness check uses snapshotComplete (not just truncated).
+{
+  const usesSnapshotComplete = readiness.includes("repo.snapshotComplete") && readiness.includes("snapshotSource");
+  record(
+    "readiness.ts checks snapshotComplete + snapshotSource in evidence",
+    usesSnapshotComplete,
+    `usesSnapshotComplete: ${usesSnapshotComplete}`
+  );
+}
+
+// Test 35: Scanner classifies binary before size check (Phase 17B order).
+{
+  const scannerContent = readFile("src/lib/repository-scanner.ts");
+  // The classifyFile call should come before the MAX_SCANNABLE_BYTES check.
+  const classifyIndex = scannerContent.indexOf("classifyFile(path, rawContent)");
+  const sizeCheckIndex = scannerContent.indexOf("bytes > MAX_SCANNABLE_BYTES");
+  record(
+    "scanner: classifyFile() called BEFORE size check (binary recognized before UNVERIFIED)",
+    classifyIndex > 0 && sizeCheckIndex > 0 && classifyIndex < sizeCheckIndex,
+    `classifyIndex: ${classifyIndex}, sizeCheckIndex: ${sizeCheckIndex}, classifyFirst: ${classifyIndex < sizeCheckIndex}`
+  );
+}
+
+// Test 36: Scanner unverified reason mentions 'Text file' (not generic 'File').
+{
+  const scannerContent = readFile("src/lib/repository-scanner.ts");
+  const hasTextFileReason = scannerContent.includes("Text file is") && scannerContent.includes("exceeds");
+  record(
+    "scanner: UNVERIFIED reason specifies 'Text file' (binary files are not UNVERIFIED)",
+    hasTextFileReason,
+    `hasTextFileReason: ${hasTextFileReason}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 17A: Repository Scanner & Readiness Completeness Invariants ===\n");
+console.log("=== Forge Phase 17B: Repository Snapshot Limits & Completeness Invariants ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {

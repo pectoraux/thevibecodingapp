@@ -139,15 +139,22 @@ export const READINESS_CHECKS: ReadinessCheckDef[] = [
   },
   {
     category: ReadinessCategory.BUILD,
-    name: "Repository tree is not truncated",
-    description: "GitHub Trees API must return a complete file list. A truncated tree means files may be missing from the scan.",
+    name: "Repository snapshot is complete and verified",
+    description: "The readiness gate must scan a complete repository snapshot at an exact immutable SHA.",
     required: true,
     check: async (_projectId, repo) => {
       return {
-        passed: !repo.truncated,
-        evidence: { truncated: repo.truncated },
-        failureReason: repo.truncated
-          ? "Repository tree is truncated — file list is incomplete. Readiness cannot verify the complete repository."
+        passed: repo.snapshotComplete,
+        evidence: {
+          snapshotSource: repo.snapshotSource,
+          repositoryHeadSha: repo.head,
+          complete: repo.snapshotComplete,
+          truncated: repo.truncated,
+        },
+        failureReason: !repo.snapshotComplete
+          ? repo.snapshotSource === "GITHUB_TREES_API"
+            ? "Repository tree is truncated — file list is incomplete. Readiness requires a complete snapshot (tarball path)."
+            : "Repository snapshot is incomplete — readiness cannot verify the complete repository."
           : undefined,
       };
     },
