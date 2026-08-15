@@ -171,6 +171,25 @@ export async function POST(req: Request) {
 
     const runtimePlanHash = hashRuntimePlan(plan);
 
+    // Phase 18B: Idempotency — check if evidence already exists for this attempt.
+    // projectId + executionId + attempt uniquely identifies a runtime verification submission.
+    const attempt = body.attempt ?? 0;
+    const idempotencyKey = `${projectId}+${token.executionId}+${attempt}`;
+    const existingEvidence = await db.runtimeEvidence.findUnique({
+      where: { idempotencyKey },
+    });
+    if (existingEvidence) {
+      // Idempotent response — return the existing evidence.
+      return NextResponse.json({
+        ok: true,
+        runtimeEvidenceId: existingEvidence.id,
+        passed: existingEvidence.passed,
+        failureReason: existingEvidence.failureReason,
+        idempotent: true,
+        message: "Runtime evidence already submitted for this attempt",
+      });
+    }
+
     // Persist a NEW RuntimeEvidence record (append-only — never UPDATE).
     const evidence = await db.runtimeEvidence.create({
       data: {
@@ -198,20 +217,24 @@ export async function POST(req: Request) {
         logs: result.logs?.slice(0, 50000) ?? null,
         executionId: token.executionId,
         workerId: token.workerId,
+        // Phase 18B: Idempotency fields.
+        attempt,
+        idempotencyKey,
         startedAt: new Date(result.startedAt),
         completedAt: new Date(result.completedAt),
       },
     });
 
-    // Phase 18A: Emit RUNTIME_VERIFIED, NOT PRODUCTION_READY.
-    // PRODUCTION_READY is only emitted by the complete canonical predicate below.
+    // Phase 18B: Emit RUNTIME_VERIFIED or RUNTIME_VERIFICATION_FAILED.
+    // NEVER emit PRODUCTION_READY here — that comes ONLY from the canonical predicate below.
+    const runtimeEventPassed = evaluation.passed;
     await ensureBuildEvent({
       projectId,
-      type: evaluation.passed ? BuildEventType.PRODUCTION_READY : BuildEventType.HUMAN_REVIEW_REQUIRED,
-      level: evaluation.passed ? "success" : "error",
-      message: evaluation.passed
-        ? `Runtime verification PASSED at SHA ${result.repositoryHeadSha.slice(0, 7)} — evidence ${evidence.id} (RUNTIME_VERIFIED, not PRODUCTION_READY)`
-        : `Runtime verification FAILED at SHA ${result.repositoryHeadSha.slice(0, 7)} — ${evaluation.failureReason}`,
+      type: runtimeEventPassed ? BuildEventType.TASK_COMPLETED : BuildEventType.TASK_FAILED,
+      level: runtimeEventPassed ? "success" : "error",
+      message: runtimeEventPassed
+        ? `RUNTIME_VERIFIED at SHA ${result.repositoryHeadSha.slice(0, 7)} — evidence ${evidence.id}`
+        : `RUNTIME_VERIFICATION_FAILED at SHA ${result.repositoryHeadSha.slice(0, 7)} — ${evaluation.failureReason}`,
       payload: JSON.stringify({
         runtimeEvidenceId: evidence.id,
         repositoryHeadSha: result.repositoryHeadSha,
@@ -222,8 +245,8 @@ export async function POST(req: Request) {
         passed: evaluation.passed,
         failureReason: evaluation.failureReason,
         breakdown: evaluation.breakdown,
-        // Phase 18A: Explicitly record that this is RUNTIME_VERIFIED, not PRODUCTION_READY.
-        eventType: "RUNTIME_VERIFIED",
+        // Phase 18B: Explicit event type — RUNTIME_VERIFIED, NOT PRODUCTION_READY.
+        eventType: runtimeEventPassed ? "RUNTIME_VERIFIED" : "RUNTIME_VERIFICATION_FAILED",
         productionReadyEligible: false,
       }),
     });

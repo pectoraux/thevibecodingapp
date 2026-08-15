@@ -500,6 +500,8 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
         buildCommands: ["npm run build"],
         startCommand: "npm start",
         port: 3000,
+        startupTimeoutMs: 30000,
+        teardownTimeoutMs: 10000,
       }),
       frozen: true,
     }
@@ -518,8 +520,8 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     {
       contractJson: "{}",
       apiContracts: JSON.stringify([
-        { method: "GET", path: "/api/users", name: "List users" },
-        { method: "POST", path: "/api/auth/login", name: "Login" },
+        { method: "GET", path: "/api/users", name: "List users", expectedStatus: 200 },
+        { method: "POST", path: "/api/auth/login", name: "Login", expectedStatus: 200 },
       ]),
       integrations: "[]",
       testingStrategy: "{}",
@@ -528,6 +530,8 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
         buildCommands: ["npm run build"],
         startCommand: "npm start",
         port: 3000,
+        startupTimeoutMs: 30000,
+        teardownTimeoutMs: 10000,
       }),
       frozen: true,
     }
@@ -770,8 +774,8 @@ const evidenceRoutePhase18A = readFile("src/app/api/worker/submit-runtime-eviden
     { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
     {
       contractJson: "{}",
-      apiContracts: JSON.stringify([{ method: "GET", path: "/api/users", name: "List users" }]),
-      integrations: JSON.stringify([{ name: "Postgres", type: "database", verificationMethod: "connectivity" }]),
+      apiContracts: JSON.stringify([{ method: "GET", path: "/api/users", name: "List users", expectedStatus: 200 }]),
+      integrations: JSON.stringify([{ name: "Postgres", type: "database", verificationMethod: "connectivity", required: "required" }]),
       testingStrategy: JSON.stringify({
         apiJourneys: [{
           name: "User CRUD",
@@ -787,6 +791,8 @@ const evidenceRoutePhase18A = readFile("src/app/api/worker/submit-runtime-eviden
         buildCommands: ["python -m build"],
         startCommand: "uvicorn app:main",
         port: 8000,
+        startupTimeoutMs: 45000,
+        teardownTimeoutMs: 15000,
       }),
       frozen: true,
     }
@@ -1090,10 +1096,306 @@ function makeMinimalResult(): RuntimeVerificationResult {
 }
 
 // ===========================================================================
+// PHASE 18B: No defaults, canonical hash, idempotency, event semantics
+// ===========================================================================
+
+const runtimeModule18B = readFile("src/lib/runtime-verification.ts");
+const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/route.ts");
+
+// Test 68: Missing startupTimeoutMs → BLOCKED.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}", apiContracts: "[]", integrations: "[]", testingStrategy: "{}",
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"], buildCommands: ["npm run build"],
+        startCommand: "npm start", port: 3000, teardownTimeoutMs: 10000,
+      }),
+      frozen: true,
+    }
+  );
+  record("Phase 18B: missing startupTimeoutMs → BLOCKED (no 30000 default)", plan === null, `plan: ${plan}`);
+}
+
+// Test 69: Missing teardownTimeoutMs → BLOCKED.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}", apiContracts: "[]", integrations: "[]", testingStrategy: "{}",
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"], buildCommands: ["npm run build"],
+        startCommand: "npm start", port: 3000, startupTimeoutMs: 30000,
+      }),
+      frozen: true,
+    }
+  );
+  record("Phase 18B: missing teardownTimeoutMs → BLOCKED (no 10000 default)", plan === null, `plan: ${plan}`);
+}
+
+// Test 70: Missing health expectedStatus → BLOCKED.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}", apiContracts: "[]", integrations: "[]",
+      testingStrategy: JSON.stringify({ healthEndpoints: [{ path: "/health", timeoutMs: 5000, required: "required" }] }),
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"], buildCommands: ["npm run build"],
+        startCommand: "npm start", port: 3000, startupTimeoutMs: 30000, teardownTimeoutMs: 10000,
+      }),
+      frozen: true,
+    }
+  );
+  record("Phase 18B: missing health expectedStatus → BLOCKED (no 200 default)", plan === null, `plan: ${plan}`);
+}
+
+// Test 71: Missing API method → BLOCKED.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}",
+      apiContracts: JSON.stringify([{ path: "/api/users", expectedStatus: 200 }]), // no method
+      integrations: "[]", testingStrategy: "{}",
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"], buildCommands: ["npm run build"],
+        startCommand: "npm start", port: 3000, startupTimeoutMs: 30000, teardownTimeoutMs: 10000,
+      }),
+      frozen: true,
+    }
+  );
+  record("Phase 18B: missing API method → BLOCKED (no GET default)", plan === null, `plan: ${plan}`);
+}
+
+// Test 72: Missing integration verificationMethod → BLOCKED.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}", apiContracts: "[]",
+      integrations: JSON.stringify([{ name: "Postgres", type: "database", required: "required" }]), // no verificationMethod
+      testingStrategy: "{}",
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"], buildCommands: ["npm run build"],
+        startCommand: "npm start", port: 3000, startupTimeoutMs: 30000, teardownTimeoutMs: 10000,
+      }),
+      frozen: true,
+    }
+  );
+  record("Phase 18B: missing integration verificationMethod → BLOCKED (no connectivity default)", plan === null, `plan: ${plan}`);
+}
+
+// Test 73: Missing background observationWindowMs → BLOCKED.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}", apiContracts: "[]", integrations: "[]",
+      testingStrategy: JSON.stringify({
+        backgroundJobs: [{ name: "Email queue", type: "worker", required: "required", trigger: "manual", expectedEffect: "email sent" }],
+      }),
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"], buildCommands: ["npm run build"],
+        startCommand: "npm start", port: 3000, startupTimeoutMs: 30000, teardownTimeoutMs: 10000,
+      }),
+      frozen: true,
+    }
+  );
+  record("Phase 18B: missing background observationWindowMs → BLOCKED (no 5000 default)", plan === null, `plan: ${plan}`);
+}
+
+// Test 74: Missing browser timeoutMs → BLOCKED.
+{
+  const plan = deriveRuntimeVerificationPlan(
+    { canonicalHeadSha: "abc123", githubRepo: "owner/repo", githubDefaultBranch: "main" },
+    {
+      contractJson: "{}", apiContracts: "[]", integrations: "[]",
+      testingStrategy: JSON.stringify({
+        browserJourneys: [{ name: "Login flow", url: "http://localhost:3000", required: "required", steps: [], assertions: [] }],
+      }),
+      deploymentModel: JSON.stringify({
+        installCommands: ["npm install"], buildCommands: ["npm run build"],
+        startCommand: "npm start", port: 3000, startupTimeoutMs: 30000, teardownTimeoutMs: 10000,
+      }),
+      frozen: true,
+    }
+  );
+  record("Phase 18B: missing browser timeoutMs → BLOCKED (no 30000 default)", plan === null, `plan: ${plan}`);
+}
+
+// Test 75: No || defaults remain in runtime-verification.ts.
+{
+  const hasDefaultPattern = /\|\|\s*(200|10000|"GET"|"connectivity"|"manual"|5000|"optional"|30000)\b/.test(runtimeModule18B);
+  record(
+    "Phase 18B: no || runtime defaults remain in runtime-verification.ts",
+    !hasDefaultPattern,
+    `hasDefaultPattern: ${hasDefaultPattern}`
+  );
+}
+
+// Test 76: Recursive canonical hash — reordered object keys produce same hash.
+{
+  const plan1: any = { a: 1, b: { y: 2, x: 1 }, c: [3, 2, 1] };
+  const plan2: any = { c: [3, 2, 1], b: { x: 1, y: 2 }, a: 1 };
+  // Use the internal canonicalSerialize via hashRuntimePlan (which wraps it).
+  // We test with the public API by hashing plans with reordered keys.
+  const hash1 = hashRuntimePlan(plan1 as any);
+  const hash2 = hashRuntimePlan(plan2 as any);
+  record(
+    "Phase 18B: reordered object keys → identical hash (recursive canonical serialization)",
+    hash1 === hash2,
+    `hash1: ${hash1}, hash2: ${hash2}`
+  );
+}
+
+// Test 77: Reordered array elements → different hash.
+{
+  const plan1: any = { a: [1, 2, 3] };
+  const plan2: any = { a: [3, 2, 1] };
+  const hash1 = hashRuntimePlan(plan1 as any);
+  const hash2 = hashRuntimePlan(plan2 as any);
+  record(
+    "Phase 18B: reordered array elements → different hash (order matters)",
+    hash1 !== hash2,
+    `hash1: ${hash1}, hash2: ${hash2}`
+  );
+}
+
+// Test 78: Endpoint does NOT emit PRODUCTION_READY from evaluation.passed alone.
+{
+  // The first event should use TASK_COMPLETED/TASK_FAILED, not PRODUCTION_READY.
+  const noEarlyProductionReady = !evidenceRoute18B.includes("evaluation.passed ? BuildEventType.PRODUCTION_READY");
+  record(
+    "Phase 18B: endpoint does NOT emit PRODUCTION_READY from evaluation.passed alone",
+    noEarlyProductionReady,
+    `noEarlyProductionReady: ${noEarlyProductionReady}`
+  );
+}
+
+// Test 79: Endpoint emits RUNTIME_VERIFIED event type.
+{
+  const emitsRuntimeVerified = evidenceRoute18B.includes("RUNTIME_VERIFIED");
+  record(
+    "Phase 18B: endpoint emits RUNTIME_VERIFIED event type",
+    emitsRuntimeVerified,
+    `emitsRuntimeVerified: ${emitsRuntimeVerified}`
+  );
+}
+
+// Test 80: Endpoint has idempotency check.
+{
+  const hasIdempotency = evidenceRoute18B.includes("idempotencyKey") && evidenceRoute18B.includes("findUnique");
+  record(
+    "Phase 18B: endpoint has idempotency check (projectId+executionId+attempt)",
+    hasIdempotency,
+    `hasIdempotency: ${hasIdempotency}`
+  );
+}
+
+// Test 81: Endpoint returns idempotent response for duplicate submission.
+{
+  const returnsIdempotent = evidenceRoute18B.includes("idempotent: true");
+  record(
+    "Phase 18B: endpoint returns idempotent response for duplicate submission",
+    returnsIdempotent,
+    `returnsIdempotent: ${returnsIdempotent}`
+  );
+}
+
+// Test 82: RuntimeEvidence schema has idempotencyKey field.
+{
+  const hasField = readFile("prisma/schema.prisma").includes("idempotencyKey  String   @unique");
+  record(
+    "Phase 18B: RuntimeEvidence schema has idempotencyKey @unique field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 83: RuntimeEvidence schema has attempt field.
+{
+  const hasField = readFile("prisma/schema.prisma").includes("attempt         Int");
+  record(
+    "Phase 18B: RuntimeEvidence schema has attempt field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 84: Runtime PASS + static FAIL → NOT PRODUCTION_READY.
+{
+  const allTrue: ProductionReadinessEvidence = {
+    architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
+    staticReadinessPassed: false, // STATIC FAILS
+    runtimeVerificationPassed: true,
+    runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    repositoryHeadVerified: true,
+  };
+  record(
+    "Phase 18B: runtime PASS + static FAIL → NOT PRODUCTION_READY",
+    !canReachProductionReadyWithRuntime(allTrue),
+    `result: ${canReachProductionReadyWithRuntime(allTrue)}`
+  );
+}
+
+// Test 85: Runtime PASS + unsandboxed → NOT PRODUCTION_READY.
+{
+  const allTrue: ProductionReadinessEvidence = {
+    architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
+    staticReadinessPassed: true,
+    runtimeVerificationPassed: true,
+    runtimeEvidencePersisted: true,
+    executionEnvironmentSandboxed: false, // UNSANDBOXED
+    repositoryHeadVerified: true,
+  };
+  record(
+    "Phase 18B: runtime PASS + unsandboxed → NOT PRODUCTION_READY",
+    !canReachProductionReadyWithRuntime(allTrue),
+    `result: ${canReachProductionReadyWithRuntime(allTrue)}`
+  );
+}
+
+// Test 86: Runtime PASS + wrong SHA → NOT PRODUCTION_READY.
+{
+  const allTrue: ProductionReadinessEvidence = {
+    architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
+    staticReadinessPassed: true,
+    runtimeVerificationPassed: true,
+    runtimeEvidencePersisted: true,
+    executionEnvironmentSandboxed: true,
+    repositoryHeadVerified: false, // SHA NOT VERIFIED
+  };
+  record(
+    "Phase 18B: runtime PASS + wrong SHA → NOT PRODUCTION_READY",
+    !canReachProductionReadyWithRuntime(allTrue),
+    `result: ${canReachProductionReadyWithRuntime(allTrue)}`
+  );
+}
+
+// Test 87: All conditions true → PRODUCTION_READY.
+{
+  const allTrue: ProductionReadinessEvidence = {
+    architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
+    staticReadinessPassed: true,
+    runtimeVerificationPassed: true,
+    runtimeEvidencePersisted: true,
+    executionEnvironmentSandboxed: true,
+    repositoryHeadVerified: true,
+  };
+  record(
+    "Phase 18B: all conditions true → PRODUCTION_READY",
+    canReachProductionReadyWithRuntime(allTrue),
+    `result: ${canReachProductionReadyWithRuntime(allTrue)}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 18A: Runtime Verification Policy Hardening ===\n");
+console.log("=== Forge Phase 18B: Final Runtime Policy Hardening ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {

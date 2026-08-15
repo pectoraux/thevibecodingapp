@@ -241,12 +241,44 @@ export interface RuntimeVerificationResult {
 // ---------------------------------------------------------------------------
 
 /**
+ * Phase 18B: Recursive canonical serialization for stable plan hashing.
+ *
+ * Rules:
+ *   - Object keys are sorted recursively (at every nesting level).
+ *   - Arrays preserve order (step order matters, command order matters).
+ *   - Strings, numbers, booleans, null are canonicalized normally.
+ *   - undefined values are omitted (not included in hash).
+ *
+ * This ensures semantically identical plans with different object insertion
+ * order hash identically, while preserving the semantic meaning of arrays.
+ */
+function canonicalSerialize(value: any): string {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value.toString();
+  if (typeof value === "number") return value.toString();
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    // Arrays preserve order — each element is recursively canonicalized.
+    return "[" + value.map(canonicalSerialize).join(",") + "]";
+  }
+  if (typeof value === "object") {
+    // Objects: sort keys recursively.
+    const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+    const pairs = keys.map((k) => JSON.stringify(k) + ":" + canonicalSerialize(value[k]));
+    return "{" + pairs.join(",") + "}";
+  }
+  return "null"; // Fallback for unexpected types.
+}
+
+/**
  * Hash a RuntimeVerificationPlan for evidence reproducibility.
  * The hash is stored in RuntimeEvidence so the exact plan used can be verified.
+ *
+ * Phase 18B: Uses recursive canonical serialization — object keys are sorted
+ * at every nesting level, while array order is preserved.
  */
 export function hashRuntimePlan(plan: RuntimeVerificationPlan): string {
-  // Canonical JSON representation (sorted keys) for stable hashing.
-  const canonical = JSON.stringify(plan, Object.keys(plan).sort());
+  const canonical = canonicalSerialize(plan);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
 
@@ -389,130 +421,163 @@ export function deriveRuntimeVerificationPlan(
     return null;
   }
 
+  // Phase 18B: NO DEFAULTS for any runtime values.
+  // Every field must be explicitly declared by the frozen architecture.
+  // Missing required fields → return null (BLOCKED).
+
+  // startupTimeoutMs — MUST be declared.
+  if (typeof deploy.startupTimeoutMs !== "number") {
+    return null;
+  }
+  // teardownTimeoutMs — MUST be declared.
+  if (typeof deploy.teardownTimeoutMs !== "number") {
+    return null;
+  }
+
   // Derive health checks from testing strategy or deployment model.
+  // Phase 18B: If health endpoints are declared, every field must be explicit.
+  // No defaults for expectedStatus, timeoutMs, or required.
   const healthChecks: HealthCheckDef[] = [];
   const healthEndpoints = deploy.healthEndpoints || testingStrategy.healthEndpoints || [];
   for (const ep of healthEndpoints) {
-    if (typeof ep === "object" && ep.path) {
-      healthChecks.push({
-        name: ep.name || `Health ${ep.path}`,
-        path: ep.path,
-        expectedStatus: ep.expectedStatus || 200,
-        timeoutMs: ep.timeoutMs || 10000,
-        required: ep.required || "required",
-      });
-    }
+    if (typeof ep !== "object" || !ep.path) return null; // Malformed → BLOCKED.
+    if (typeof ep.expectedStatus !== "number") return null;
+    if (typeof ep.timeoutMs !== "number") return null;
+    if (ep.required !== "required" && ep.required !== "optional") return null;
+    healthChecks.push({
+      name: ep.name || `Health ${ep.path}`, // name is cosmetic, not a runtime default
+      path: ep.path,
+      expectedStatus: ep.expectedStatus,
+      timeoutMs: ep.timeoutMs,
+      required: ep.required,
+    });
   }
-  // If no health endpoints declared, that's acceptable — health checks are optional.
-  // But if declared, they must have the right shape.
 
-  // Derive API journeys from apiContracts.
-  // Phase 18A: Each journey is a multi-step sequence.
+  // Derive API journeys from testing strategy.
+  // Phase 18B: Every step field must be explicit. No defaults for method/status.
   const apiJourneys: ApiJourneyDef[] = [];
   const journeyDefs = testingStrategy.apiJourneys || [];
   if (journeyDefs.length > 0) {
     for (const j of journeyDefs) {
-      if (j.name && Array.isArray(j.steps)) {
-        apiJourneys.push({
-          name: j.name,
-          description: j.description || "",
-          required: j.required || "required",
-          setup: j.setup,
-          steps: j.steps.map((s: any) => ({
-            name: s.name || s.path || "step",
-            method: s.method || "GET",
-            path: s.path,
-            expectedStatus: s.expectedStatus || 200,
-            body: s.body,
-            capture: s.capture,
-            assertions: s.assertions || [],
-          })),
-          teardown: j.teardown,
+      if (!j.name || !Array.isArray(j.steps)) return null; // Malformed → BLOCKED.
+      if (j.required !== "required" && j.required !== "optional") return null;
+      const steps: ApiJourneyStep[] = [];
+      for (const s of j.steps) {
+        if (typeof s.method !== "string") return null; // No "GET" default.
+        if (typeof s.path !== "string") return null;
+        if (typeof s.expectedStatus !== "number") return null; // No 200 default.
+        steps.push({
+          name: s.name || s.path, // name is cosmetic
+          method: s.method,
+          path: s.path,
+          expectedStatus: s.expectedStatus,
+          body: s.body,
+          capture: s.capture,
+          assertions: Array.isArray(s.assertions) ? s.assertions : [],
         });
       }
+      apiJourneys.push({
+        name: j.name,
+        description: j.description || "", // description is cosmetic
+        required: j.required,
+        setup: j.setup,
+        steps,
+        teardown: j.teardown,
+      });
     }
   } else if (apiContracts.length > 0) {
-    // Fall back to single-step journeys from API contracts.
+    // Phase 18B: API-contract fallback is acceptable ONLY if the architecture
+    // explicitly declares API contracts with method + expectedStatus.
+    // No inventing missing method/status.
     for (const a of apiContracts.slice(0, 10)) {
-      if (a.path) {
-        apiJourneys.push({
+      if (!a.path) return null; // Malformed → BLOCKED.
+      if (typeof a.method !== "string") return null; // No "GET" default.
+      if (typeof a.expectedStatus !== "number") return null; // No 200 default.
+      apiJourneys.push({
+        name: a.name || a.path,
+        description: `API contract: ${a.method} ${a.path}`,
+        required: "required",
+        steps: [{
           name: a.name || a.path,
-          description: `API contract: ${a.method || "GET"} ${a.path}`,
-          required: "required",
-          steps: [{
-            name: a.name || a.path,
-            method: a.method || "GET",
-            path: a.path,
-            expectedStatus: a.expectedStatus || 200,
-            body: a.body,
-            assertions: a.assertions || [],
-          }],
-        });
-      }
+          method: a.method,
+          path: a.path,
+          expectedStatus: a.expectedStatus,
+          body: a.body,
+          assertions: Array.isArray(a.assertions) ? a.assertions : [],
+        }],
+      });
     }
   }
 
   // Derive integration checks from integrations.
+  // Phase 18B: verificationMethod MUST be declared. No "connectivity" default.
   const integrationChecks: IntegrationCheckDef[] = [];
   for (const i of integrations) {
-    if (i.name) {
-      integrationChecks.push({
-        name: i.name,
-        type: i.type || "unknown",
-        required: i.required || "required",
-        verificationMethod: i.verificationMethod || "connectivity",
-        verificationConfig: i.verificationConfig ? JSON.stringify(i.verificationConfig) : undefined,
-      });
-    }
+    if (!i.name) return null; // Malformed → BLOCKED.
+    if (typeof i.verificationMethod !== "string") return null; // No default.
+    if (i.required !== "required" && i.required !== "optional") return null;
+    integrationChecks.push({
+      name: i.name,
+      type: i.type || "unknown", // type is descriptive, not a runtime default
+      required: i.required,
+      verificationMethod: i.verificationMethod,
+      verificationConfig: i.verificationConfig ? JSON.stringify(i.verificationConfig) : undefined,
+    });
   }
 
   // Derive background job checks from testing strategy.
+  // Phase 18B: trigger, observationWindowMs, expectedEffect MUST be declared.
   const backgroundJobChecks: BackgroundJobCheckDef[] = [];
   const bgJobs = testingStrategy.backgroundJobs || [];
   for (const j of bgJobs) {
-    if (j.name) {
-      backgroundJobChecks.push({
-        name: j.name,
-        type: j.type || "unknown",
-        required: j.required || "required",
-        trigger: j.trigger || "manual",
-        observationWindowMs: j.observationWindowMs || 5000,
-        expectedEffect: j.expectedEffect || "",
-      });
-    }
+    if (!j.name) return null; // Malformed → BLOCKED.
+    if (typeof j.trigger !== "string") return null; // No "manual" default.
+    if (typeof j.observationWindowMs !== "number") return null; // No 5000 default.
+    if (typeof j.expectedEffect !== "string") return null;
+    if (j.required !== "required" && j.required !== "optional") return null;
+    backgroundJobChecks.push({
+      name: j.name,
+      type: j.type || "unknown",
+      required: j.required,
+      trigger: j.trigger,
+      observationWindowMs: j.observationWindowMs,
+      expectedEffect: j.expectedEffect,
+    });
   }
 
   // Derive browser journeys from testing strategy.
+  // Phase 18B: required, timeoutMs MUST be declared. No defaults.
   const browserJourneys: BrowserJourneyDef[] = [];
   const browserJourneysDefs = testingStrategy.browserJourneys || [];
   for (const b of browserJourneysDefs) {
-    if (b.name && b.url) {
-      browserJourneys.push({
-        name: b.name,
-        url: b.url,
-        required: b.required || "optional",
-        steps: b.steps || [],
-        assertions: b.assertions || [],
-        timeoutMs: b.timeoutMs || 30000,
-      });
-    }
+    if (!b.name || !b.url) return null; // Malformed → BLOCKED.
+    if (b.required !== "required" && b.required !== "optional") return null; // No "optional" default.
+    if (typeof b.timeoutMs !== "number") return null; // No 30000 default.
+    browserJourneys.push({
+      name: b.name,
+      url: b.url,
+      required: b.required,
+      steps: Array.isArray(b.steps) ? b.steps : [],
+      assertions: Array.isArray(b.assertions) ? b.assertions : [],
+      timeoutMs: b.timeoutMs,
+    });
   }
 
   return {
     repositoryHeadSha: project.canonicalHeadSha,
     githubRepo: project.githubRepo,
-    githubDefaultBranch: project.githubDefaultBranch || "main",
+    githubDefaultBranch: project.githubDefaultBranch || "main", // branch is config, not runtime
     installCommands: deploy.installCommands,
     buildCommands: deploy.buildCommands,
     startCommand: deploy.startCommand,
     expectedPort: deploy.port,
-    startupTimeoutMs: deploy.startupTimeoutMs || 30000,
+    startupTimeoutMs: deploy.startupTimeoutMs, // No default — required above.
     healthChecks,
     apiJourneys,
     integrationChecks,
     backgroundJobChecks,
     browserJourneys,
-    teardownTimeoutMs: 10000,
+    teardownTimeoutMs: deploy.teardownTimeoutMs, // No default — required above.
   };
 }
 

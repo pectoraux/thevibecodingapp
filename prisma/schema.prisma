@@ -717,6 +717,11 @@ model RuntimeEvidence {
   executionId     String?  // ExecutionJob that ran this verification
   workerId        String?
 
+  // Phase 18B: Idempotency — projectId + executionId + attempt uniquely identifies
+  // a runtime verification submission. Retries for the same attempt are idempotent.
+  attempt         Int      @default(0)
+  idempotencyKey  String   @unique  // projectId+executionId+attempt
+
   // Timing
   startedAt       DateTime
   completedAt     DateTime?
