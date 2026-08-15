@@ -294,13 +294,12 @@ export async function getProjectEvidence(projectId: string): Promise<TaskEvidenc
 }
 
 // ---------------------------------------------------------------------------
-// P15D: hasSufficientEvidence now takes an optional mode parameter.
-// If mode is provided, it uses the ACTUAL project mode (GITHUB_BACKED or LOCAL_ONLY).
-// If mode is not provided, it defaults to LOCAL_ONLY for backward compatibility.
+// P15E: hasSufficientEvidence requires a mandatory mode parameter.
+// No unsafe default — callers must explicitly pass LOCAL_ONLY or GITHUB_BACKED.
 // The submit-evidence endpoint always passes the correct mode.
 // ---------------------------------------------------------------------------
 
-export function hasSufficientEvidence(evidence: TaskEvidence, mode?: "LOCAL_ONLY" | "GITHUB_BACKED"): boolean {
+export function hasSufficientEvidence(evidence: TaskEvidence, mode: "LOCAL_ONLY" | "GITHUB_BACKED"): boolean {
   const { canCompleteTask } = require("@/lib/completion-policy") as typeof import("@/lib/completion-policy");
 
   const tests = decodeArray<TestRunResult>(evidence.testRuns);
@@ -312,9 +311,7 @@ export function hasSufficientEvidence(evidence: TaskEvidence, mode?: "LOCAL_ONLY
   const review = decodeObject<ReviewEvidencePayload>(evidence.reviewResults);
   const reviewVerdict = review?.verdict || "REJECTED";
 
-  // P15D: Use the provided mode, or default to LOCAL_ONLY.
-  const projectMode = mode || "LOCAL_ONLY";
-
+  // P15E: Mode is mandatory — no unsafe default.
   return canCompleteTask({
     commitSha: evidence.commitSha,
     pushedToRemote: evidence.pushedToRemote,
@@ -324,7 +321,7 @@ export function hasSufficientEvidence(evidence: TaskEvidence, mode?: "LOCAL_ONLY
     reviewVerdict,
     testsPassed,
     evidencePersisted: true,
-  }, projectMode);
+  }, mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +329,7 @@ export function hasSufficientEvidence(evidence: TaskEvidence, mode?: "LOCAL_ONLY
 // Used by the dashboard and the orchestrator's completion gate.
 // ---------------------------------------------------------------------------
 
-export function summarizeEvidence(evidence: TaskEvidence[], mode?: "LOCAL_ONLY" | "GITHUB_BACKED"): EvidenceSummary {
+export function summarizeEvidence(evidence: TaskEvidence[], mode: "LOCAL_ONLY" | "GITHUB_BACKED"): EvidenceSummary {
   const totalAttempts = evidence.length;
   if (totalAttempts === 0) {
     return {

@@ -218,15 +218,11 @@ export async function POST(req: Request) {
       },
     });
 
-    // P15D: Update canonical project HEAD on completion.
-    // This ensures dependent tasks branch from a base that includes ALL
-    // completed dependency changes.
-    if (canComplete && commitSha) {
-      await db.project.update({
-        where: { id: projectId },
-        data: { canonicalHeadSha: commitSha },
-      });
-    }
+    // P15E: Do NOT update canonicalHeadSha on task completion.
+    // canonicalHeadSha represents the INTEGRATION branch HEAD (GitHub default branch).
+    // It advances only when a PR is merged, not when a task completes.
+    // A completed task has a verified candidate commit + remote branch — but
+    // the canonical HEAD doesn't change until that commit is merged.
 
     await ensureBuildEvent({
       projectId,
