@@ -20,7 +20,7 @@ import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runS
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
 const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
-const WORKER_VERSION = "phase13";
+const WORKER_VERSION = "phase14";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
@@ -275,40 +275,55 @@ Generate the implementation files. Respond with ONLY JSON:
     filesChanged.push({ path: f.path, content: f.content || "" });
   }
 
-  // --- VerificationPlan (no silent npm fallback) ---
+  // --- P14: Full VerificationPlan execution (install, static, unit, build) ---
   const verCommands = getVerificationCommands(spec.verificationPlan);
   if (!verCommands) {
     return blocked("No VerificationPlan in architecture contract", "Architecture Contract must include a VerificationPlan");
   }
 
   let testResults: any[] = [];
+  let verificationFailed = false;
 
-  for (const cmd of verCommands.install) {
-    const [bin, ...args] = cmd.split(" ");
-    const result = await runCommand(sandboxPath, bin, args, 120000);
-    if (!result.success) {
-      testResults.push({
-        name: cmd, command: cmd, exitCode: result.exitCode,
-        stdout: result.stdout.slice(0, 5000), stderr: result.stderr.slice(0, 5000),
-        passes: false, evidence: `Install failed: exitCode=${result.exitCode}`,
-        durationMs: result.durationMs, timedOut: result.timedOut,
-      });
-      break;
-    }
-  }
+  // Execute each verification phase. All required phases must pass.
+  const phases: { name: string; commands: string[]; phase: string }[] = [
+    { name: "install", commands: verCommands.install, phase: "install" },
+    { name: "static", commands: verCommands.lint, phase: "static" },
+    { name: "unit", commands: verCommands.test, phase: "unit" },
+    { name: "build", commands: verCommands.build, phase: "build" },
+  ];
 
-  if (testResults.length === 0 || testResults.every((t) => t.passes)) {
-    for (const cmd of verCommands.test) {
+  for (const phase of phases) {
+    for (const cmd of phase.commands) {
       const [bin, ...args] = cmd.split(" ");
       const result = await runCommand(sandboxPath, bin, args, 120000);
       testResults.push({
-        name: cmd, command: cmd, exitCode: result.exitCode,
+        name: cmd, command: cmd, phase: phase.phase,
+        exitCode: result.exitCode,
         stdout: result.stdout.slice(0, 5000), stderr: result.stderr.slice(0, 5000),
         passes: result.success,
         evidence: `exitCode=${result.exitCode}, duration=${result.durationMs}ms`,
         durationMs: result.durationMs, timedOut: result.timedOut,
       });
+      if (!result.success) {
+        verificationFailed = true;
+        console.log(`[worker] Verification phase '${phase.phase}' FAILED: ${cmd}`);
+        break;
+      }
     }
+    if (verificationFailed) break;
+  }
+
+  // P14: If any verification phase fails, don't commit or push.
+  if (verificationFailed) {
+    return {
+      commitSha: null,
+      testResults,
+      guardianResult: { verdict: "VIOLATION", summary: "VerificationPlan phase failed — cannot proceed", violations: [], warnings: [] },
+      reviewResult: { verdict: "REJECTED", summary: "Verification failed", findings: [] },
+      filesChanged: filesChanged.map((f) => f.path),
+      pushedToRemote: false,
+      implementationLog: `BLOCKED: VerificationPlan phase failed`,
+    };
   }
 
   // --- P13: Candidate commit (local only — NOT pushed yet) ---
@@ -379,6 +394,7 @@ Generate the implementation files. Respond with ONLY JSON:
     guardianResult,
     reviewResult,
     filesChanged: filesChanged.map((f) => f.path),
+    pushedToRemote,
     implementationLog: `Executed in sandbox. Branch: ${branchName}. Commit: ${commitSha?.slice(0, 7) || "none"}. Pushed: ${pushedToRemote}. Deterministic: ${deterministicGuardianResult.verdict}. Semantic: ${semanticGuardianResult.verdict}.`,
   };
 }
@@ -391,6 +407,7 @@ function blocked(summary: string, log: string): any {
     guardianResult: { verdict: "VIOLATION", summary: `BLOCKED: ${summary}`, violations: [], warnings: [] },
     reviewResult: { verdict: "REJECTED", summary: summary, findings: [] },
     filesChanged: [],
+    pushedToRemote: false,
     implementationLog: `BLOCKED: ${log}`,
   };
 }
@@ -417,14 +434,19 @@ async function workerLoop(): Promise<void> {
             filesChanged: result.filesChanged,
             implementationLog: result.implementationLog,
           });
-          // P13: Success requires Guardian PASS or WARNING only.
-          // UNVERIFIED, VIOLATION, ARCHITECTURE_CHANGE_REQUIRED all block.
+          // P14: One canonical completion predicate.
+          // For GITHUB_BACKED: push must succeed. For LOCAL_ONLY: push not required.
           const blockVerdicts = ["VIOLATION", "UNVERIFIED", "ARCHITECTURE_CHANGE_REQUIRED"];
-          const success = result.commitSha !== null &&
-                          !blockVerdicts.includes(result.guardianResult.verdict) &&
-                          result.reviewResult.verdict === "APPROVED" &&
-                          result.testResults.length > 0 &&
-                          result.testResults.every((t) => t.passes);
+          const isGithubBacked = !!spec?.repository?.githubRepo;
+          const guardianPassed = !blockVerdicts.includes(result.guardianResult.verdict);
+          const reviewApproved = result.reviewResult.verdict === "APPROVED";
+          const testsPassed = result.testResults.length > 0 && result.testResults.every((t) => t.passes);
+          const hasCommit = result.commitSha !== null;
+
+          // P14: For GitHub-backed projects, push success is mandatory.
+          const pushOk = isGithubBacked ? result.pushedToRemote : true;
+
+          const success = hasCommit && guardianPassed && reviewApproved && testsPassed && pushOk;
           await completeJob(success ? "SUCCEEDED" : "FAILED");
           console.log(`[worker] ${job.executionId} → ${success ? "SUCCEEDED" : "FAILED"}`);
         } catch (err: any) {
