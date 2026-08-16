@@ -1832,3 +1832,34 @@ Stage Summary:
 - HONEST LIMITATIONS: filesystem-only isolation (no container), network not physically enforced, no resource quotas, no seccomp. Documented in SandboxIsolationLevel type.
 - TESTS: 373 passed, 0 failed from clean clone.
 - NEXT: Phase 19 — Worker Network (distributed verification). OR container mode upgrade for real sandbox isolation.
+
+---
+Task ID: 18E
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 18E — Replace HMAC shared-secret evidence signing with asymmetric Ed25519 signing. Honest acknowledgment that Phase 18D security freeze is NOT complete.
+
+Work Log:
+- User correctly identified that Phase 18D's HMAC-SHA256 with shared secret is wrong for distributed architecture. Compromised worker with secret can forge evidence.
+- Replaced with asymmetric Ed25519 signing:
+  * generateWorkerKeyPair() — generates Ed25519 key pair at registration.
+  * Private key NEVER leaves worker. Public key registered with control plane.
+  * signEvidence() uses crypto.sign(null, data, privateKey) — Ed25519 one-shot API.
+  * verifyEvidenceSignature() uses crypto.verify(null, data, publicKey, sig).
+  * Cross-worker forgery prevented (different keys).
+  * Control plane cannot fabricate worker evidence (no private key).
+- Updated tests to use key pairs instead of shared secrets.
+- Test 62 proves cross-worker forgery fails (worker-1 signs, worker-2 public key rejects).
+- HONESTLY DOCUMENTED that Phase 18D is NOT a complete security freeze:
+  * Physical sandbox: BLOCKED (no Docker/container runtime in sandbox).
+  * Network enforcement: BLOCKED (no network namespace).
+  * Resource limits: BLOCKED (no cgroups).
+  * Syscall restrictions: BLOCKED (no seccomp).
+  * Artifact capture: NOT YET IMPLEMENTED.
+  * These are documented as known P0 gaps, not hidden.
+- CLEAN-CLONE VERIFICATION: 373 passed, 0 failed. Ed25519 code confirmed present.
+- SHA: local == remote == clean clone == 91082d86e35120a9b7838168e9708d7765de330e.
+
+Stage Summary:
+- FIXED: Evidence signing now asymmetric (Ed25519). Cross-worker forgery prevented.
+- NOT FIXED (honestly): Physical sandbox, network enforcement, resource limits, seccomp, artifact capture. These require container infrastructure not available in this sandbox.
+- The user's assessment is correct: Phase 18D is NOT a complete security freeze. The naming should reflect this.
