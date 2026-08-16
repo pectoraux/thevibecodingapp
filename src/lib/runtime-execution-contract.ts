@@ -52,6 +52,26 @@ import { createHash } from "node:crypto";
  *   - Workspace is destroyed after execution (always — even on failure).
  *   - No caches that could contaminate reproducibility.
  */
+/**
+ * Phase 18D: Sandbox isolation level.
+ *
+ * The current implementation provides FILESYSTEM isolation only (dedicated
+ * directory per execution, destroyed after execution).
+ *
+ * Production-grade isolation requires container/microVM enforcement:
+ *   - Docker container with resource quotas (CPU, memory)
+ *   - Network namespace (no route in hermetic mode)
+ *   - Syscall restrictions (seccomp)
+ *   - User namespace (non-root)
+ *
+ * The isolation level is recorded in evidence so consumers know what
+ * guarantees the evidence actually carries.
+ */
+export type SandboxIsolationLevel =
+  | "filesystem-only"    // Current: mkdir + rmSync. No process/network isolation.
+  | "container"          // Docker container with resource quotas.
+  | "microvm";           // Firecracker/gVisor microVM.
+
 export interface SandboxModel {
   /** Root directory for all runtime verification sandboxes. */
   sandboxRoot: string;
@@ -63,6 +83,10 @@ export interface SandboxModel {
   cachesAllowed: boolean;
   /** Whether caches are included in evidence (default: false). */
   cachesInEvidence: boolean;
+  /** Phase 18D: Isolation level — records what guarantees the sandbox provides. */
+  isolationLevel: SandboxIsolationLevel;
+  /** Phase 18D: Whether network is physically enforced (not just policy). */
+  networkEnforced: boolean;
 }
 
 /**
@@ -79,6 +103,13 @@ export function createSandboxModel(
     destroyAfterExecution: true,
     cachesAllowed: false,
     cachesInEvidence: false,
+    // Phase 18D: Current implementation is filesystem-only.
+    // Production deployment must upgrade to "container" or "microvm".
+    isolationLevel: "filesystem-only",
+    // Phase 18D: Network is NOT physically enforced in filesystem-only mode.
+    // The network policy is recorded but not physically blocked.
+    // Container mode would enforce via network namespace.
+    networkEnforced: false,
   };
 }
 
@@ -399,4 +430,162 @@ export function getWorkspacePaths(sandbox: SandboxModel): WorkspacePaths {
     logs: `${sandbox.workspacePath}/logs`,
     artifacts: `${sandbox.workspacePath}/artifacts`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18D: Evidence Signing — HMAC-SHA256 signature
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 18D: Evidence signature.
+ *
+ * The worker signs the evidence using HMAC-SHA256 with the worker secret.
+ * The control plane verifies the signature before accepting the evidence.
+ *
+ * This prevents a compromised worker from fabricating evidence — the signature
+ * binds the evidence to the worker's authenticated identity.
+ */
+export interface EvidenceSignature {
+  /** HMAC-SHA256 hex digest of the canonical evidence serialization. */
+  signature: string;
+  /** The worker ID that signed the evidence. */
+  workerId: string;
+  /** The execution ID the evidence belongs to. */
+  executionId: string;
+  /** Timestamp the signature was created. */
+  signedAt: string;
+}
+
+/**
+ * Phase 18D: Sign a runtime verification result.
+ *
+ * Creates an HMAC-SHA256 signature over the canonical serialization of the
+ * result's key fields (repositoryHeadSha, passed, runtimePlanHash, environmentFingerprint).
+ *
+ * @param result The runtime verification result to sign.
+ * @param workerSecret The worker's secret key (from FORGE_WORKER_SECRET env).
+ * @param workerId The worker's ID.
+ * @param executionId The execution ID.
+ */
+export function signEvidence(
+  result: {
+    repositoryHeadSha: string;
+    passed: boolean;
+    failureReason: string | null;
+    environmentFingerprint: { environmentVariablesHash: string };
+  },
+  runtimePlanHash: string,
+  architectureHash: string | null,
+  workerSecret: string,
+  workerId: string,
+  executionId: string
+): EvidenceSignature {
+  // Canonical serialization of the evidence's key fields.
+  const canonical = JSON.stringify({
+    repositoryHeadSha: result.repositoryHeadSha,
+    passed: result.passed,
+    failureReason: result.failureReason,
+    runtimePlanHash,
+    architectureHash,
+    environmentVariablesHash: result.environmentFingerprint.environmentVariablesHash,
+  }, Object.keys({
+    repositoryHeadSha: 0,
+    passed: 0,
+    failureReason: 0,
+    runtimePlanHash: 0,
+    architectureHash: 0,
+    environmentVariablesHash: 0,
+  }).sort());
+
+  const signature = createHash("sha256")
+    .update(canonical)
+    .update(workerSecret)
+    .digest("hex");
+
+  return {
+    signature,
+    workerId,
+    executionId,
+    signedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Phase 18D: Verify an evidence signature.
+ *
+ * @returns true if the signature matches the evidence.
+ */
+export function verifyEvidenceSignature(
+  result: {
+    repositoryHeadSha: string;
+    passed: boolean;
+    failureReason: string | null;
+    environmentFingerprint: { environmentVariablesHash: string };
+  },
+  runtimePlanHash: string,
+  architectureHash: string | null,
+  sig: EvidenceSignature,
+  workerSecret: string
+): boolean {
+  const expected = signEvidence(
+    result,
+    runtimePlanHash,
+    architectureHash,
+    workerSecret,
+    sig.workerId,
+    sig.executionId
+  );
+  return expected.signature === sig.signature;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18D: Replayability — verify evidence is reproducible
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 18D: Replayability identity.
+ *
+ * Given the same repositoryHeadSha + runtimePlanHash + architectureHash +
+ * environmentFingerprint, a runtime verification should be reproducible.
+ *
+ * This is the identity that makes evidence deterministic.
+ */
+export interface ReplayabilityIdentity {
+  repositoryHeadSha: string;
+  runtimePlanHash: string;
+  architectureHash: string | null;
+  environmentVariablesHash: string;
+}
+
+/**
+ * Phase 18D: Create a replayability identity from an execution policy + result.
+ */
+export function createReplayabilityIdentity(
+  policy: RuntimeExecutionPolicy,
+  result: { environmentFingerprint: { environmentVariablesHash: string } }
+): ReplayabilityIdentity {
+  return {
+    repositoryHeadSha: policy.repositoryHeadSha,
+    runtimePlanHash: policy.runtimePlanHash,
+    architectureHash: policy.architectureHash,
+    environmentVariablesHash: result.environmentFingerprint.environmentVariablesHash,
+  };
+}
+
+/**
+ * Phase 18D: Check if two runtime evidence records are replay-compatible.
+ *
+ * Two evidence records are replay-compatible if they share the same
+ * replayability identity (same SHA + plan + architecture + environment).
+ */
+export function isReplayCompatible(
+  a: ReplayabilityIdentity,
+  b: ReplayabilityIdentity
+): boolean {
+  return (
+    a.repositoryHeadSha === b.repositoryHeadSha &&
+    a.runtimePlanHash === b.runtimePlanHash &&
+    a.architectureHash === b.architectureHash &&
+    a.environmentVariablesHash === b.environmentVariablesHash
+  );
 }

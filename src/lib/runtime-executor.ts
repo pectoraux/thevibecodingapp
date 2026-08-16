@@ -143,6 +143,7 @@ export function runCommand(
       cwd,
       env: { ...process.env, ...env },
       stdio: ["pipe", "pipe", "pipe"],
+      shell: false, // Phase 18D: NEVER use shell — prevents command injection.
     });
 
     child.stdout?.on("data", (d) => {
@@ -215,6 +216,7 @@ export class ProcessSupervisor {
       env: { ...process.env, ...env },
       stdio: ["pipe", "pipe", "pipe"],
       detached: true, // Create process group for child cleanup
+      shell: false, // Phase 18D: NEVER use shell — prevents command injection.
     });
 
     this.child.stdout?.on("data", (d) => {

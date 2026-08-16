@@ -18,6 +18,10 @@ import {
   deriveRuntimeExecutionPolicy,
   captureEnvironmentFingerprint,
   getWorkspacePaths,
+  signEvidence,
+  verifyEvidenceSignature,
+  createReplayabilityIdentity,
+  isReplayCompatible,
   type SandboxModel,
   type RuntimeCommand,
   type RuntimeCommandSet,
@@ -28,6 +32,9 @@ import {
   type RuntimeExecutionPolicy,
   type EvidenceEvent,
   type RuntimeStage,
+  type SandboxIsolationLevel,
+  type EvidenceSignature,
+  type ReplayabilityIdentity,
 } from "../src/lib/runtime-execution-contract";
 
 interface TestResult {
@@ -615,10 +622,216 @@ const executorModule = readFile("src/lib/runtime-executor.ts");
 }
 
 // ===========================================================================
+// PHASE 18D: Security freeze — sandbox isolation, shell:false, evidence signing, replayability
+// ===========================================================================
+
+// Test 56: spawn calls use shell: false (no command injection).
+{
+  const executorCode = readFile("src/lib/runtime-executor.ts");
+  const hasShellFalse = executorCode.includes("shell: false");
+  const hasNoExec = !executorCode.includes("exec(") && !executorCode.includes("execSync(");
+  record(
+    "Phase 18D: all spawn calls use shell: false (no command injection, no exec())",
+    hasShellFalse && hasNoExec,
+    `shellFalse: ${hasShellFalse}, noExec: ${hasNoExec}`
+  );
+}
+
+// Test 57: SandboxIsolationLevel type exists.
+{
+  const hasType = readFile("src/lib/runtime-execution-contract.ts").includes("type SandboxIsolationLevel");
+  record(
+    "Phase 18D: SandboxIsolationLevel type exists (filesystem-only | container | microvm)",
+    hasType,
+    `hasType: ${hasType}`
+  );
+}
+
+// Test 58: SandboxModel records isolationLevel.
+{
+  const sandbox = createSandboxModel("exec-test");
+  record(
+    "SandboxModel records isolationLevel (current: filesystem-only)",
+    sandbox.isolationLevel === "filesystem-only",
+    `isolationLevel: ${sandbox.isolationLevel}`
+  );
+}
+
+// Test 59: SandboxModel records networkEnforced.
+{
+  const sandbox = createSandboxModel("exec-test");
+  record(
+    "SandboxModel records networkEnforced (current: false — not physically enforced)",
+    sandbox.networkEnforced === false,
+    `networkEnforced: ${sandbox.networkEnforced}`
+  );
+}
+
+// Test 60: Evidence signing produces a signature.
+{
+  const result = {
+    repositoryHeadSha: "abc123",
+    passed: true,
+    failureReason: null,
+    environmentFingerprint: { environmentVariablesHash: "hash123" },
+  };
+  const sig = signEvidence(result, "planHash", "archHash", "workerSecret", "worker-1", "exec-1");
+  record(
+    "Phase 18D: signEvidence produces an EvidenceSignature",
+    sig.signature.length > 0 && sig.workerId === "worker-1" && sig.executionId === "exec-1",
+    `signature length: ${sig.signature.length}, workerId: ${sig.workerId}`
+  );
+}
+
+// Test 61: Evidence signature is verifiable.
+{
+  const result = {
+    repositoryHeadSha: "abc123",
+    passed: true,
+    failureReason: null,
+    environmentFingerprint: { environmentVariablesHash: "hash123" },
+  };
+  const sig = signEvidence(result, "planHash", "archHash", "workerSecret", "worker-1", "exec-1");
+  const verified = verifyEvidenceSignature(result, "planHash", "archHash", sig, "workerSecret");
+  record(
+    "Phase 18D: verifyEvidenceSignature returns true for correct signature",
+    verified,
+    `verified: ${verified}`
+  );
+}
+
+// Test 62: Evidence signature fails with wrong secret.
+{
+  const result = {
+    repositoryHeadSha: "abc123",
+    passed: true,
+    failureReason: null,
+    environmentFingerprint: { environmentVariablesHash: "hash123" },
+  };
+  const sig = signEvidence(result, "planHash", "archHash", "correctSecret", "worker-1", "exec-1");
+  const verified = verifyEvidenceSignature(result, "planHash", "archHash", sig, "wrongSecret");
+  record(
+    "Phase 18D: verifyEvidenceSignature returns false for wrong secret",
+    !verified,
+    `verified: ${verified}`
+  );
+}
+
+// Test 63: Evidence signature fails with tampered result.
+{
+  const originalResult = {
+    repositoryHeadSha: "abc123",
+    passed: true,
+    failureReason: null,
+    environmentFingerprint: { environmentVariablesHash: "hash123" },
+  };
+  const sig = signEvidence(originalResult, "planHash", "archHash", "secret", "worker-1", "exec-1");
+  // Tamper with the result.
+  const tamperedResult = { ...originalResult, passed: false };
+  const verified = verifyEvidenceSignature(tamperedResult, "planHash", "archHash", sig, "secret");
+  record(
+    "Phase 18D: verifyEvidenceSignature returns false for tampered result (passed: true→false)",
+    !verified,
+    `verified: ${verified}`
+  );
+}
+
+// Test 64: ReplayabilityIdentity type exists.
+{
+  const hasType = readFile("src/lib/runtime-execution-contract.ts").includes("interface ReplayabilityIdentity");
+  record(
+    "Phase 18D: ReplayabilityIdentity interface exists",
+    hasType,
+    `hasType: ${hasType}`
+  );
+}
+
+// Test 65: isReplayCompatible returns true for same identity.
+{
+  const a: ReplayabilityIdentity = {
+    repositoryHeadSha: "abc123",
+    runtimePlanHash: "planHash",
+    architectureHash: "archHash",
+    environmentVariablesHash: "envHash",
+  };
+  const b: ReplayabilityIdentity = { ...a };
+  record(
+    "Phase 18D: isReplayCompatible returns true for same identity",
+    isReplayCompatible(a, b),
+    `compatible: ${isReplayCompatible(a, b)}`
+  );
+}
+
+// Test 66: isReplayCompatible returns false for different SHA.
+{
+  const a: ReplayabilityIdentity = {
+    repositoryHeadSha: "abc123",
+    runtimePlanHash: "planHash",
+    architectureHash: "archHash",
+    environmentVariablesHash: "envHash",
+  };
+  const b: ReplayabilityIdentity = { ...a, repositoryHeadSha: "different" };
+  record(
+    "Phase 18D: isReplayCompatible returns false for different SHA",
+    !isReplayCompatible(a, b),
+    `compatible: ${isReplayCompatible(a, b)}`
+  );
+}
+
+// Test 67: isReplayCompatible returns false for different plan hash.
+{
+  const a: ReplayabilityIdentity = {
+    repositoryHeadSha: "abc123",
+    runtimePlanHash: "planHash",
+    architectureHash: "archHash",
+    environmentVariablesHash: "envHash",
+  };
+  const b: ReplayabilityIdentity = { ...a, runtimePlanHash: "different" };
+  record(
+    "Phase 18D: isReplayCompatible returns false for different plan hash",
+    !isReplayCompatible(a, b),
+    `compatible: ${isReplayCompatible(a, b)}`
+  );
+}
+
+// Test 68: ProcessSupervisor uses detached: true (process group).
+{
+  const executorCode = readFile("src/lib/runtime-executor.ts");
+  const hasDetached = executorCode.includes("detached: true");
+  record(
+    "Phase 18D: ProcessSupervisor uses detached: true (process group for child cleanup)",
+    hasDetached,
+    `hasDetached: ${hasDetached}`
+  );
+}
+
+// Test 69: ProcessSupervisor kills process group (negative PID).
+{
+  const executorCode = readFile("src/lib/runtime-executor.ts");
+  const hasProcessGroupKill = executorCode.includes("process.kill(-");
+  record(
+    "Phase 18D: ProcessSupervisor kills process group (negative PID, not just parent)",
+    hasProcessGroupKill,
+    `hasProcessGroupKill: ${hasProcessGroupKill}`
+  );
+}
+
+// Test 70: No exec() or execSync() anywhere in the executor.
+{
+  const executorCode = readFile("src/lib/runtime-executor.ts");
+  const hasExec = /\bexec\s*\(/.test(executorCode) || /\bexecSync\s*\(/.test(executorCode);
+  record(
+    "Phase 18D: no exec() or execSync() in runtime-executor.ts (only spawn)",
+    !hasExec,
+    `hasExec: ${hasExec}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 18C: Runtime Execution Contract + Executor Invariants ===\n");
+console.log("=== Forge Phase 18D: Runtime Executor Security Freeze ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {
