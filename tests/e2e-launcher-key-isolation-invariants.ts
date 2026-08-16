@@ -79,7 +79,7 @@ import {
 import { getHostNamespaceInodes } from "@/lib/substrate-namespace";
 import { executeRuntimeVerificationInWorker, generateSubstrateNonce } from "../mini-services/execution-worker/runtime/verify.js";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
-import { setupTestRepo as setupTestRepoHelper, setupTestWorkspace, makeTestPlan } from "./lib/test-capability.js";
+import { setupTestRepo as setupTestRepoHelper, setupTestWorkspace, makeTestPlan, fileUrlForPath } from "./lib/test-capability.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -201,6 +201,7 @@ async function runVerification(opts: {
     nonce,
     leaseId: "lease-e2e-iso",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(useCrashApp ? CRASH_APP_DIR : TEST_APP_DIR),
     runtimePlanHash: "e2e-iso-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
@@ -265,6 +266,7 @@ let test1Capability: ExecutionCapability | null = null;
     nonce,
     leaseId: "lease-e2e-iso",
     repositoryHeadSha: envelope.repositoryHeadSha,
+    repositoryUrl: fileUrlForPath(TEST_APP_DIR),
     runtimePlanHash: envelope.runtimePlanHash,
     architectureHash: envelope.architectureHash,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
@@ -480,6 +482,7 @@ let test1Capability: ExecutionCapability | null = null;
     nonce,
     leaseId: "lease-1",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -491,7 +494,6 @@ let test1Capability: ExecutionCapability | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      repoPath,
     }),
   });
   const respText = await resp.text();
@@ -546,6 +548,7 @@ let test1Capability: ExecutionCapability | null = null;
     nonce,
     leaseId: "lease-1",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
@@ -558,7 +561,6 @@ let test1Capability: ExecutionCapability | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: forgedCap,
-      repoPath,
     }),
   });
   let detail = "";
@@ -594,6 +596,7 @@ let test1Capability: ExecutionCapability | null = null;
     nonce,
     leaseId: "lease-1",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() - 60000).toISOString(), // EXPIRED 60s ago
@@ -605,7 +608,6 @@ let test1Capability: ExecutionCapability | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      repoPath,
     }),
   });
   let detail = "";
@@ -629,17 +631,16 @@ let test1Capability: ExecutionCapability | null = null;
 // ===========================================================================
 //
 // POST /execute without a `capability` field must be rejected.
-// Phase 18Y: the request body is { capability, repoPath } — no workload.
-// We POST { repoPath } only (no capability).
+// Phase 18Z-PRE: the request body is { capability } only — no workload,
+// no repoPath. We POST { } (empty body) — the supervisor rejects with 403
+// for missing capability.
 
 {
-  const { repoPath } = setupTestWorkspace("e2e-iso-8");
   const resp = await fetch(`${SUPERVISOR.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      // No capability field. Phase 18Y: NO workload field either.
-      repoPath,
+      // Empty body — no capability, no workload, no repoPath.
     }),
   });
   const ok = resp.status === 403 || resp.status === 400;
@@ -678,6 +679,7 @@ let test1Capability: ExecutionCapability | null = null;
     nonce,
     leaseId: "lease-1",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -689,7 +691,6 @@ let test1Capability: ExecutionCapability | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      repoPath,
     }),
   });
   let detail = "";
@@ -740,6 +741,7 @@ let test1Capability: ExecutionCapability | null = null;
     nonce,
     leaseId: "lease-1",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -751,7 +753,6 @@ let test1Capability: ExecutionCapability | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      repoPath,
     }),
   });
   const body = await resp.json() as { attestation?: SandboxAttestation; result?: { stdout?: string } };
@@ -986,6 +987,7 @@ let test1Capability: ExecutionCapability | null = null;
     nonce: nonceA,
     leaseId: "lease-1",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -997,7 +999,6 @@ let test1Capability: ExecutionCapability | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: capA,
-      repoPath,
     }),
   });
   const body = await resp.json() as { attestation?: SandboxAttestation };

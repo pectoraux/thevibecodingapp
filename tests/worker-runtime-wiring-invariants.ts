@@ -50,6 +50,7 @@ import {
   computeWorkloadHash,
 } from "@/lib/execution-capability";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
+import { fileUrlForPath } from "./lib/test-capability.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -197,6 +198,7 @@ async function runVerification(opts: {
         nonce,
         leaseId: "lease-1",
         repositoryHeadSha: sha,
+        repositoryUrl: fileUrlForPath(TEST_APP_DIR),
         runtimePlanHash: "test-plan-hash",
         architectureHash: null,
         expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
@@ -461,6 +463,7 @@ console.log(`[wiring-test] Supervisor started at ${SUPERVISOR.url} (launcher key
     nonce,
     leaseId: "lease-1",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(TEST_APP_DIR),
     runtimePlanHash: "test-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),

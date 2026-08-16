@@ -76,6 +76,7 @@ import { deriveRuntimeVerificationPlan, hashRuntimePlan } from "@/lib/runtime-ve
 import { getControlPlanePrivateKey, getControlPlanePublicKey } from "@/lib/worker-auth";
 import { executeRuntimeVerificationInWorker, generateSubstrateNonce } from "../mini-services/execution-worker/runtime/verify.js";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
+import { fileUrlForPath } from "./lib/test-capability.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -269,11 +270,18 @@ function issueCapabilityLikeJobSpecRoute(params: {
   // signed into the capability.
   const workloadHash = computeWorkloadHash(deriveWorkloadFromPlan(runtimePlan));
 
+  // Phase 18Z-PRE: the capability carries repositoryUrl — the supervisor
+  // clones the repo itself. Mirror the route's logic here.
+  const repositoryUrl = params.project?.githubRepo
+    ? `https://github.com/${params.project.githubRepo}.git`
+    : "";
+
   const capabilityInput: ExecutionCapabilityInput = {
     executionId: params.executionId,
     nonce: params.nonce,
     leaseId: params.leaseId,
     repositoryHeadSha: params.repositoryHeadSha,
+    repositoryUrl,
     runtimePlanHash,
     architectureHash: params.architecture?.hash ?? null,
     workloadHash,
@@ -594,11 +602,13 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
   const nonce = generateSubstrateNonce();
   const plan = makePlan(3000);
   // Phase 18Y: the capability MUST include runtimePlan + workloadHash.
+  // Phase 18Z-PRE: the capability MUST include repositoryUrl.
   const capability = SUPERVISOR!.signCapability({
     executionId,
     nonce,
     leaseId: "lease-e2e-7",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(TEST_APP_DIR),
     runtimePlanHash: "test-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
@@ -653,7 +663,8 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
     executionId,
     nonce,
     leaseId: "lease-test-8",
-    repositoryHeadSha: "deadbeef",
+    repositoryHeadSha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    repositoryUrl: fileUrlForPath(TEST_APP_DIR),
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(runtimePlan)),
@@ -661,17 +672,14 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
     expiresAt: new Date(Date.now() + 60000).toISOString(),
     // signature, algorithm, signedAt MISSING.
   } as any;
-  // Phase 18Y: the supervisor requires a repoPath that exists. We need a
-  // real repo because the supervisor checks existsSync(repoPath) BEFORE
-  // verifying the cap signature. Use TEST_APP_DIR (a git repo set up below).
-  setupTestApp(); // initialize TEST_APP_DIR git repo so it exists
-  // Use TEST_APP_DIR as repoPath (it exists + is a git repo).
+  // Phase 18Z-PRE: the supervisor no longer takes a repoPath. POST
+  // { capability } only — the supervisor verifies the cap signature → 403
+  // (signature missing).
   const resp = await fetch(`${SUPERVISOR!.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: unsignedCap,
-      repoPath: TEST_APP_DIR,
     }),
   });
   const ok = resp.status === 403;
@@ -745,11 +753,13 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
   // the job-spec route does). We use the supervisor's control-plane keypair
   // so the supervisor accepts it.
   // Phase 18Y: include runtimePlan + workloadHash.
+  // Phase 18Z-PRE: include repositoryUrl.
   const capability = SUPERVISOR!.signCapability({
     executionId,
     nonce,
     leaseId,
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(TEST_APP_DIR),
     runtimePlanHash: "test-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),

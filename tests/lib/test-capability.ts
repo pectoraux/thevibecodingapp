@@ -90,6 +90,13 @@ export interface MakeTestCapabilityOpts {
   nonce: string;
   leaseId: string;
   repositoryHeadSha: string;
+  /**
+   * Phase 18Z-PRE: the repository URL the supervisor must clone. The
+   * supervisor derives this from the signed capability — the worker does
+   * NOT supply a repoPath. For tests, use a `file://` URL pointing at a
+   * local test repo (no credential needed).
+   */
+  repositoryUrl: string;
   /** Optional — defaults to makeTestPlan(). */
   plan?: TestOrchestratorPlan;
   architectureHash?: string | null;
@@ -129,6 +136,7 @@ export function makeTestCapability(
     nonce: opts.nonce,
     leaseId: opts.leaseId,
     repositoryHeadSha: opts.repositoryHeadSha,
+    repositoryUrl: opts.repositoryUrl,
     runtimePlanHash,
     architectureHash: opts.architectureHash ?? null,
     workloadHash,
@@ -187,17 +195,16 @@ ${listenLine}
  * Phase 18Y: Create a workspace dir + a `repo` subdir inside it containing
  * a real git repo. Returns { workspace, repoPath, sha }.
  *
- * The supervisor computes `workspace = dirname(repoPath)` and writes
- * plan.json + orchestrator.js into it. The substrate bind-mounts
- * `${workspace}` as `/workspace` inside the chroot, so the orchestrator
- * sees `/workspace/plan.json`, `/workspace/orchestrator.js`,
- * `/workspace/repo/server.js`, `/workspace/results.json`.
+ * Phase 18Z-PRE: the supervisor no longer accepts a repoPath — it clones the
+ * repo itself from the capability's repositoryUrl. This helper is kept for
+ * tests that need a SOURCE repo to clone from: tests sign a capability with
+ * `repositoryUrl: \`file://${repoPath}\`` and POST { capability } to the
+ * supervisor, which clones from that file:// URL into its own per-execution
+ * workspace at /tmp/forge-executions/<executionId>/repo.
  *
- * Tests that POST directly to /execute (without going through
- * executeRuntimeVerificationInWorker) MUST use this helper — passing a
- * bare repoPath (not inside a workspace dir) would cause the supervisor
- * to write plan.json + orchestrator.js into the parent of repoPath (e.g.,
- * `/tmp`), which is wrong.
+ * The returned `workspace` + `repoPath` are the SOURCE repo (the supervisor
+ * clones FROM here, not INTO here). The `sha` is the source repo's HEAD —
+ * sign the capability with this value as `repositoryHeadSha`.
  */
 export function setupTestWorkspace(prefix: string, portOverride?: number): {
   workspace: string;
@@ -209,6 +216,17 @@ export function setupTestWorkspace(prefix: string, portOverride?: number): {
   const repoPath = join(workspace, "repo");
   const sha = setupTestRepo(repoPath, portOverride);
   return { workspace, repoPath, sha };
+}
+
+/**
+ * Phase 18Z-PRE: Convert a host-side repo path to a file:// URL the
+ * supervisor can `git clone` from. Used by tests that sign a capability
+ * with `repositoryUrl: fileUrlForPath(repoPath)`.
+ */
+export function fileUrlForPath(absPath: string): string {
+  // file:// URLs use an empty host + absolute path. The path is already
+  // absolute (setupTestWorkspace returns /tmp/...). Just prepend "file://".
+  return `file://${absPath}`;
 }
 
 /**

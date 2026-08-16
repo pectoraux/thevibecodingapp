@@ -1,40 +1,52 @@
-// Forge — Phase 18X / 18Y: Worker runtime verification module.
+// Forge — Phase 18X / 18Y / 18Z-PRE: Worker runtime verification module.
 //
 // This module is called by the poller when runtime verification is needed.
 // It does NOT use the control-plane's runtime-executor (which lives in the
 // main project and imports from @/lib/db). Instead it:
 //
-//   1. Resolves the GitHub credential and clones the repo at the exact SHA.
-//   2. POSTs { capability, repoPath } to the substrate supervisor
-//      (mini-services/substrate-supervisor, port 3004). The supervisor — a
-//      TRUSTED process that holds the launcher key IN MEMORY — DERIVES the
-//      workload from cap.runtimePlan (Phase 18Y — the worker does NOT
-//      supply the workload), runs the substrate, writes plan.json +
-//      orchestrator.js, runs the substrate, and returns the signed
-//      attestation.
-//   3. Reads results.json (the orchestrator's output) — written by the
-//      supervisor to a workspace dir that the supervisor cleans up.
-//      IMPORTANT: in Phase 18Y the worker no longer has the workspace
-//      dir (the supervisor owns it). The supervisor returns `results` in
-//      the response body; the worker uses that if present. If absent
-//      (orchestrator crashed), the worker synthesizes a failed result from
-//      the substrate's stdout/stderr.
-//   4. Constructs the ExecutionEvidenceEnvelope (signed with the WORKER's
+//   1. POSTs { capability } to the substrate supervisor (NO repoPath, NO
+//      workload — Phase 18Z-PRE). The supervisor:
+//        a. verifies the capability signature + expiry.
+//        b. runs PRE-CONSUMPTION CHECKS (workloadHash, runtimePlan,
+//           repositoryUrl, repositoryHeadSha) — returns 403 WITHOUT
+//           consuming the nonce on failure (DoS vector closed).
+//        c. calls /api/supervisor/consume-capability (atomic nonce + lease).
+//        d. creates /tmp/forge-executions/<executionId>/.
+//        e. calls /api/supervisor/resolve-repo-credential → cloneUrl
+//           (the supervisor NEVER asks the worker for a credential).
+//        f. git clone <cloneUrl> + git checkout <cap.repositoryHeadSha>.
+//        g. verifies git rev-parse HEAD === cap.repositoryHeadSha.
+//        h. verifies the FULL tree (status --porcelain, clean -nd,
+//           core.hooksPath).
+//        i. writes plan.json + copies orchestrator.js.
+//        j. runs the substrate.
+//        k. returns { attestation, result, results }.
+//   2. Constructs the ExecutionEvidenceEnvelope (signed with the WORKER's
 //      Ed25519 private key).
 //
-// PHASE 18Y — EXECUTION CAPABILITY CLOSURE:
-//   The worker NEVER supplies the workload. It supplies:
-//     - capability (control-plane-signed; carries runtimePlan + workloadHash)
-//     - repoPath (host-side path where the worker cloned the repo)
+// PHASE 18Z-PRE — REPOSITORY EXECUTION BOUNDARY:
+//   The worker NEVER supplies a repoPath. The supervisor clones the repo
+//   itself (using the repositoryUrl from the signed capability + a control-
+//   plane-resolved credential). The worker has ZERO host-path authority
+//   over the repo — it can't point the supervisor at a different repo with
+//   the same SHA but attacker-controlled ignored files / hooks.
+//
+//   The worker NEVER clones the repo, NEVER supplies a credential, NEVER
+//   passes a path. The supervisor owns the entire repository materialization.
+//
+// PHASE 18Y — EXECUTION CAPABILITY CLOSURE (still enforced):
+//   The worker NEVER supplies the workload. It supplies ONLY:
+//     - capability (control-plane-signed; carries runtimePlan + workloadHash
+//       + repositoryUrl + repositoryHeadSha)
 //   The supervisor:
 //     - verifies the capability signature
 //     - calls /api/supervisor/consume-capability (atomic nonce consumption)
 //     - derives the workload from cap.runtimePlan (binary="node",
 //       args=["/workspace/orchestrator.js"], cwd="/workspace/repo")
 //     - verifies workloadHash matches cap.workloadHash
-//     - verifies git rev-parse HEAD === cap.repositoryHeadSha
+//     - clones the repo at cap.repositoryHeadSha
 //     - verifies the working tree is clean
-//     - writes plan.json + copies orchestrator.js to a workspace
+//     - writes plan.json + copies orchestrator.js to its workspace
 //     - runs the substrate
 //     - returns { attestation, result, results }
 //
@@ -61,9 +73,6 @@
 //   - @/lib/execution-capability (types only — for the request body shape)
 // None of these have @/lib/db dependencies.
 
-import { execFileSync } from "node:child_process";
-import { mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import {
@@ -119,6 +128,13 @@ export interface OrchestratorPlan {
  *     authorizes the supervisor to run this workload.
  *   - `supervisorUrl`: the URL of the substrate supervisor (default
  *     http://localhost:3004).
+ *
+ * Phase 18Z-PRE: the job no longer carries a `repositoryUrl` for the
+ * WORKER to clone — the supervisor clones the repo itself. The
+ * `repositoryUrl` field is kept (optional) for informational purposes
+ * (it's bound into the capability's signature, so it's already
+ * authoritative). The worker does NOT call git clone, does NOT pass
+ * repoPath, does NOT resolve a credential.
  */
 export interface RuntimeVerificationJob {
   /** Stable id for this execution (informational — the real binding is in the capability). */
@@ -129,8 +145,13 @@ export interface RuntimeVerificationJob {
   leaseId: string;
   /** The exact SHA the runtime verification must execute. */
   repositoryHeadSha: string;
-  /** Authenticated URL for `git clone` (https://x-access-token:...@github.com/...). */
-  repositoryUrl: string;
+  /**
+   * Phase 18Z-PRE: the repository URL is informational only — the worker
+   * does NOT clone. The supervisor reads `repositoryUrl` from the signed
+   * capability and clones itself. Kept on the job for evidence-binding
+   * + envelope hash stability.
+   */
+  repositoryUrl?: string;
   /** Architecture hash (for evidence binding). */
   architectureHash: string | null;
   /** Runtime plan hash (for evidence binding). */
@@ -147,12 +168,16 @@ export interface RuntimeVerificationJob {
    * Phase 18Y: The capability ALSO carries the full runtimePlan +
    * workloadHash. The supervisor DERIVES the workload from cap.runtimePlan
    * — the worker does NOT supply the workload.
+   *
+   * Phase 18Z-PRE: The capability ALSO carries repositoryUrl +
+   * repositoryHeadSha. The supervisor CLONES the repo at
+   * cap.repositoryHeadSha — the worker does NOT supply a repoPath.
    */
   capability: ExecutionCapability;
   /**
    * Phase 18X: The URL of the substrate supervisor. Default
-   * http://localhost:3004. The worker POSTs { capability, repoPath }
-   * here and receives { attestation, result, results }.
+   * http://localhost:3004. The worker POSTs { capability } here and
+   * receives { attestation, result, results }.
    */
   supervisorUrl?: string;
   /** Total substrate timeout for the whole pipeline. */
@@ -214,66 +239,29 @@ interface OrchestratorResults {
 }
 
 // ---------------------------------------------------------------------------
-// Git clone at exact SHA
-// ---------------------------------------------------------------------------
-
-function gitCloneAtSha(repositoryUrl: string, targetPath: string, sha: string): void {
-  // Use execFileSync with arg array — NO shell interpolation. The URL may
-  // contain a token; that token is passed as an argv element, which is not
-  // visible to other processes via /proc/<pid>/cmdline on most systems (the
-  // worker runs as a non-root user). The token is never logged.
-  execFileSync("git", ["clone", repositoryUrl, targetPath], {
-    cwd: "/tmp",
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    stdio: ["pipe", "pipe", "pipe"],
-    shell: false,
-    timeout: 120000,
-    maxBuffer: 10 * 1024 * 1024,
-  });
-  // Checkout the exact SHA. Use -f to discard any local state (shouldn't be any).
-  execFileSync("git", ["-C", targetPath, "checkout", "-f", sha], {
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    stdio: ["pipe", "pipe", "pipe"],
-    shell: false,
-    timeout: 30000,
-  });
-  // Verify the checkout produced the expected SHA.
-  const rev = execFileSync("git", ["-C", targetPath, "rev-parse", "HEAD"], {
-    encoding: "utf-8",
-    shell: false,
-    timeout: 10000,
-  }).trim();
-  if (rev !== sha) {
-    throw new Error(
-      `git checkout at SHA ${sha} produced HEAD ${rev} — repository SHA mismatch`
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Substrate supervisor client — POST /execute
 // ---------------------------------------------------------------------------
 
 /**
- * Phase 18Y: The request body the worker POSTs to the supervisor.
+ * Phase 18Z-PRE: The request body the worker POSTs to the supervisor.
  *
  * The worker supplies ONLY:
  *   - capability: the control-plane-signed ExecutionCapability (carries the
- *     full runtimePlan + workloadHash — the supervisor derives the workload).
- *   - repoPath: the host-side path where the worker cloned the repo.
+ *     full runtimePlan + workloadHash + repositoryUrl + repositoryHeadSha).
  *
  * The worker does NOT supply:
- *   - workload (binary, args, cwd, env, timeoutMs)
+ *   - workload (binary, args, cwd, env, timeoutMs) — Phase 18Y.
+ *   - repoPath — Phase 18Z-PRE (the supervisor clones the repo itself).
  *   - plan
  *   - any execution recipe
+ *   - any credential
  *
- * The supervisor derives the workload from cap.runtimePlan, verifies
- * workloadHash, verifies the repo SHA + clean tree, writes plan.json +
- * copies orchestrator.js, and runs the substrate.
+ * The supervisor verifies the capability, consumes the nonce, resolves the
+ * repo credential, clones the repo, verifies the SHA + clean tree, writes
+ * plan.json + copies orchestrator.js, and runs the substrate.
  */
 interface SupervisorExecuteRequest {
   capability: ExecutionCapability;
-  repoPath: string;
 }
 
 interface SupervisorExecuteResponse {
@@ -374,7 +362,6 @@ export async function executeRuntimeVerificationInWorker(
   if (!job.nonce) throw new Error("executeRuntimeVerificationInWorker: nonce is required");
   if (!job.capability) throw new Error("executeRuntimeVerificationInWorker: capability is required (Phase 18X — the supervisor verifies the capability before running the substrate)");
   if (!job.workerPrivateKeyPem) throw new Error("executeRuntimeVerificationInWorker: workerPrivateKeyPem is required");
-  if (!job.repositoryUrl) throw new Error("executeRuntimeVerificationInWorker: repositoryUrl is required (no anonymous clone)");
   if (!job.repositoryHeadSha) throw new Error("executeRuntimeVerificationInWorker: repositoryHeadSha is required");
 
   const supervisorUrl = (job.supervisorUrl ?? "http://localhost:3004").trim();
@@ -382,89 +369,62 @@ export async function executeRuntimeVerificationInWorker(
     throw new Error("executeRuntimeVerificationInWorker: supervisorUrl is empty (set SUBSTRATE_SUPERVISOR_URL or pass supervisorUrl in the job)");
   }
 
-  // Phase 18Y: the worker only needs a workspace for cloning the repo. The
-  // supervisor owns the plan.json + orchestrator.js + results.json (it
-  // derives them from cap.runtimePlan and cleans up its own workspace). The
-  // worker's workspace is just the cloned repo + a workspace dir name to
-  // hand to the supervisor as repoPath.
-  const workspace = `/tmp/forge-runtime-${job.executionId}-${randomUUID()}`;
-  mkdirSync(workspace, { recursive: true });
-  const repoPath = join(workspace, "repo");
+  // Phase 18Z-PRE: the worker does NOT clone the repo. The supervisor owns
+  // the entire repository materialization:
+  //   - The supervisor reads repositoryUrl from the signed capability.
+  //   - The supervisor resolves the clone credential via the control plane.
+  //   - The supervisor clones into /tmp/forge-executions/<executionId>/repo.
+  //   - The supervisor verifies git rev-parse HEAD === cap.repositoryHeadSha.
+  //
+  // The worker has ZERO host-path authority over the repo. It can't point
+  // the supervisor at a different repo with the same SHA but attacker-
+  // controlled ignored files / hooks / submodule state.
+  //
+  // FAIL-CLOSED: if the supervisor is down, rejects the capability, or
+  // runInSubstrate inside the supervisor throws — callSupervisorExecute
+  // throws and we propagate.
+  console.log(
+    `[worker] Starting runtime verification via supervisor at ${supervisorUrl} ` +
+      `(executionId=${job.executionId}, nonce=${job.nonce.slice(0, 8)}..., sha=${job.repositoryHeadSha.slice(0, 7)})`
+  );
+  const { result, attestation, results: supervisorResults } = await callSupervisorExecute(supervisorUrl, {
+    capability: job.capability,
+  });
 
-  try {
-    // 1. Clone the repository at the exact SHA. The worker is the ONLY
-    //    party with the GitHub credential — it clones the repo on the host.
-    //    The supervisor (and the substrate) NEVER sees the GitHub
-    //    credential; they receive the cloned repoPath.
-    gitCloneAtSha(job.repositoryUrl, repoPath, job.repositoryHeadSha);
-
-    // 2. POST { capability, repoPath } to the substrate supervisor.
-    //    Phase 18Y: the worker does NOT supply the workload. The supervisor
-    //    derives it from cap.runtimePlan, verifies workloadHash, verifies
-    //    git rev-parse HEAD === cap.repositoryHeadSha, verifies the working
-    //    tree is clean, writes plan.json + copies orchestrator.js, calls
-    //    /api/supervisor/consume-capability (atomic nonce consumption),
-    //    runs the substrate, and returns { attestation, result, results }.
-    //
-    //    The nonce + executionId come from the capability (the worker cannot
-    //    override them — they're cryptographically bound).
-    //
-    //    FAIL-CLOSED: if the supervisor is down, rejects the capability, or
-    //    runInSubstrate inside the supervisor throws — callSupervisorExecute
-    //    throws and we propagate.
-    console.log(
-      `[worker] Starting runtime verification via supervisor at ${supervisorUrl} ` +
-        `(executionId=${job.executionId}, nonce=${job.nonce.slice(0, 8)}..., sha=${job.repositoryHeadSha.slice(0, 7)})`
-    );
-    const { result, attestation, results: supervisorResults } = await callSupervisorExecute(supervisorUrl, {
-      capability: job.capability,
-      repoPath,
-    });
-
-    // 3. Use the results the supervisor returned. The supervisor owns the
-    //    workspace now (it wrote plan.json + orchestrator.js + results.json
-    //    and cleaned them up). The worker can't read the supervisor's
-    //    workspace; the supervisor returns results.json in the response body.
-    let results: OrchestratorResults;
-    if (
-      supervisorResults &&
-      typeof supervisorResults === "object" &&
-      "passed" in supervisorResults
-    ) {
-      results = supervisorResults as OrchestratorResults;
-    } else {
-      // The orchestrator crashed before writing results.json (or the
-      // supervisor failed to read it). Synthesize a failed result from
-      // the substrate run's stdout/stderr. The attestation is still
-      // present (the substrate ran).
-      const completedAt = new Date().toISOString();
-      results = {
-        installResult: null,
-        buildResult: null,
-        startupResult: null,
-        healthChecks: [],
-        apiJourneys: [],
-        teardownResult: { success: false, durationMs: 0 },
-        passed: false,
-        failureReason: `orchestrator did not produce results.json (supervisor returned no results). Substrate stdout: ${result.stdout.slice(0, 500)}`,
-        startedAt: completedAt,
-        completedAt,
-      };
-    }
-
-    // 4. Construct the envelope.
-    const envelope = buildEnvelopeFromResults(job, results, attestation, result.stdout);
-    return envelope;
-  } finally {
-    // Clean up the worker's workspace (the cloned repo). The supervisor's
-    // workspace (plan.json + orchestrator.js + results.json) is cleaned up
-    // by the supervisor itself.
-    try {
-      rmSync(workspace, { recursive: true, force: true });
-    } catch {
-      // best-effort
-    }
+  // Use the results the supervisor returned. The supervisor owns the
+  // workspace now (it cloned the repo + wrote plan.json + orchestrator.js +
+  // results.json). The worker can't read the supervisor's workspace; the
+  // supervisor returns results.json in the response body.
+  let results: OrchestratorResults;
+  if (
+    supervisorResults &&
+    typeof supervisorResults === "object" &&
+    "passed" in supervisorResults
+  ) {
+    results = supervisorResults as OrchestratorResults;
+  } else {
+    // The orchestrator crashed before writing results.json (or the
+    // supervisor failed to read it). Synthesize a failed result from
+    // the substrate run's stdout/stderr. The attestation is still
+    // present (the substrate ran).
+    const completedAt = new Date().toISOString();
+    results = {
+      installResult: null,
+      buildResult: null,
+      startupResult: null,
+      healthChecks: [],
+      apiJourneys: [],
+      teardownResult: { success: false, durationMs: 0 },
+      passed: false,
+      failureReason: `orchestrator did not produce results.json (supervisor returned no results). Substrate stdout: ${result.stdout.slice(0, 500)}`,
+      startedAt: completedAt,
+      completedAt,
+    };
   }
+
+  // Construct the envelope.
+  const envelope = buildEnvelopeFromResults(job, results, attestation, result.stdout);
+  return envelope;
 }
 
 // ---------------------------------------------------------------------------

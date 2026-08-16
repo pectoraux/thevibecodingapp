@@ -233,11 +233,21 @@ export async function POST(req: Request) {
     const derivedWorkload = deriveWorkloadFromPlan(runtimePlanForCapability);
     const workloadHash = computeWorkloadHash(derivedWorkload);
 
+    // Phase 18Z-PRE: the capability carries repositoryUrl — the supervisor
+    // clones the repo itself (using a control-plane-resolved credential).
+    // The worker does NOT supply a repoPath. The repositoryUrl is signed
+    // into the capability, so a worker can't tamper with it without breaking
+    // the signature.
+    const repositoryUrl = project?.githubRepo
+      ? `https://github.com/${project.githubRepo}.git`
+      : "";
+
     const capabilityInput = {
       executionId: job.executionId,
       nonce: substrateNonce,
       leaseId: job.leaseId ?? "",
       repositoryHeadSha: project?.canonicalHeadSha ?? "",
+      repositoryUrl, // Phase 18Z-PRE
       runtimePlanHash,
       architectureHash: architecture?.hash ?? null,
       workloadHash,

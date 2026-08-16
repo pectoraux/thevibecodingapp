@@ -52,7 +52,7 @@ import {
   type ExecutionCapabilityInput,
 } from "@/lib/execution-capability";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
-import { setupTestWorkspace, makeTestPlan } from "./lib/test-capability.js";
+import { setupTestWorkspace, makeTestPlan, fileUrlForPath } from "./lib/test-capability.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -228,6 +228,7 @@ function readFile(path: string): string {
       nonce,
       leaseId: "lease-1",
       repositoryHeadSha: sha,
+      repositoryUrl: fileUrlForPath(repoPath),
       runtimePlanHash: "plan-hash",
       architectureHash: null,
       expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -239,7 +240,6 @@ function readFile(path: string): string {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: cap,
-        repoPath,
       }),
     });
     const respText = await resp.text();
@@ -282,6 +282,7 @@ function readFile(path: string): string {
       nonce,
       leaseId: "lease-1",
       repositoryHeadSha: sha,
+      repositoryUrl: fileUrlForPath(repoPath),
       runtimePlanHash: "plan-hash",
       architectureHash: null,
       expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -293,7 +294,6 @@ function readFile(path: string): string {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: cap,
-        repoPath,
       }),
     });
     const body = await resp.json() as { attestation: any; result: any };
@@ -345,6 +345,7 @@ function readFile(path: string): string {
       nonce,
       leaseId: "lease-1",
       repositoryHeadSha: sha,
+      repositoryUrl: fileUrlForPath(repoPath),
       runtimePlanHash: "plan-hash",
       architectureHash: null,
       workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
@@ -357,7 +358,6 @@ function readFile(path: string): string {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: forgedCap,
-        repoPath,
       }),
     });
     let detail = "";
@@ -402,6 +402,7 @@ function readFile(path: string): string {
       nonce,
       leaseId: "lease-1",
       repositoryHeadSha: sha,
+      repositoryUrl: fileUrlForPath(repoPath),
       runtimePlanHash: "plan-hash",
       architectureHash: null,
       expiresAt: new Date(Date.now() - 60000).toISOString(), // EXPIRED 60s ago
@@ -413,7 +414,6 @@ function readFile(path: string): string {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: cap,
-        repoPath,
       }),
     });
     let detail = "";
@@ -452,13 +452,15 @@ function readFile(path: string): string {
   let sup: TestSupervisor | null = null;
   try {
     sup = await startTestSupervisor();
-    const { repoPath } = setupTestWorkspace("key-iso-10");
+    // Phase 18Z-PRE: the supervisor rejects a request with NO capability.
+    // We POST an empty body { } — the supervisor returns 403 for missing
+    // capability. (The supervisor also rejects a `repoPath` field, so we
+    // don't include one.)
     const resp = await fetch(`${sup.url}/execute`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        // No capability field. Phase 18Y: NO workload field either.
-        repoPath,
+        // Empty body — no capability, no repoPath.
       }),
     });
     const ok = resp.status === 403;
@@ -650,9 +652,12 @@ function readFile(path: string): string {
     executionId: randomUUID(),
     nonce: randomUUID(),
     leaseId: "lease-1",
-    repositoryHeadSha: "deadbeef",
+    repositoryHeadSha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    repositoryUrl: "file:///tmp/forge-test-repo-15",
     runtimePlanHash: "plan-hash",
     architectureHash: null,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan({})),
+    runtimePlan: {},
     expiresAt: new Date(Date.now() + 60000).toISOString(),
   };
   const cap = signExecutionCapability(input, cpPrivPem);

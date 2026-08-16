@@ -55,7 +55,7 @@ import {
 } from "@/lib/execution-capability";
 import { executeRuntimeVerificationInWorker, generateSubstrateNonce } from "../mini-services/execution-worker/runtime/verify.js";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
-import { setupTestWorkspace, setupTestRepo, makeTestPlan } from "./lib/test-capability.js";
+import { setupTestWorkspace, setupTestRepo, makeTestPlan, fileUrlForPath } from "./lib/test-capability.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -126,6 +126,7 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     nonce,
     leaseId: "lease-smoke-1",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "smoke-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
@@ -141,7 +142,7 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     workerId: "phase-18y-smoke-worker",
     leaseId: "lease-smoke-1",
     repositoryHeadSha: sha,
-    repositoryUrl: repoPath,
+    repositoryUrl: fileUrlForPath(repoPath),
     architectureHash: null,
     runtimePlanHash: "smoke-plan-hash",
     plan,
@@ -195,6 +196,7 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     nonce,
     leaseId: "lease-smoke-2",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "smoke-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -212,7 +214,6 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
         cwd: "/tmp",
         timeoutMs: 15000,
       },
-      repoPath,
     }),
   });
   const ok = resp.status === 403;
@@ -261,13 +262,14 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     // consume-capability will reject (replay) BEFORE the git SHA check.
     // So we can use the original test1Cap with any repoPath — the SHA check
     // never runs.
-    // Use the new repoPath (it exists).
+    // Phase 18Z-PRE: the supervisor no longer takes a repoPath. POST
+    // { capability } only — the supervisor will consume the nonce (which is
+    // already consumed) → 403.
     const resp = await fetch(`${SUPERVISOR.url}/execute`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: test1Cap,
-        repoPath,
       }),
     });
     const ok = resp.status === 403;
@@ -300,6 +302,7 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     nonce,
     leaseId: "lease-smoke-4",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "smoke-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -314,7 +317,6 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: tamperedCap,
-      repoPath,
     }),
   });
   const ok = resp.status === 403;
@@ -354,6 +356,7 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     nonce,
     leaseId: "lease-smoke-5",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "smoke-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -367,7 +370,6 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: tamperedCap,
-      repoPath,
     }),
   });
   const ok = resp.status === 403;
@@ -402,6 +404,7 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     nonce,
     leaseId: "lease-smoke-6",
     repositoryHeadSha: wrongSha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "smoke-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
@@ -413,7 +416,6 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      repoPath,
     }),
   });
   const ok = resp.status === 403;
@@ -430,16 +432,20 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
 }
 
 // ===========================================================================
-// TEST 7 — DIRTY tree: uncommitted changes in repoPath → 403
+// TEST 7 — DIRTY SOURCE tree: clone is fresh, supervisor ACCEPTS (Phase 18Z-PRE)
 // ===========================================================================
-// Set up a clean repo, then modify a file (uncommitted). The supervisor
-// verifies git status --porcelain is empty → not empty → 403.
+// Phase 18Z-PRE: the supervisor clones the repo itself. A dirty SOURCE tree
+// (uncommitted modification + untracked file) does NOT propagate to the
+// clone — `git clone` copies only committed state. The supervisor's fresh
+// clone is clean by construction. This test PROVES the dirty-tree attack
+// (which was a 403 in Phase 18Y when the worker supplied a repoPath) is
+// defeated: the supervisor accepts the request because its clone is clean.
 
 {
   const { repoPath, sha } = setupTestWorkspace("phase-18y-7");
-  // Dirty the tree: append to server.js.
+  // Dirty the SOURCE tree: append to server.js (uncommitted).
   writeFileSync(join(repoPath, "server.js"), "// dirty modification\n" + readFile(join(repoPath, "server.js")));
-  // Also create an untracked file.
+  // Also create an untracked file in the SOURCE.
   writeFileSync(join(repoPath, "untracked.txt"), "untracked content");
   const executionId = randomUUID();
   const nonce = randomUUID();
@@ -449,28 +455,31 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
     nonce,
     leaseId: "lease-smoke-7",
     repositoryHeadSha: sha,
+    repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "smoke-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
     runtimePlan: plan as unknown as Record<string, unknown>,
     workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
+  // Phase 18Z-PRE: the supervisor clones from the source repo. The clone
+  // is fresh — the uncommitted modification + untracked file in the source
+  // do NOT appear in the clone. The supervisor accepts (status 200).
   const resp = await fetch(`${SUPERVISOR.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      repoPath,
     }),
   });
-  const ok = resp.status === 403;
+  const ok = resp.status === 200;
   let detail = `status=${resp.status}`;
   try {
     const body = await resp.json() as { error?: string; reasons?: string[] };
     detail += ` error=${body.error ?? "(none)"} reasons=${(body.reasons ?? []).slice(0, 2).join("; ")}`;
   } catch { /* ignore */ }
   record(
-    "Test 7: dirty working tree (uncommitted changes) → 403 (worker modified the repo after cloning)",
+    "Test 7: dirty SOURCE tree → clone is fresh, supervisor ACCEPTS (Phase 18Z-PRE defeats the dirty-tree attack)",
     ok,
     detail
   );
@@ -554,29 +563,36 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
 }
 
 // ===========================================================================
-// TEST 12 — Worker verify.ts POSTs { capability, repoPath } (NO workload)
+// TEST 12 — Worker verify.ts POSTs { capability } (NO workload, NO repoPath)
 // ===========================================================================
+// Phase 18Y: the worker must NOT pass a workload field.
+// Phase 18Z-PRE: the worker must NOT pass a repoPath field either — the
+// supervisor clones the repo itself from cap.repositoryUrl.
 
 {
   const src = readFile("mini-services/execution-worker/runtime/verify.ts");
-  const hasRepoPath = /body:\s*JSON\.stringify\(\s*{\s*capability:\s*job\.capability,\s*repoPath,?\s*}\s*\)/.test(src) ||
-    /capability:\s*job\.capability/.test(src) && /repoPath/.test(src);
-  // Strip comments before checking for 'workload' references.
+  // Strip comments before checking for 'workload' / 'repoPath' references.
   const stripped = src
     .replace(/\/\/.*$/gm, "")
     .replace(/\/\*[\s\S]*?\*\//g, "");
+  // The worker MUST pass `capability` in the POST body.
+  const hasCapability = /capability:\s*job\.capability/.test(stripped);
   // The worker MUST NOT pass a workload field to the supervisor.
   const hasNoWorkloadInPostBody = !/JSON\.stringify\(\s*{\s*capability:[^}]*workload/.test(stripped);
-  const ok = hasRepoPath && hasNoWorkloadInPostBody;
+  // Phase 18Z-PRE: the worker MUST NOT pass a repoPath field. The SupervisorExecuteRequest
+  // interface must have ONLY capability.
+  const hasNoRepoPathInRequest = !/interface\s+SupervisorExecuteRequest\s*\{[^}]*repoPath/s.test(stripped);
+  const hasNoRepoPathInBody = !/JSON\.stringify\(\s*{\s*capability:[^}]*repoPath/s.test(stripped);
+  const ok = hasCapability && hasNoWorkloadInPostBody && hasNoRepoPathInRequest && hasNoRepoPathInBody;
   record(
-    "Test 12: worker verify.ts POSTs { capability, repoPath } (NO workload field — Phase 18Y)",
+    "Test 12: worker verify.ts POSTs { capability } (NO workload, NO repoPath — Phase 18Y + 18Z-PRE)",
     ok,
-    `hasRepoPath=${hasRepoPath} hasNoWorkloadInPostBody=${hasNoWorkloadInPostBody}`
+    `hasCapability=${hasCapability} hasNoWorkloadInPostBody=${hasNoWorkloadInPostBody} hasNoRepoPathInRequest=${hasNoRepoPathInRequest} hasNoRepoPathInBody=${hasNoRepoPathInBody}`
   );
 }
 
 // ===========================================================================
-// TEST 13 — Job-spec route includes runtimePlan + workloadHash in capability
+// TEST 13 — Job-spec route includes runtimePlan + workloadHash + repositoryUrl
 // ===========================================================================
 
 {
@@ -584,11 +600,13 @@ let test1Cap: ReturnType<typeof SUPERVISOR.signCapability> | null = null;
   const importsDerive = src.includes("deriveWorkloadFromPlan") && src.includes("computeWorkloadHash");
   const hasRuntimePlan = /runtimePlan:\s*runtimePlanForCapability/.test(src);
   const hasWorkloadHash = /workloadHash,/.test(src) || /workloadHash:\s*workloadHash/.test(src);
-  const ok = importsDerive && hasRuntimePlan && hasWorkloadHash;
+  // Phase 18Z-PRE: the route constructs repositoryUrl from project.githubRepo.
+  const hasRepositoryUrl = /repositoryUrl/.test(src) && /github\.com/.test(src);
+  const ok = importsDerive && hasRuntimePlan && hasWorkloadHash && hasRepositoryUrl;
   record(
-    "Test 13: job-spec route includes runtimePlan + workloadHash in the signed capability (Phase 18Y)",
+    "Test 13: job-spec route includes runtimePlan + workloadHash + repositoryUrl in the signed capability (Phase 18Y + 18Z-PRE)",
     ok,
-    `importsDerive=${importsDerive} hasRuntimePlan=${hasRuntimePlan} hasWorkloadHash=${hasWorkloadHash}`
+    `importsDerive=${importsDerive} hasRuntimePlan=${hasRuntimePlan} hasWorkloadHash=${hasWorkloadHash} hasRepositoryUrl=${hasRepositoryUrl}`
   );
 }
 

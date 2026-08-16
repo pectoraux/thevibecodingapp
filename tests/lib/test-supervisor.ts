@@ -1,4 +1,4 @@
-// Forge — Phase 18X / 18Y: Test supervisor helper.
+// Forge — Phase 18X / 18Y / 18Z-PRE: Test supervisor helper.
 //
 // Starts a substrate supervisor mini-service as a child process for use in
 // tests. Generates a launcher keypair, writes the private key to a temp
@@ -13,12 +13,21 @@
 // succeeds. The mock implements the SAME atomic-consumption logic as the
 // real control-plane endpoint (but in-memory, no DB).
 //
+// Phase 18Z-PRE: ALSO serves /api/supervisor/resolve-repo-credential on
+// the SAME mock server. The supervisor calls this endpoint to get the
+// authenticated cloneUrl for the capability's repositoryUrl. The mock
+// simply echoes the repositoryUrl back as cloneUrl (no credential
+// transformation — for file:// URLs, no credential is needed; for https://
+// URLs in tests, we don't actually clone from GitHub).
+//
 // Used by:
 //   tests/worker-runtime-wiring-invariants.ts
 //   tests/e2e-substrate-trust-invariants.ts
 //   tests/substrate-key-isolation-invariants.ts
 //   tests/control-plane-capability-invariants.ts
 //   tests/e2e-launcher-key-isolation-invariants.ts
+//   tests/e2e-capability-closure-invariants.ts
+//   tests/repo-boundary-invariants.ts
 //
 // The test harness holds the launcher PRIVATE key (so it can sign
 // capabilities if needed). In production, ONLY the supervisor has the
@@ -38,6 +47,13 @@ import {
   verifyExecutionCapability,
   type ExecutionCapability,
 } from "@/lib/execution-capability";
+
+/** A single recorded call to the mock /api/supervisor/resolve-repo-credential endpoint. */
+export interface ResolveRepoCredentialCall {
+  executionId: string;
+  repositoryUrl: string;
+  receivedAt: string;
+}
 
 export interface TestSupervisor {
   /** The supervisor's base URL (e.g., http://localhost:3004). */
@@ -59,6 +75,13 @@ export interface TestSupervisor {
   supervisorSecret: string;
   /** The mock consume-capability server's port (in-memory, no DB). */
   mockConsumeCapabilityPort: number;
+  /**
+   * Phase 18Z-PRE-B: every call the supervisor made to the mock
+   * /api/supervisor/resolve-repo-credential endpoint. Tests can assert this
+   * list is non-empty (proving the supervisor used the control-plane endpoint
+   * to resolve the cloneUrl — NOT a worker-supplied credential).
+   */
+  resolveRepoCredentialCalls: ResolveRepoCredentialCall[];
   /** Sign an ExecutionCapability using the control-plane private key. */
   signCapability: (input: Omit<SignCapabilityInput, "workloadHash" | "runtimePlan"> & Partial<Pick<SignCapabilityInput, "workloadHash" | "runtimePlan">>) => ExecutionCapability;
   /** Stop the supervisor (SIGTERM → 5s grace → SIGKILL) + stop the mock. */
@@ -73,12 +96,16 @@ export interface TestSupervisor {
  *
  * The runtimePlan is the FULL plan object (signed into the capability). The
  * supervisor DERIVES the workload from this and verifies workloadHash.
+ *
+ * Phase 18Z-PRE: repositoryUrl is REQUIRED — the supervisor clones the repo
+ * from this URL. For tests, use a file:// URL (fileUrlForPath(repoPath)).
  */
 export interface SignCapabilityInput {
   executionId: string;
   nonce: string;
   leaseId: string;
   repositoryHeadSha: string;
+  repositoryUrl: string;
   runtimePlanHash: string;
   architectureHash: string | null;
   workloadHash: string;
@@ -148,9 +175,12 @@ export async function startTestSupervisor(opts?: {
   // 5. Start the mock consume-capability server (in-memory, no DB).
   const mockConsumeCapabilityPort = pickTestPort();
   const consumedNonces = new Set<string>();
+  // Phase 18Z-PRE-B: track every call to /api/supervisor/resolve-repo-credential
+  // so tests can assert the supervisor actually called the control-plane endpoint.
+  const resolveRepoCredentialCalls: ResolveRepoCredentialCall[] = [];
   const mockServer = opts?.noMockConsumeCapability
     ? null
-    : startMockConsumeCapabilityServer(mockConsumeCapabilityPort, supervisorSecret, controlPlaneKeyPair.publicKeyPem, consumedNonces);
+    : startMockConsumeCapabilityServer(mockConsumeCapabilityPort, supervisorSecret, controlPlaneKeyPair.publicKeyPem, consumedNonces, resolveRepoCredentialCalls);
   if (mockServer) {
     await waitForServer(`http://localhost:${mockConsumeCapabilityPort}/health`, 5000);
   }
@@ -244,6 +274,7 @@ export async function startTestSupervisor(opts?: {
       nonce: input.nonce,
       leaseId: input.leaseId,
       repositoryHeadSha: input.repositoryHeadSha,
+      repositoryUrl: input.repositoryUrl,
       runtimePlanHash: input.runtimePlanHash,
       architectureHash: input.architectureHash,
       workloadHash,
@@ -286,6 +317,7 @@ export async function startTestSupervisor(opts?: {
     launcherKeyFilePath,
     supervisorSecret,
     mockConsumeCapabilityPort,
+    resolveRepoCredentialCalls,
     signCapability,
     stop,
   };
@@ -296,30 +328,33 @@ export async function startTestSupervisor(opts?: {
 // ---------------------------------------------------------------------------
 
 /**
- * Start a mock /api/supervisor/consume-capability server on the given port.
+ * Start a mock /api/supervisor/consume-capability + /api/supervisor/resolve-repo-credential
+ * server on the given port.
  *
- * This server has the SAME shape as the real control-plane endpoint, but
- * with IN-MEMORY state (a Set of consumed nonces) instead of a DB. It:
+ * The consume-capability endpoint has the SAME shape as the real control-plane
+ * endpoint, but with IN-MEMORY state (a Set of consumed nonces) instead of a DB. It:
  *   1. Authenticates the supervisor via the Bearer token (supervisorSecret).
  *   2. Verifies the capability signature (controlPlanePublicKeyPem).
  *   3. Atomically consumes the nonce: if the nonce is already in
  *      consumedNonces → 403 (replay). Otherwise add to the Set → 200.
  *
+ * The resolve-repo-credential endpoint (Phase 18Z-PRE):
+ *   1. Authenticates the supervisor via the Bearer token (supervisorSecret).
+ *   2. Accepts { executionId, repositoryUrl }.
+ *   3. Returns { cloneUrl: repositoryUrl, credentialType: "none" } — for
+ *      file:// URLs, no credential transformation is needed.
+ *
  * Endpoints:
  *   GET  /health  → 200 "OK"
  *   POST /api/supervisor/consume-capability → 200 (consumed) or 403 (replay/invalid).
- *
- * NOTE: the real endpoint uses updateMany with where: { ..., leaseId,
- * leaseExpiresAt: { gt: now } } (atomic at the DB level). This mock uses a
- * Set + a JS lock (single-threaded) to approximate atomicity. It's not a
- * perfect simulation of the DB-level atomicity, but it correctly implements
- * the replay-detection behavior the supervisor depends on.
+ *   POST /api/supervisor/resolve-repo-credential → 200 { cloneUrl, credentialType }.
  */
 function startMockConsumeCapabilityServer(
   port: number,
   supervisorSecret: string,
   controlPlanePublicKeyPem: string,
-  consumedNonces: Set<string>
+  consumedNonces: Set<string>,
+  resolveRepoCredentialCalls: ResolveRepoCredentialCall[]
 ): ReturnType<typeof createServer> {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     if (req.method === "GET" && req.url === "/health") {
@@ -331,11 +366,70 @@ function startMockConsumeCapabilityServer(
       handleConsume(req, res, supervisorSecret, controlPlanePublicKeyPem, consumedNonces);
       return;
     }
+    if (req.method === "POST" && req.url === "/api/supervisor/resolve-repo-credential") {
+      handleResolve(req, res, supervisorSecret, resolveRepoCredentialCalls);
+      return;
+    }
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not found");
   });
   server.listen(port);
   return server;
+}
+
+async function handleResolve(
+  req: IncomingMessage,
+  res: ServerResponse,
+  supervisorSecret: string,
+  resolveRepoCredentialCalls: ResolveRepoCredentialCall[]
+): Promise<void> {
+  // Authenticate.
+  const authHeader = req.headers["authorization"] ?? "";
+  if (!authHeader.startsWith("Bearer ")) {
+    sendJson(res, 401, { error: "Missing Bearer token" });
+    return;
+  }
+  const presented = authHeader.slice(7);
+  const presentedBuf = Buffer.from(presented, "utf-8");
+  const expectedBuf = Buffer.from(supervisorSecret, "utf-8");
+  if (presentedBuf.length !== expectedBuf.length || !timingSafeEqual(presentedBuf, expectedBuf)) {
+    sendJson(res, 401, { error: "Invalid supervisor secret" });
+    return;
+  }
+
+  // Parse body.
+  let body: any;
+  try {
+    const raw = await readBodyPromise(req);
+    body = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+  const executionId = typeof body.executionId === "string" ? body.executionId : "";
+  const repositoryUrl = typeof body.repositoryUrl === "string" ? body.repositoryUrl : "";
+  if (!executionId || !repositoryUrl) {
+    sendJson(res, 400, { error: "executionId, repositoryUrl are required" });
+    return;
+  }
+
+  // Phase 18Z-PRE-B: record this call so tests can assert the supervisor
+  // actually used the control-plane endpoint (rather than a worker-supplied
+  // credential).
+  resolveRepoCredentialCalls.push({
+    executionId,
+    repositoryUrl,
+    receivedAt: new Date().toISOString(),
+  });
+
+  // Phase 18Z-PRE: for tests, just echo the repositoryUrl back as cloneUrl.
+  // file:// URLs need no credential; https:// URLs in tests aren't actually
+  // cloned (the test harness creates a local repo + signs a capability
+  // pointing at it via file://).
+  sendJson(res, 200, {
+    cloneUrl: repositoryUrl,
+    credentialType: "none",
+  });
 }
 
 async function handleConsume(

@@ -112,6 +112,11 @@ export interface ExecutionCapability {
   nonce: string;
   leaseId: string;
   repositoryHeadSha: string;
+  /** Phase 18Z-PRE: The repository URL the supervisor must clone. The supervisor
+   *  derives this from the signed capability — the worker does NOT supply a
+   *  repoPath. The supervisor calls /api/supervisor/resolve-repo-credential to
+   *  get the authenticated cloneUrl (the worker never sees the credential). */
+  repositoryUrl: string;
   runtimePlanHash: string;
   architectureHash: string | null;
   /** Phase 18Y: SHA-256 of the canonical workload recipe the supervisor must execute. */
@@ -130,6 +135,8 @@ export interface ExecutionCapabilityInput {
   nonce: string;
   leaseId: string;
   repositoryHeadSha: string;
+  /** Phase 18Z-PRE: The repository URL the supervisor must clone. */
+  repositoryUrl: string;
   runtimePlanHash: string;
   architectureHash: string | null;
   /** Phase 18Y: SHA-256 of the canonical workload recipe the supervisor must execute. */
@@ -317,6 +324,7 @@ export function verifyExecutionCapability(
     nonce: cap.nonce,
     leaseId: cap.leaseId,
     repositoryHeadSha: cap.repositoryHeadSha,
+    repositoryUrl: cap.repositoryUrl,
     runtimePlanHash: cap.runtimePlanHash,
     architectureHash: cap.architectureHash,
     workloadHash: cap.workloadHash,
@@ -392,6 +400,7 @@ function canonicalCapabilityJson(input: ExecutionCapabilityInput | ExecutionCapa
     leaseId: input.leaseId,
     nonce: input.nonce,
     repositoryHeadSha: input.repositoryHeadSha,
+    repositoryUrl: input.repositoryUrl,
     runtimePlan: canonicalSerializeValue(input.runtimePlan),
     runtimePlanHash: input.runtimePlanHash,
     workloadHash: input.workloadHash,

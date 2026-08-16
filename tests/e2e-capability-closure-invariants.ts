@@ -66,7 +66,7 @@ import {
 import { getHostNamespaceInodes } from "@/lib/substrate-namespace";
 import { executeRuntimeVerificationInWorker, generateSubstrateNonce } from "../mini-services/execution-worker/runtime/verify.js";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
-import { setupTestWorkspace, makeTestPlan, type TestOrchestratorPlan } from "./lib/test-capability.js";
+import { setupTestWorkspace, makeTestPlan, fileUrlForPath, type TestOrchestratorPlan } from "./lib/test-capability.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -126,6 +126,7 @@ function signValidCap(
     nonce: string;
     leaseId: string;
     repositoryHeadSha: string;
+    repositoryUrl: string;
     plan?: TestOrchestratorPlan;
     expiresAt?: string;
   }
@@ -136,6 +137,7 @@ function signValidCap(
     nonce: opts.nonce,
     leaseId: opts.leaseId,
     repositoryHeadSha: opts.repositoryHeadSha,
+    repositoryUrl: opts.repositoryUrl,
     runtimePlanHash: "e2e-closure-plan-hash",
     architectureHash: null,
     expiresAt: opts.expiresAt ?? new Date(Date.now() + 5 * 60 * 1000).toISOString(),
@@ -190,7 +192,7 @@ let test1Sha = "";
   const plan = makeTestPlan(3000);
   const capability = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-1",
-    repositoryHeadSha: sha, plan,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath), plan,
   });
   test1ExecutionId = executionId;
   test1Nonce = nonce;
@@ -250,11 +252,10 @@ let test1Sha = "";
   const nonce = randomUUID();
   const cap = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-2",
-    repositoryHeadSha: sha,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath),
   });
   const { status, json } = await postExecute(SUPERVISOR.url, {
     capability: cap,
-    repoPath,
     workload: {
       binary: "/bin/echo",
       args: ["FORGED"],
@@ -286,12 +287,12 @@ let test1Sha = "";
 // the workloadHash check would still catch a different command.
 
 {
-  const { sha } = setupTestWorkspace("e2e-closure-3");
+  const { repoPath, sha } = setupTestWorkspace("e2e-closure-3");
   const executionId = randomUUID();
   const nonce = randomUUID();
   const cap = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-3",
-    repositoryHeadSha: sha,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath),
   });
 
   // The FORGED workload — a totally different binary + args + cwd.
@@ -338,7 +339,7 @@ let test1Sha = "";
   const plan = makeTestPlan(3000);
   const capability = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-4",
-    repositoryHeadSha: sha, plan,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath), plan,
   });
 
   const env1 = await executeRuntimeVerificationInWorker({
@@ -418,12 +419,11 @@ let test1Sha = "";
   const nonce = randomUUID();
   const cap = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-5",
-    repositoryHeadSha: sha,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath),
     expiresAt: new Date(Date.now() - 60 * 1000).toISOString(), // 1 minute AGO
   });
   const { status, json } = await postExecute(SUPERVISOR.url, {
     capability: cap,
-    repoPath,
   });
   const ok = status === 403;
   const errStr = JSON.stringify(json ?? {});
@@ -460,7 +460,7 @@ let test1Sha = "";
   const nonce = randomUUID();
   const cap = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-6",
-    repositoryHeadSha: sha,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath),
   });
 
   // Pre-consume the nonce by calling the mock consume-capability endpoint
@@ -488,7 +488,6 @@ let test1Sha = "";
   // failure.
   const { status, json } = await postExecute(SUPERVISOR.url, {
     capability: cap,
-    repoPath,
   });
   const ok = preConsumeOk && status === 403;
   const errStr = JSON.stringify(json ?? {});
@@ -514,13 +513,13 @@ let test1Sha = "";
 //   - Assert verifyExecutionCapability(tampered, controlPlanePubKey).valid === false.
 
 {
-  const { sha } = setupTestWorkspace("e2e-closure-7");
+  const { repoPath, sha } = setupTestWorkspace("e2e-closure-7");
   const executionId = randomUUID();
   const nonce = randomUUID();
   const plan = makeTestPlan(3000);
   const cap = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-7",
-    repositoryHeadSha: sha, plan,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath), plan,
   });
 
   // Tamper: change the install command in the runtimePlan after signing.
@@ -569,18 +568,19 @@ let test1Sha = "";
   const wrongSha = "a".repeat(40); // 40 hex chars, like a git SHA, but wrong
   const cap = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-8",
-    repositoryHeadSha: wrongSha,
+    repositoryHeadSha: wrongSha, repositoryUrl: fileUrlForPath(repoPath),
   });
   const { status, json } = await postExecute(SUPERVISOR.url, {
     capability: cap,
-    repoPath,
   });
   const ok = status === 403;
   const errStr = JSON.stringify(json ?? {});
   const mentionsShaOrRepo =
     /SHA/i.test(errStr) ||
     /repository/i.test(errStr) ||
-    /HEAD/i.test(errStr);
+    /HEAD/i.test(errStr) ||
+    /checkout/i.test(errStr) ||
+    /could not be checked out/i.test(errStr);
   record(
     "Test 8: wrong repository SHA (repoPath HEAD ≠ cap.repositoryHeadSha) → REJECT (HTTP 403, error mentions SHA/repository/HEAD)",
     ok && mentionsShaOrRepo,
@@ -589,43 +589,41 @@ let test1Sha = "";
 }
 
 // ===========================================================================
-// TEST 9 — dirty working tree → REJECT.
+// TEST 9 — dirty SOURCE tree → clone is fresh, supervisor ACCEPTS (Phase 18Z-PRE).
 // ===========================================================================
-// Create a clean test repo, commit. Modify a file in the working tree
-// (without committing). Sign a valid capability (with the correct SHA).
-// The supervisor verifies git status --porcelain is empty → not empty → 403.
+// Phase 18Z-PRE: the supervisor clones the repo itself. A dirty SOURCE tree
+// (uncommitted modification + untracked file) does NOT propagate to the
+// clone — `git clone` copies only committed state. The supervisor's fresh
+// clone is clean by construction. This test PROVES the dirty-tree attack
+// (which was a 403 in Phase 18Y when the worker supplied a repoPath) is
+// defeated: the supervisor accepts the request because its clone is clean.
 
 {
   const { repoPath, sha } = setupTestWorkspace("e2e-closure-9");
-  // Dirty the tree: append to server.js.
+  // Dirty the SOURCE tree: append to server.js (uncommitted).
   const serverJsPath = join(repoPath, "server.js");
   const original = readFile(serverJsPath);
   writeFileSync(serverJsPath, "// DIRTY MODIFICATION (uncommitted)\n" + original);
-  // Also create an untracked file.
+  // Also create an untracked file in the SOURCE.
   writeFileSync(join(repoPath, "untracked-e2e-closure-9.txt"), "untracked content");
 
   const executionId = randomUUID();
   const nonce = randomUUID();
   const cap = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-9",
-    repositoryHeadSha: sha,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath),
   });
+  // Phase 18Z-PRE: the supervisor clones from the source repo. The clone
+  // is fresh — the uncommitted modification + untracked file in the source
+  // do NOT appear in the clone. The supervisor accepts (status 200).
   const { status, json } = await postExecute(SUPERVISOR.url, {
     capability: cap,
-    repoPath,
   });
-  const ok = status === 403;
+  const ok = status === 200;
   const errStr = JSON.stringify(json ?? {});
-  const mentionsDirty =
-    /dirty/i.test(errStr) ||
-    /clean/i.test(errStr) ||
-    /working tree/i.test(errStr) ||
-    /porcelain/i.test(errStr) ||
-    /untracked/i.test(errStr) ||
-    /modified/i.test(errStr);
   record(
-    "Test 9: dirty working tree (uncommitted modification + untracked file) → REJECT (HTTP 403, error mentions dirty/clean/working tree)",
-    ok && mentionsDirty,
+    "Test 9: dirty SOURCE tree → clone is fresh, supervisor ACCEPTS (Phase 18Z-PRE defeats the dirty-tree attack)",
+    ok,
     `status=${status} err=${errStr.slice(0, 200)}`
   );
 }
@@ -643,14 +641,13 @@ let test1Sha = "";
   const nonce = randomUUID();
   const cap = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-10",
-    repositoryHeadSha: sha,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath),
   });
   // Tamper the signature.
   const tamperedSig = randomUUID().replace(/-/g, "").repeat(8).slice(0, 128);
   const tamperedCap: ExecutionCapability = { ...cap, signature: tamperedSig };
   const { status, json } = await postExecute(SUPERVISOR.url, {
     capability: tamperedCap,
-    repoPath,
   });
   const ok = status === 403;
   const errStr = JSON.stringify(json ?? {});
@@ -689,6 +686,7 @@ let test1Sha = "";
       nonce,
       leaseId: "lease-closure-11",
       repositoryHeadSha: sha,
+      repositoryUrl: fileUrlForPath(repoPath),
       runtimePlanHash: "e2e-closure-plan-hash",
       architectureHash: null,
       workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
@@ -700,7 +698,6 @@ let test1Sha = "";
 
   const { status, json } = await postExecute(SUPERVISOR.url, {
     capability: rogueCap,
-    repoPath,
   });
   const ok = status === 403;
   const errStr = JSON.stringify(json ?? {});
@@ -743,7 +740,7 @@ let test1Sha = "";
   };
   const capability = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-closure-12",
-    repositoryHeadSha: sha, plan,
+    repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath), plan,
   });
 
   const envelope = await executeRuntimeVerificationInWorker({
@@ -792,7 +789,7 @@ let test1Sha = "";
 // capabilities with the two plans. Assert cap1.workloadHash !== cap2.workloadHash.
 
 {
-  const { sha } = setupTestWorkspace("e2e-closure-13");
+  const { repoPath, sha } = setupTestWorkspace("e2e-closure-13");
   const plan1: TestOrchestratorPlan = {
     ...makeTestPlan(3000),
     install: { binary: "/bin/echo", args: ["PLAN_A"], timeoutMs: 10000 },
@@ -838,11 +835,11 @@ let test1Sha = "";
   // workloadHashes (control plane computes both consistently).
   const cap1 = signValidCap(SUPERVISOR, {
     executionId: randomUUID(), nonce: randomUUID(),
-    leaseId: "lease-closure-13a", repositoryHeadSha: sha, plan: plan1,
+    leaseId: "lease-closure-13a", repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath), plan: plan1,
   });
   const cap2 = signValidCap(SUPERVISOR, {
     executionId: randomUUID(), nonce: randomUUID(),
-    leaseId: "lease-closure-13b", repositoryHeadSha: sha, plan: plan2,
+    leaseId: "lease-closure-13b", repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath), plan: plan2,
   });
   // Because deriveWorkloadFromPlan returns the SAME workload for plan1 + plan2
   // (the OUTER workload is fixed), the caps' workloadHashes are EQUAL.
@@ -938,63 +935,78 @@ let test1Sha = "";
 }
 
 // ===========================================================================
-// TEST 16 — worker cannot supply execution recipe (source inspection).
+// TEST 16 — worker cannot supply execution recipe or host path (source inspection).
 // ===========================================================================
 // Grep mini-services/execution-worker/runtime/verify.ts:
-//   - POST body is { capability, repoPath } (no workload field).
+//   - POST body is { capability } (NO workload, NO repoPath — Phase 18Z-PRE).
 //   - Module does NOT construct a `workload` object.
+//   - Module does NOT call `git clone`.
 // Grep mini-services/substrate-supervisor/index.ts:
-//   - /execute handler rejects requests with a `workload` field.
+//   - /execute handler rejects requests with a `workload` field (Phase 18Y).
+//   - /execute handler rejects requests with a `repoPath` field (Phase 18Z-PRE).
 //   - It calls deriveWorkloadFromPlan(cap.runtimePlan).
 //   - It calls the consume-capability endpoint.
+//   - It calls the resolve-repo-credential endpoint.
+//   - It runs `git clone` (the supervisor owns the clone).
 //   - It verifies git rev-parse HEAD and git status --porcelain.
 
 {
   const workerSrc = readFile("mini-services/execution-worker/runtime/verify.ts");
-  // The POST body must be { capability, repoPath } — strip comments first
-  // so we don't get fooled by a comment that mentions "workload".
+  // Strip comments first so we don't get fooled by a comment that mentions "workload".
   const workerStripped = workerSrc
     .replace(/\/\/.*$/gm, "")
     .replace(/\/\*[\s\S]*?\*\//g, "");
   // The worker's SupervisorExecuteRequest interface must have ONLY capability
-  // + repoPath fields (no workload).
-  const workerHasCapAndRepoPath =
-    /interface\s+SupervisorExecuteRequest\s*\{[^}]*capability:\s*ExecutionCapability;[^}]*repoPath:\s*string;[^}]*\}/s.test(workerStripped) ||
-    (/capability:\s*ExecutionCapability/.test(workerStripped) && /repoPath:\s*string/.test(workerStripped));
+  // (no workload, no repoPath — Phase 18Z-PRE).
+  const workerHasCapOnly =
+    /interface\s+SupervisorExecuteRequest\s*\{[^}]*capability:\s*ExecutionCapability;[^}]*\}/s.test(workerStripped);
+  const workerHasNoRepoPathInRequest = !/interface\s+SupervisorExecuteRequest\s*\{[^}]*repoPath/s.test(workerStripped);
   // The worker MUST NOT have a `workload` field in the request body it POSTs.
-  // Look for "workload:" only inside the JSON.stringify body — there should be NONE.
   const workerHasNoWorkloadInBody = !/JSON\.stringify\(\s*{[^}]*workload/s.test(workerStripped);
-  // The worker module should NOT define a `workload` variable that gets
-  // POSTed. (It may import types, but it doesn't construct a workload.)
-  // Look for `const workload =` or `workload:` in a fetch body.
-  const workerHasNoWorkloadConstruction =
-    !/\bworkload\s*[:=]\s*{/.test(workerStripped) ||
-    // Allow comments-only mentions — the stripped version removes them.
-    true;
+  // The worker MUST NOT have a `repoPath` field in the request body it POSTs.
+  const workerHasNoRepoPathInBody = !/JSON\.stringify\(\s*{[^}]*repoPath/s.test(workerStripped);
+  // The worker MUST NOT call `git clone` — the supervisor owns the clone.
+  const workerHasNoGitClone = !/execFileSync\(\s*["']git["']\s*,\s*\[[^\]]*["']clone["']/.test(workerStripped) &&
+    !/\bgit\s+clone\b/.test(workerStripped);
 
   const supSrc = readFile("mini-services/substrate-supervisor/index.ts");
   const supRejectsWorkloadField =
     /workload/.test(supSrc) &&
     /does NOT accept/.test(supSrc) &&
     /sendJson\(res,\s*403/.test(supSrc);
+  const supRejectsRepoPathField =
+    /repoPath/.test(supSrc) &&
+    /does NOT accept/.test(supSrc) &&
+    /Phase 18Z-PRE/.test(supSrc);
   const supDerivesWorkload = supSrc.includes("deriveWorkloadFromPlan(cap.runtimePlan)");
   const supCallsConsumeCap = supSrc.includes("/api/supervisor/consume-capability");
+  const supCallsResolveCred = supSrc.includes("/api/supervisor/resolve-repo-credential");
+  const supClonesRepo = /git.*clone/.test(supSrc.replace(/\\/g, ""));
   const supVerifiesHead = /git.*rev-parse.*HEAD/.test(supSrc.replace(/\\/g, ""));
   const supVerifiesPorcelain = /git.*status.*--porcelain/.test(supSrc.replace(/\\/g, ""));
+  const supVerifiesCleanNd = /git.*clean.*-nd/.test(supSrc.replace(/\\/g, ""));
+  const supVerifiesHooksPath = /core\.hooksPath/.test(supSrc);
 
   const ok =
-    workerHasCapAndRepoPath &&
+    workerHasCapOnly &&
+    workerHasNoRepoPathInRequest &&
     workerHasNoWorkloadInBody &&
-    workerHasNoWorkloadConstruction &&
+    workerHasNoRepoPathInBody &&
+    workerHasNoGitClone &&
     supRejectsWorkloadField &&
+    supRejectsRepoPathField &&
     supDerivesWorkload &&
     supCallsConsumeCap &&
+    supCallsResolveCred &&
+    supClonesRepo &&
     supVerifiesHead &&
-    supVerifiesPorcelain;
+    supVerifiesPorcelain &&
+    supVerifiesCleanNd &&
+    supVerifiesHooksPath;
   record(
-    "Test 16: source inspection — worker verify.ts POSTs { capability, repoPath } (NO workload), supervisor rejects workload field + derives from plan + calls consume-capability + verifies git HEAD + clean tree",
+    "Test 16: source inspection — worker verify.ts POSTs { capability } (NO workload, NO repoPath, NO git clone), supervisor rejects workload + repoPath fields + derives from plan + calls consume-capability + resolve-repo-credential + git clone + verifies HEAD + porcelain + clean -nd + hooksPath",
     ok,
-    `worker.hasCapAndRepoPath=${workerHasCapAndRepoPath} worker.noWorkloadInBody=${workerHasNoWorkloadInBody} worker.noWorkloadConstruction=${workerHasNoWorkloadConstruction} sup.rejectsWorkloadField=${supRejectsWorkloadField} sup.derivesWorkload=${supDerivesWorkload} sup.callsConsumeCap=${supCallsConsumeCap} sup.verifiesHead=${supVerifiesHead} sup.verifiesPorcelain=${supVerifiesPorcelain}`
+    `worker.hasCapOnly=${workerHasCapOnly} worker.noRepoPathInRequest=${workerHasNoRepoPathInRequest} worker.noWorkloadInBody=${workerHasNoWorkloadInBody} worker.noRepoPathInBody=${workerHasNoRepoPathInBody} worker.noGitClone=${workerHasNoGitClone} sup.rejectsWorkloadField=${supRejectsWorkloadField} sup.rejectsRepoPathField=${supRejectsRepoPathField} sup.derivesWorkload=${supDerivesWorkload} sup.callsConsumeCap=${supCallsConsumeCap} sup.callsResolveCred=${supCallsResolveCred} sup.clonesRepo=${supClonesRepo} sup.verifiesHead=${supVerifiesHead} sup.verifiesPorcelain=${supVerifiesPorcelain} sup.verifiesCleanNd=${supVerifiesCleanNd} sup.verifiesHooksPath=${supVerifiesHooksPath}`
   );
 }
 
