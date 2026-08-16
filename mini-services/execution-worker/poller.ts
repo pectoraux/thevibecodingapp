@@ -18,12 +18,18 @@ import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runS
 
 // --- Configuration ---
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
-const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
+const WORKER_SECRET = process.env.FORGE_WORKER_SECRET; // Bootstrap only (Phase 18P).
 const WORKER_VERSION = "phase16d";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
 const EXEC_ROOT = "/tmp/forge-exec";
+
+// Phase 18P: Control-plane public key for verifying session/execution tokens.
+// The control plane signs tokens with its PRIVATE key; the worker verifies
+// with this PUBLIC key. A worker with FORGE_WORKER_SECRET can NO LONGER forge
+// control-plane tokens — it doesn't have the control-plane private key.
+const CONTROL_PLANE_PUBLIC_KEY = process.env.FORGE_CONTROL_PLANE_PUBLIC_KEY;
 
 // Phase 18M: Worker identity must be STABLE across restarts.
 // In production (NODE_ENV=production), FORGE_WORKER_ID is REQUIRED.
@@ -44,19 +50,30 @@ if (process.env.FORGE_WORKER_ID) {
 }
 
 if (!WORKER_SECRET) {
-  console.error("[worker] FATAL: FORGE_WORKER_SECRET not set");
+  console.error("[worker] FATAL: FORGE_WORKER_SECRET not set (required for bootstrap registration)");
+  process.exit(1);
+}
+
+// Phase 18P: In production, control-plane public key is REQUIRED for verifying
+// session/execution tokens. Without it, the worker cannot verify that tokens
+// were issued by the control plane (not forged by another worker).
+if (isProduction && !CONTROL_PLANE_PUBLIC_KEY) {
+  console.error("[worker] FATAL: FORGE_CONTROL_PLANE_PUBLIC_KEY is required in production. The worker must verify control-plane tokens with the control-plane's public key.");
   process.exit(1);
 }
 
 console.log(`[worker] Starting Forge Execution Worker (${WORKER_VERSION})`);
 
 // --- Token helpers ---
-// Phase 18K: Worker tokens now include tokenType field (required by 18J control plane).
+// Phase 18P: Worker tokens include tokenType + signatureAlgorithm.
+// Registration tokens use HMAC (bootstrap only).
+// Session/execution tokens are verified with the control-plane Ed25519 public key.
 function signToken(payload: any): string {
   const data = [
     payload.tokenType, payload.iss, payload.aud, payload.workerId,
     payload.executionId || "", payload.leaseId || "", payload.projectId || "",
     JSON.stringify(payload.capabilities), payload.iat, payload.exp, payload.nonce,
+    payload.signatureAlgorithm || "hmac",
   ].join(".");
   return createHmac("sha256", WORKER_SECRET).update(data).digest("hex");
 }
@@ -68,6 +85,7 @@ function createRegToken(): string {
     iss: "forge-worker", aud: "forge-control-plane", workerId: WORKER_ID,
     capabilities: ["node", "git", "test", "build"],
     iat: now, exp: now + 60000, nonce: randomUUID(),
+    signatureAlgorithm: "hmac" as const, // Bootstrap: HMAC only for first registration.
   };
   return `Bearer ${Buffer.from(JSON.stringify({ ...payload, signature: signToken(payload) })).toString("base64")}`;
 }

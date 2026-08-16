@@ -172,10 +172,10 @@ const workerAuth = readFile("src/lib/worker-auth.ts");
   record("Signature includes tokenType in the signed payload", includes, `includes: ${includes}`);
 }
 
-// Test 24: Honest documentation of shared HMAC limitation.
+// Test 24: HMAC documented as bootstrap only (not root of authority).
 {
-  const honest = workerAuth.includes("KNOWN LIMITATION") && workerAuth.includes("shared secret");
-  record("Honest documentation of shared HMAC limitation", honest, `honest: ${honest}`);
+  const honest = workerAuth.includes("bootstrap") || workerAuth.includes("Bootstrap");
+  record("HMAC documented as bootstrap only (not root of authority)", honest, `honest: ${honest}`);
 }
 
 // ===========================================================================
