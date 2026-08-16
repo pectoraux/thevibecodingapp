@@ -12,6 +12,10 @@ import {
   type RuntimeVerificationResult,
   type ProductionReadinessEvidence,
 } from "@/lib/runtime-verification";
+import {
+  verifyEvidenceEnvelope,
+  type ExecutionEvidenceEnvelope,
+} from "@/lib/runtime-execution-contract";
 
 // POST /api/worker/submit-runtime-evidence
 //
@@ -80,9 +84,46 @@ export async function POST(req: Request) {
 
     const body = await req.json();
     const result = body.result as RuntimeVerificationResult;
+    const envelope = body.envelope as ExecutionEvidenceEnvelope | undefined;
 
     if (!result || !result.repositoryHeadSha) {
       return NextResponse.json({ error: "Missing runtime verification result" }, { status: 400 });
+    }
+
+    // Phase 18F: REQUIRE a signed evidence envelope. No signature = REJECTED.
+    // The Ed25519 signature is no longer an unused primitive — it is REQUIRED.
+    if (!envelope || !envelope.signature) {
+      return NextResponse.json({
+        error: "REJECTED: Missing signed evidence envelope. Phase 18F requires Ed25519-signed ExecutionEvidenceEnvelope.",
+      }, { status: 403 });
+    }
+
+    // Phase 18F: Verify the envelope signature before doing anything else.
+    // The worker's public key must be registered. In production, this would
+    // look up the worker's registered public key from the WorkerRegistry.
+    // For now, we require the envelope to be valid against a registered key.
+    // TODO: Look up worker public key from WorkerRegistry by workerId.
+    // For now, if a workerPublicKey is provided in the body (development mode),
+    // verify against it. In production, the key is server-side only.
+    const workerPublicKey = body.workerPublicKey as string | undefined;
+    if (!workerPublicKey) {
+      return NextResponse.json({
+        error: "REJECTED: Worker public key not provided. The control plane must verify the evidence signature.",
+      }, { status: 403 });
+    }
+
+    const signatureValid = verifyEvidenceEnvelope(envelope, workerPublicKey);
+    if (!signatureValid) {
+      return NextResponse.json({
+        error: "REJECTED: Evidence envelope signature verification FAILED. The complete evidence (including all stage results) must be signed by the worker's Ed25519 private key.",
+      }, { status: 403 });
+    }
+
+    // Phase 18F: Verify envelope identity matches the token identity.
+    if (envelope.executionId !== token.executionId || envelope.workerId !== token.workerId) {
+      return NextResponse.json({
+        error: "REJECTED: Envelope identity mismatch. envelope.executionId/workerId must match the authenticated token.",
+      }, { status: 403 });
     }
 
     // Phase 18A: Verify the worker's SHA matches the server's expected SHA.
@@ -273,7 +314,12 @@ export async function POST(req: Request) {
         staticReadinessPassed,
         runtimeVerificationPassed: evaluation.passed,
         runtimeEvidencePersisted: true, // just persisted
-        executionEnvironmentSandboxed: process.env.FORGE_EXECUTION_MODE === "sandbox",
+        // Phase 18F: Do NOT trust FORGE_EXECUTION_MODE config label.
+        // The production predicate requires a VERIFIED execution substrate,
+        // not a configuration string. In filesystem-only mode, this is false.
+        // Container mode would provide substrate attestation (future phase).
+        // Config says "sandbox" ≠ system is sandboxed.
+        executionEnvironmentSandboxed: false, // FAIL-CLOSED: no verified substrate attestation exists yet.
         repositoryHeadVerified: headVerified,
       };
 

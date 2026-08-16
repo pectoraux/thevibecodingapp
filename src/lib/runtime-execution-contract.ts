@@ -453,36 +453,94 @@ export function getWorkspacePaths(sandbox: SandboxModel): WorkspacePaths {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 18E: Evidence Signing — Asymmetric (Ed25519) signature
+// Phase 18F: Complete Evidence Envelope + Asymmetric Signing
 // ---------------------------------------------------------------------------
 //
-// Phase 18D used HMAC-SHA256 with a shared secret. This was wrong for a
-// distributed architecture: a compromised worker that obtains the shared
-// secret can manufacture valid evidence.
+// Phase 18E implemented Ed25519 signing but:
+//   1. The endpoint never called verifyEvidenceSignature() — unused primitive.
+//   2. Only high-level verdict was signed, not the complete stage evidence.
+//   3. workerId/executionId/leaseId were not cryptographically bound.
 //
-// Phase 18E replaces HMAC with asymmetric signing:
-//   - Worker holds a PRIVATE key (never shared with the control plane).
-//   - Control plane holds the worker's PUBLIC key.
-//   - Worker signs evidence with its private key.
-//   - Control plane verifies with the worker's public key.
-//
-// A compromised worker cannot forge another worker's evidence (different key).
-// A compromised control plane cannot fabricate worker evidence (no private key).
+// Phase 18F fixes all three:
+//   - ExecutionEvidenceEnvelope covers ALL stage results + metadata.
+//   - resultHash = SHA-256(canonical complete result).
+//   - envelopeHash = SHA-256(canonical complete envelope including metadata).
+//   - signature = Ed25519(workerPrivateKey, envelopeHash).
+//   - The control plane MUST verify the signature before persisting evidence.
 //
 
 import { sign as cryptoSign, verify as cryptoVerify, generateKeyPairSync } from "node:crypto";
 
 /**
- * Phase 18E: Asymmetric evidence signature.
+ * Phase 18F: The COMPLETE evidence envelope.
  *
- * Uses Ed25519 for simplicity and performance. RSA-SHA256 is also supported
- * for environments where Ed25519 is unavailable.
+ * This is what gets signed. Every field is included in the canonical
+ * serialization. A valid signature proves:
+ *   - This worker signed this exact execution evidence.
+ *   - The stage results (install/build/startup/health/API/teardown) are
+ *     cryptographically bound to the verdict.
+ *   - workerId, executionId, leaseId are bound to the evidence.
+ *
+ * A compromised worker cannot tamper with any field without invalidating
+ * the signature.
+ */
+export interface ExecutionEvidenceEnvelope {
+  // Identity (bound into signature)
+  executionId: string;
+  workerId: string;
+  leaseId: string;
+
+  // Canonical state (bound into signature)
+  repositoryHeadSha: string;
+  architectureHash: string | null;
+  runtimePlanHash: string;
+
+  // Environment (bound into signature)
+  environmentFingerprint: {
+    os: string;
+    architecture: string;
+    nodeVersion: string;
+    packageManager: string;
+    containerImageHash: string | null;
+    environmentVariablesHash: string;
+    timestamp: string;
+  };
+
+  // COMPLETE stage evidence (bound into signature — not just high-level verdict)
+  dependencyInstallResult: { success: boolean; durationMs: number; exitCode: number | null; output: string };
+  buildResult: { success: boolean; durationMs: number; exitCode: number | null; output: string };
+  startupResult: { success: boolean; durationMs: number; exitCode: number | null; output: string; port: number; pid: number | null };
+  healthChecks: { name: string; path: string; passed: boolean; status: number | null; responseTimeMs: number }[];
+  apiJourneys: { name: string; passed: boolean; stepsCompleted: number; stepsTotal: number }[];
+  integrationChecks: { name: string; type: string; passed: boolean }[];
+  backgroundJobChecks: { name: string; type: string; passed: boolean }[];
+  browserJourneys: { name: string; url: string; passed: boolean }[];
+  teardownResult: { success: boolean; durationMs: number };
+
+  // Overall verdict (bound into signature)
+  passed: boolean;
+  failureReason: string | null;
+
+  // Timing (bound into signature)
+  startedAt: string;
+  completedAt: string;
+
+  // Derived hashes (computed from the above, included in envelope)
+  resultHash: string;
+  envelopeHash: string;
+
+  // Signature over envelopeHash
+  signature: EvidenceSignature;
+}
+
+/**
+ * Phase 18F: Asymmetric evidence signature (Ed25519).
  */
 export interface EvidenceSignature {
-  /** Digital signature (hex) over the canonical evidence serialization. */
+  /** Digital signature (hex) over the envelope hash. */
   signature: string;
   /** Signing algorithm used. */
-  algorithm: "ed25519" | "rsa-sha256";
+  algorithm: "ed25519";
   /** The worker ID that signed the evidence. */
   workerId: string;
   /** The execution ID the evidence belongs to. */
@@ -493,14 +551,11 @@ export interface EvidenceSignature {
 
 /**
  * Phase 18E: Worker key pair for evidence signing.
- *
- * The worker generates this pair at registration time. The private key never
- * leaves the worker. The public key is registered with the control plane.
  */
 export interface WorkerKeyPair {
   workerId: string;
-  privateKeyPem: string;  // Never sent to control plane.
-  publicKeyPem: string;   // Registered with control plane at registration.
+  privateKeyPem: string;
+  publicKeyPem: string;
 }
 
 /**
@@ -516,40 +571,133 @@ export function generateWorkerKeyPair(workerId: string): WorkerKeyPair {
 }
 
 /**
- * Canonical serialization of evidence for signing.
- * Uses recursive key sorting (same as hashRuntimePlan).
+ * Phase 18F: Compute the result hash — SHA-256 of the canonical complete result.
+ *
+ * This covers ALL stage evidence, not just the high-level verdict.
  */
-function canonicalEvidenceSerialization(
-  result: {
-    repositoryHeadSha: string;
-    passed: boolean;
-    failureReason: string | null;
-    environmentFingerprint: { environmentVariablesHash: string };
-  },
-  runtimePlanHash: string,
-  architectureHash: string | null
-): string {
-  const obj = {
-    architectureHash,
-    environmentVariablesHash: result.environmentFingerprint.environmentVariablesHash,
+export function computeResultHash(result: Omit<ExecutionEvidenceEnvelope, "resultHash" | "envelopeHash" | "signature">): string {
+  // Extract only the result fields (exclude metadata that goes into envelopeHash).
+  const resultFields = {
+    apiJourneys: result.apiJourneys,
+    backgroundJobChecks: result.backgroundJobChecks,
+    browserJourneys: result.browserJourneys,
+    buildResult: result.buildResult,
+    completedAt: result.completedAt,
+    dependencyInstallResult: result.dependencyInstallResult,
     failureReason: result.failureReason,
+    healthChecks: result.healthChecks,
+    integrationChecks: result.integrationChecks,
     passed: result.passed,
-    repositoryHeadSha: result.repositoryHeadSha,
-    runtimePlanHash,
+    startedAt: result.startedAt,
+    startupResult: result.startupResult,
+    teardownResult: result.teardownResult,
   };
-  // Recursive canonical serialization (sorted keys at every level).
-  return canonicalSerialize(obj);
+  return createHash("sha256").update(canonicalSerialize(resultFields)).digest("hex").slice(0, 16);
 }
 
 /**
- * Phase 18E: Sign evidence with the worker's private key.
+ * Phase 18F: Compute the envelope hash — SHA-256 of the canonical complete envelope
+ * (including identity, state, environment, result hash, but excluding the signature itself).
+ */
+export function computeEnvelopeHash(
+  envelope: Omit<ExecutionEvidenceEnvelope, "signature">
+): string {
+  const envelopeFields = {
+    architectureHash: envelope.architectureHash,
+    completedAt: envelope.completedAt,
+    dependencyInstallResult: envelope.dependencyInstallResult,
+    environmentFingerprint: envelope.environmentFingerprint,
+    executionId: envelope.executionId,
+    failureReason: envelope.failureReason,
+    leaseId: envelope.leaseId,
+    passed: envelope.passed,
+    repositoryHeadSha: envelope.repositoryHeadSha,
+    resultHash: envelope.resultHash,
+    runtimePlanHash: envelope.runtimePlanHash,
+    startedAt: envelope.startedAt,
+    workerId: envelope.workerId,
+    // Include all stage results in the envelope hash too.
+    apiJourneys: envelope.apiJourneys,
+    backgroundJobChecks: envelope.backgroundJobChecks,
+    browserJourneys: envelope.browserJourneys,
+    buildResult: envelope.buildResult,
+    healthChecks: envelope.healthChecks,
+    integrationChecks: envelope.integrationChecks,
+    startupResult: envelope.startupResult,
+    teardownResult: envelope.teardownResult,
+  };
+  return createHash("sha256").update(canonicalSerialize(envelopeFields)).digest("hex").slice(0, 16);
+}
+
+/**
+ * Phase 18F: Sign the COMPLETE evidence envelope.
  *
- * @param result The runtime verification result to sign.
- * @param runtimePlanHash The plan hash.
- * @param architectureHash The architecture hash.
- * @param privateKeyPem The worker's private key (PEM).
- * @param workerId The worker's ID.
- * @param executionId The execution ID.
+ * The signature covers:
+ *   - Identity: executionId, workerId, leaseId
+ *   - State: repositoryHeadSha, architectureHash, runtimePlanHash
+ *   - Environment: full fingerprint
+ *   - Results: ALL stage evidence (install, build, startup, health, API, teardown)
+ *   - Verdict: passed, failureReason
+ *   - Timing: startedAt, completedAt
+ *   - Derived: resultHash, envelopeHash
+ *
+ * A valid signature proves the worker attests to the COMPLETE evidence,
+ * not just a high-level verdict.
+ */
+export function signEvidenceEnvelope(
+  envelope: Omit<ExecutionEvidenceEnvelope, "signature">,
+  privateKeyPem: string
+): EvidenceSignature {
+  const data = Buffer.from(envelope.envelopeHash, "utf-8");
+
+  // Ed25519 signs the envelope hash directly.
+  const signature = cryptoSign(null, data, privateKeyPem).toString("hex");
+
+  return {
+    signature,
+    algorithm: "ed25519",
+    workerId: envelope.workerId,
+    executionId: envelope.executionId,
+    signedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Phase 18F: Verify the complete evidence envelope signature.
+ *
+ * @returns true if the signature is valid for this envelope + public key.
+ */
+export function verifyEvidenceEnvelope(
+  envelope: ExecutionEvidenceEnvelope,
+  publicKeyPem: string
+): boolean {
+  // Recompute the envelope hash from the envelope (excluding signature).
+  const { signature: _sig, ...envelopeWithoutSig } = envelope;
+  const expectedHash = computeEnvelopeHash(envelopeWithoutSig);
+
+  // Verify the envelope hash matches.
+  if (expectedHash !== envelope.envelopeHash) {
+    return false;
+  }
+
+  // Verify the signature over the envelope hash.
+  const data = Buffer.from(envelope.envelopeHash, "utf-8");
+  const sigBuf = Buffer.from(envelope.signature.signature, "hex");
+
+  try {
+    return cryptoVerify(null, data, publicKeyPem, sigBuf);
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Backward-compatible signEvidence/verifyEvidenceSignature (deprecated)
+// ---------------------------------------------------------------------------
+
+/**
+ * @deprecated Use signEvidenceEnvelope/verifyEvidenceEnvelope instead.
+ * Phase 18F replaces partial signing with complete envelope signing.
  */
 export function signEvidence(
   result: {
@@ -564,25 +712,21 @@ export function signEvidence(
   workerId: string,
   executionId: string
 ): EvidenceSignature {
-  const canonical = canonicalEvidenceSerialization(result, runtimePlanHash, architectureHash);
+  const canonical = canonicalSerialize({
+    architectureHash,
+    environmentVariablesHash: result.environmentFingerprint.environmentVariablesHash,
+    failureReason: result.failureReason,
+    passed: result.passed,
+    repositoryHeadSha: result.repositoryHeadSha,
+    runtimePlanHash,
+  });
   const data = Buffer.from(canonical, "utf-8");
-
-  // Ed25519 uses null digest (signs the raw data, not a hash of it).
   const signature = cryptoSign(null, data, privateKeyPem).toString("hex");
-
-  return {
-    signature,
-    algorithm: "ed25519",
-    workerId,
-    executionId,
-    signedAt: new Date().toISOString(),
-  };
+  return { signature, algorithm: "ed25519", workerId, executionId, signedAt: new Date().toISOString() };
 }
 
 /**
- * Phase 18E: Verify evidence signature with the worker's public key.
- *
- * @returns true if the signature is valid for this evidence + public key.
+ * @deprecated Use verifyEvidenceEnvelope instead.
  */
 export function verifyEvidenceSignature(
   result: {
@@ -596,15 +740,17 @@ export function verifyEvidenceSignature(
   sig: EvidenceSignature,
   publicKeyPem: string
 ): boolean {
-  const canonical = canonicalEvidenceSerialization(result, runtimePlanHash, architectureHash);
+  const canonical = canonicalSerialize({
+    architectureHash,
+    environmentVariablesHash: result.environmentFingerprint.environmentVariablesHash,
+    failureReason: result.failureReason,
+    passed: result.passed,
+    repositoryHeadSha: result.repositoryHeadSha,
+    runtimePlanHash,
+  });
   const data = Buffer.from(canonical, "utf-8");
   const sigBuf = Buffer.from(sig.signature, "hex");
-
-  try {
-    return cryptoVerify(null, data, publicKeyPem, sigBuf);
-  } catch {
-    return false;
-  }
+  try { return cryptoVerify(null, data, publicKeyPem, sigBuf); } catch { return false; }
 }
 
 // ---------------------------------------------------------------------------

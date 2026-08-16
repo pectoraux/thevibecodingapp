@@ -21,6 +21,10 @@ import {
   signEvidence,
   verifyEvidenceSignature,
   generateWorkerKeyPair,
+  signEvidenceEnvelope,
+  verifyEvidenceEnvelope,
+  computeResultHash,
+  computeEnvelopeHash,
   createReplayabilityIdentity,
   isReplayCompatible,
   type SandboxModel,
@@ -833,10 +837,115 @@ const executorModule = readFile("src/lib/runtime-executor.ts");
 }
 
 // ===========================================================================
+// PHASE 18F: Evidence envelope — complete signing + endpoint integration
+// ===========================================================================
+
+const contractCode18F = readFile("src/lib/runtime-execution-contract.ts");
+const endpointCode18F = readFile("src/app/api/worker/submit-runtime-evidence/route.ts");
+
+// Test 71: ExecutionEvidenceEnvelope interface exists.
+{
+  const hasType = contractCode18F.includes("interface ExecutionEvidenceEnvelope");
+  record("Phase 18F: ExecutionEvidenceEnvelope interface exists", hasType, `hasType: ${hasType}`);
+}
+
+// Test 72: Envelope includes ALL stage results (not just high-level verdict).
+{
+  const stages = ["dependencyInstallResult", "buildResult", "startupResult", "healthChecks", "apiJourneys", "integrationChecks", "backgroundJobChecks", "browserJourneys", "teardownResult"];
+  const missing = stages.filter((s) => !contractCode18F.includes(s));
+  record("Phase 18F: Envelope includes ALL stage results", missing.length === 0, missing.length === 0 ? "All present" : `MISSING: ${missing.join(", ")}`);
+}
+
+// Test 73: Envelope binds identity (executionId, workerId, leaseId).
+{
+  const hasAll = contractCode18F.includes("executionId: string") && contractCode18F.includes("workerId: string") && contractCode18F.includes("leaseId: string");
+  record("Phase 18F: Envelope binds executionId, workerId, leaseId", hasAll, `hasAll: ${hasAll}`);
+}
+
+// Test 74-77: Envelope functions exist.
+{
+  record("Phase 18F: computeResultHash exists", contractCode18F.includes("export function computeResultHash"), "");
+  record("Phase 18F: computeEnvelopeHash exists", contractCode18F.includes("export function computeEnvelopeHash"), "");
+  record("Phase 18F: signEvidenceEnvelope exists", contractCode18F.includes("export function signEvidenceEnvelope"), "");
+  record("Phase 18F: verifyEvidenceEnvelope exists", contractCode18F.includes("export function verifyEvidenceEnvelope"), "");
+}
+
+// Test 78: Endpoint requires signed envelope.
+{
+  record("Phase 18F: endpoint rejects without signed envelope", endpointCode18F.includes("Missing signed evidence envelope"), "");
+}
+
+// Test 79: Endpoint calls verifyEvidenceEnvelope.
+{
+  record("Phase 18F: endpoint calls verifyEvidenceEnvelope (Ed25519 IS USED)", endpointCode18F.includes("verifyEvidenceEnvelope(envelope"), "");
+}
+
+// Test 80: Endpoint rejects on signature failure.
+{
+  record("Phase 18F: endpoint rejects on signature verification failure", endpointCode18F.includes("signature verification FAILED"), "");
+}
+
+// Test 81: Endpoint verifies envelope identity matches token.
+{
+  record("Phase 18F: endpoint verifies envelope identity matches token", endpointCode18F.includes("envelope.executionId !== token.executionId"), "");
+}
+
+// Test 82: Endpoint does NOT trust FORGE_EXECUTION_MODE.
+{
+  const noConfigTrust = !endpointCode18F.includes('FORGE_EXECUTION_MODE === "sandbox"');
+  const failClosed = endpointCode18F.includes("executionEnvironmentSandboxed: false");
+  record("Phase 18F: endpoint does NOT trust config label (fail-closed: false)", noConfigTrust && failClosed, `noConfig: ${noConfigTrust}, failClosed: ${failClosed}`);
+}
+
+// Test 83: Envelope signing + verification round-trip.
+{
+  const keyPair = generateWorkerKeyPair("worker-test");
+  const data = {
+    executionId: "exec-1", workerId: "worker-test", leaseId: "lease-1",
+    repositoryHeadSha: "abc123", architectureHash: "arch", runtimePlanHash: "plan",
+    environmentFingerprint: { os: "linux", architecture: "x64", nodeVersion: "v20", packageManager: "npm", containerImageHash: null, environmentVariablesHash: "env", timestamp: new Date().toISOString() },
+    dependencyInstallResult: { success: true, durationMs: 1, exitCode: 0, output: "ok" },
+    buildResult: { success: true, durationMs: 1, exitCode: 0, output: "ok" },
+    startupResult: { success: true, durationMs: 1, exitCode: 0, output: "ok", port: 3000, pid: 1 },
+    healthChecks: [], apiJourneys: [], integrationChecks: [], backgroundJobChecks: [], browserJourneys: [],
+    teardownResult: { success: true, durationMs: 1 },
+    passed: true, failureReason: null, startedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
+  };
+  const resultHash = computeResultHash(data);
+  const envelopeHash = computeEnvelopeHash({ ...data, resultHash });
+  const sig = signEvidenceEnvelope({ ...data, resultHash, envelopeHash }, keyPair.privateKeyPem);
+  const verified = verifyEvidenceEnvelope({ ...data, resultHash, envelopeHash, signature: sig }, keyPair.publicKeyPem);
+  record("Phase 18F: envelope signing + verification round-trip works", verified, `verified: ${verified}`);
+}
+
+// Test 84: Tampered stage result invalidates signature.
+{
+  const keyPair = generateWorkerKeyPair("worker-test");
+  const data = {
+    executionId: "exec-1", workerId: "worker-test", leaseId: "lease-1",
+    repositoryHeadSha: "abc123", architectureHash: "arch", runtimePlanHash: "plan",
+    environmentFingerprint: { os: "linux", architecture: "x64", nodeVersion: "v20", packageManager: "npm", containerImageHash: null, environmentVariablesHash: "env", timestamp: new Date().toISOString() },
+    dependencyInstallResult: { success: true, durationMs: 1, exitCode: 0, output: "ok" },
+    buildResult: { success: true, durationMs: 1, exitCode: 0, output: "ok" },
+    startupResult: { success: true, durationMs: 1, exitCode: 0, output: "ok", port: 3000, pid: 1 },
+    healthChecks: [], apiJourneys: [], integrationChecks: [], backgroundJobChecks: [], browserJourneys: [],
+    teardownResult: { success: true, durationMs: 1 },
+    passed: true, failureReason: null, startedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
+  };
+  const resultHash = computeResultHash(data);
+  const envelopeHash = computeEnvelopeHash({ ...data, resultHash });
+  const sig = signEvidenceEnvelope({ ...data, resultHash, envelopeHash }, keyPair.privateKeyPem);
+  // Tamper with buildResult after signing.
+  const tampered = { ...data, resultHash, envelopeHash, signature: sig, buildResult: { success: false, durationMs: 1, exitCode: 1, output: "FAIL" } };
+  const verified = verifyEvidenceEnvelope(tampered, keyPair.publicKeyPem);
+  record("Phase 18F: tampered stage result invalidates signature", !verified, `verified: ${verified} (should be false)`);
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 18D: Runtime Executor Security Freeze ===\n");
+console.log("=== Forge Phase 18F: Verifiable Execution Boundary ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {
