@@ -80,8 +80,8 @@ const submitEvidence = readFile("src/app/api/worker/submit-evidence/route.ts");
 
 // Test 8: /submit-evidence requires signature in production.
 {
-  const requiresProd = submitEvidence.includes("Evidence signature required in production");
-  record("/submit-evidence requires Ed25519 signature in production", requiresProd, `requiresProd: ${requiresProd}`);
+  const requiresUniversal = submitEvidence.includes("Evidence signature required.");
+  record("/submit-evidence requires Ed25519 signature universally (FORGE_DEV_INSECURE_MODE bypass only)", requiresUniversal, `requiresUniversal: ${requiresUniversal}`);
 }
 
 // Test 9: /submit-evidence recomputes evidence hash (doesn't trust worker hash).

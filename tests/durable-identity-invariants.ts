@@ -39,7 +39,7 @@ const register = readFile("src/app/api/worker/register/route.ts");
 
 // Test 3: Worker loads key from disk if it exists.
 {
-  const loadsFromDisk = poller.includes("readFileSync(WORKER_KEY_PATH") && poller.includes("Loaded existing Ed25519 keypair");
+  const loadsFromDisk = poller.includes("readFileSync(fd") && poller.includes("Loaded existing Ed25519 keypair");
   record("Worker loads existing keypair from disk (durable across restarts)", loadsFromDisk, `loadsFromDisk: ${loadsFromDisk}`);
 }
 

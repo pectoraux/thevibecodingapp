@@ -110,11 +110,28 @@ export async function POST(req: Request) {
     const body = await req.json();
     const { commitSha, pushedToRemote, testResults, guardianResult, reviewResult, filesChanged, implementationLog } = body;
 
-    // Phase 18N: Verify Ed25519 task evidence signature.
-    // The worker signs the evidence hash with its registered private key.
-    // The control plane verifies with the worker's registered public key.
+    // Phase 18O: Verify Ed25519 task evidence signature with execution identity binding.
+    // The signature must cover BOTH the evidence AND the execution identity
+    // (workerId, executionId, leaseId) to prevent replay across executions.
     const evidenceSignature = body.evidenceSignature as string | undefined;
     const evidenceHash = body.evidenceHash as string | undefined;
+    const signedExecutionId = body.signedExecutionId as string | undefined;
+    const signedLeaseId = body.signedLeaseId as string | undefined;
+
+    // Phase 18O: Signed evidence is REQUIRED (not just in production).
+    // Only FORGE_DEV_INSECURE_MODE=true bypasses this for isolated local dev.
+    const devInsecureMode = process.env.FORGE_DEV_INSECURE_MODE === "true";
+
+    if (!evidenceSignature || !evidenceHash) {
+      if (devInsecureMode) {
+        // Explicitly opt-in insecure mode for isolated local development only.
+        console.warn("[submit-evidence] FORGE_DEV_INSECURE_MODE=true — accepting unsigned evidence");
+      } else {
+        return NextResponse.json({
+          error: "REJECTED: Evidence signature required. The worker must sign evidence with its Ed25519 private key. Set FORGE_DEV_INSECURE_MODE=true only for isolated local development.",
+        }, { status: 403 });
+      }
+    }
 
     if (evidenceSignature && evidenceHash) {
       // Resolve the worker's public key from WorkerRegistry.
@@ -129,14 +146,34 @@ export async function POST(req: Request) {
         }, { status: 403 });
       }
 
-      // Recompute the evidence hash from the evidence fields (not including the signature itself).
+      // Phase 18O: Verify that the signed execution identity matches the authenticated token.
+      // This prevents evidence replay across different executions.
+      if (signedExecutionId !== token.executionId) {
+        return NextResponse.json({
+          error: "REJECTED: Signed executionId does not match authenticated token. Evidence replay across executions is not permitted.",
+        }, { status: 403 });
+      }
+      if (signedLeaseId !== token.leaseId) {
+        return NextResponse.json({
+          error: "REJECTED: Signed leaseId does not match authenticated token. Evidence replay with a different lease is not permitted.",
+        }, { status: 403 });
+      }
+
+      // Phase 18O: Recompute the evidence hash from the ENVELOPE (evidence + identity).
+      // The signature covers both the evidence fields AND the execution identity.
       const evidenceFields = { commitSha, pushedToRemote, testResults, guardianResult, reviewResult, filesChanged, implementationLog };
-      const canonical = JSON.stringify(evidenceFields, Object.keys(evidenceFields).sort());
+      const envelope = {
+        evidence: evidenceFields,
+        executionId: token.executionId,
+        leaseId: token.leaseId,
+        workerId: token.workerId,
+      };
+      const canonical = JSON.stringify(envelope, Object.keys(envelope).sort());
       const expectedHash = createHash("sha256").update(canonical).digest("hex");
 
       if (expectedHash !== evidenceHash) {
         return NextResponse.json({
-          error: "REJECTED: Evidence hash mismatch. The signed hash does not match the submitted evidence.",
+          error: "REJECTED: Evidence hash mismatch. The signed hash does not match the evidence + execution identity.",
         }, { status: 403 });
       }
 
@@ -155,13 +192,7 @@ export async function POST(req: Request) {
           error: "REJECTED: Evidence signature verification FAILED. The evidence must be signed by the worker's Ed25519 private key.",
         }, { status: 403 });
       }
-    } else if (process.env.NODE_ENV === "production") {
-      // Phase 18N: In production, signed evidence is REQUIRED.
-      return NextResponse.json({
-        error: "REJECTED: Evidence signature required in production. The worker must sign evidence with its Ed25519 private key.",
-      }, { status: 403 });
     }
-    // In development, unsigned evidence is still accepted for backward compatibility.
 
     // P15B: Remote verification uses DERIVED expected values, not worker-supplied.
     let remoteCommitVerified = false;

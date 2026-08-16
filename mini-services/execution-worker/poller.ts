@@ -134,16 +134,17 @@ function loadOrGenerateWorkerKeypair(): void {
     }
 
     try {
-      // Phase 18N: Open with O_NOFOLLOW to prevent TOCTOU symlink race.
-      // readFileSync after openSync with O_NOFOLLOW ensures we read the actual file,
-      // not a symlink target that could be swapped between statSync and readFileSync.
-      const fd = openSync(WORKER_KEY_PATH, "r", 0o600);
-      // O_NOFOLLOW is set via the flags — Node's openSync doesn't directly support
-      // O_NOFOLLOW, so we rely on the statSync.isFile() check above + the fact that
-      // we're in a validated 0o700 directory. In a production system, this would
-      // use fs.openSync with O_NOFOLLOW flag directly.
+      // Phase 18O: Open with O_NOFOLLOW to prevent TOCTOU symlink race.
+      // Use numeric flags: O_RDONLY (0) | O_NOFOLLOW (0o400000 on Linux).
+      // Then read FROM the fd — not from the path again — to eliminate the race.
+      const O_NOFOLLOW = 0o400000; // Linux: prevent following symlinks on open.
+      const fd = openSync(WORKER_KEY_PATH, O_NOFOLLOW, 0o600);
+      // Read from the file descriptor, NOT from the path.
+      // This ensures we read the exact object that was opened, not a potentially
+      // swapped path target between statSync and readFileSync.
+      const fileContent = readFileSync(fd, "utf-8");
       closeSync(fd);
-      const keyData = JSON.parse(readFileSync(WORKER_KEY_PATH, "utf-8"));
+      const keyData = JSON.parse(fileContent);
       if (!keyData.privateKeyPem || !keyData.publicKeyPem) {
         throw new Error("Key file is missing required fields (privateKeyPem or publicKeyPem)");
       }
@@ -231,29 +232,53 @@ async function getJobSpec(executionId: string): Promise<any> {
   return apiCall("/api/worker/job-spec", "POST", { executionId }, executionToken!);
 }
 
-// Phase 18N: Worker signs task evidence with Ed25519 private key.
-// The evidence data is canonicalized, hashed, and signed.
-// The control plane verifies the signature with the worker's registered public key.
-function signTaskEvidence(data: any): { signature: string; evidenceHash: string } | null {
+// Phase 18O: Worker signs task evidence with Ed25519 private key.
+// The signature binds BOTH the evidence AND the execution identity
+// (workerId, executionId, leaseId) into the signed commitment.
+// This prevents evidence replay across different executions.
+function signTaskEvidence(data: any, executionContext: { workerId: string; executionId: string; leaseId: string }): { signature: string; evidenceHash: string } | null {
   if (!workerPrivateKeyPem) {
     console.warn("[worker] No Ed25519 private key — evidence will be unsigned (development mode)");
     return null;
   }
-  // Canonical serialization (sorted keys).
-  const canonical = JSON.stringify(data, Object.keys(data).sort());
+  // Phase 18O: The signed envelope includes execution identity + evidence.
+  // This binds the evidence to a specific execution, preventing replay.
+  const envelope = {
+    evidence: data,
+    executionId: executionContext.executionId,
+    leaseId: executionContext.leaseId,
+    workerId: executionContext.workerId,
+  };
+  const canonical = JSON.stringify(envelope, Object.keys(envelope).sort());
   const evidenceHash = createHash("sha256").update(canonical).digest("hex");
   const signature = cryptoSign(null, Buffer.from(evidenceHash, "utf-8"), workerPrivateKeyPem).toString("hex");
   return { signature, evidenceHash };
 }
 
 async function submitEvidence(data: any): Promise<any> {
-  // Phase 18N: Sign the evidence before submission.
-  const sig = signTaskEvidence(data);
+  // Phase 18O: Sign the evidence WITH execution identity binding.
+  // Extract execution identity from the execution token (parsed from the HMAC token).
+  // The token contains executionId and leaseId; workerId is WORKER_ID.
+  let executionId = "";
+  let leaseId = "";
+  // Parse the execution token to extract executionId and leaseId.
+  if (executionToken) {
+    try {
+      const tokenStr = executionToken.replace("Bearer ", "");
+      const token = JSON.parse(Buffer.from(tokenStr, "base64").toString("utf-8"));
+      executionId = token.executionId || "";
+      leaseId = token.leaseId || "";
+    } catch {}
+  }
+
+  const sig = signTaskEvidence(data, { workerId: WORKER_ID, executionId, leaseId });
   const body: any = { ...data };
   if (sig) {
     body.evidenceSignature = sig.signature;
     body.evidenceHash = sig.evidenceHash;
     body.signedBy = WORKER_ID;
+    body.signedExecutionId = executionId;
+    body.signedLeaseId = leaseId;
   }
   return apiCall("/api/worker/submit-evidence", "POST", body, executionToken!);
 }
