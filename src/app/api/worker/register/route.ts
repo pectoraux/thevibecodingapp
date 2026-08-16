@@ -46,12 +46,16 @@ export async function POST(req: Request) {
       select: { publicKeyPem: true },
     });
 
-    if (existing && existing.publicKeyPem && publicKeyPem) {
-      // Worker exists AND has a key AND is trying to set a new one → REJECT.
+    // Phase 18L: Allow re-registration with the SAME key (worker restart).
+    // Only reject if the key is DIFFERENT (attempted replacement).
+    if (existing && existing.publicKeyPem && publicKeyPem && publicKeyPem !== existing.publicKeyPem) {
+      // Worker exists, has a DIFFERENT key, and is trying to set a new one → REJECT.
       return NextResponse.json({
         error: "REJECTED: Worker already has a registered signing key. Key rotation requires /api/worker/rotate-key with authorization from the current key or an admin.",
       }, { status: 403 });
     }
+    // If the key is the SAME (re-registration after restart), allow it.
+    // The update block below won't overwrite the key (it's already the same).
 
     const worker = await db.workerRegistry.upsert({
       where: { workerId },

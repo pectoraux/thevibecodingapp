@@ -55,16 +55,52 @@ function createRegToken(): string {
   return `Bearer ${Buffer.from(JSON.stringify({ ...payload, signature: signToken(payload) })).toString("base64")}`;
 }
 
-// Phase 18K: Worker Ed25519 keypair for evidence signing.
+// Phase 18L: Worker Ed25519 keypair for evidence signing — DURABLE across restarts.
+// The key is persisted to disk so the worker identity survives process restarts.
+// Without this, every restart generates a new key, but the control plane treats
+// the key as immutable — the worker would be permanently locked out after restart.
 import { generateKeyPairSync } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
 let workerPrivateKeyPem: string | null = null;
 let workerPublicKeyPem: string | null = null;
 
-function generateWorkerKeypair(): void {
+// Deterministic key file path based on worker ID.
+const WORKER_KEY_DIR = process.env.FORGE_WORKER_KEY_DIR || "/tmp/forge-worker-keys";
+const WORKER_KEY_PATH = `${WORKER_KEY_DIR}/${WORKER_ID}.pem`;
+
+function loadOrGenerateWorkerKeypair(): void {
+  // Phase 18L: Try to load existing key from disk first.
+  if (existsSync(WORKER_KEY_PATH)) {
+    try {
+      const keyData = JSON.parse(readFileSync(WORKER_KEY_PATH, "utf-8"));
+      workerPrivateKeyPem = keyData.privateKeyPem;
+      workerPublicKeyPem = keyData.publicKeyPem;
+      console.log(`[worker] Loaded existing Ed25519 keypair from ${WORKER_KEY_PATH}`);
+      return;
+    } catch (err: any) {
+      console.warn(`[worker] Failed to load keypair from ${WORKER_KEY_PATH}: ${err.message} — generating new key`);
+    }
+  }
+
+  // No existing key (or load failed) — generate a new one and persist it.
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   workerPrivateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   workerPublicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
-  console.log(`[worker] Generated Ed25519 keypair for evidence signing`);
+
+  // Persist to disk so the key survives restarts.
+  try {
+    mkdirSync(dirname(WORKER_KEY_PATH), { recursive: true });
+    writeFileSync(WORKER_KEY_PATH, JSON.stringify({
+      privateKeyPem: workerPrivateKeyPem,
+      publicKeyPem: workerPublicKeyPem,
+    }, null, 2), { mode: 0o600 }); // Owner read/write only.
+    console.log(`[worker] Generated and persisted new Ed25519 keypair to ${WORKER_KEY_PATH}`);
+  } catch (err: any) {
+    console.error(`[worker] WARNING: Failed to persist keypair to ${WORKER_KEY_PATH}: ${err.message}`);
+    console.error(`[worker] Key will be ephemeral — worker identity will NOT survive restart.`);
+  }
 }
 
 let sessionToken: string | null = null;
@@ -88,13 +124,13 @@ async function apiCall(path: string, method: string, body?: any, token?: string)
 
 // --- Worker API functions ---
 async function register(): Promise<void> {
-  // Phase 18K: Generate Ed25519 keypair and register publicKeyPem.
-  generateWorkerKeypair();
+  // Phase 18L: Load or generate DURABLE Ed25519 keypair (survives restart).
+  loadOrGenerateWorkerKeypair();
 
   const result = await apiCall("/api/worker/register", "POST", {
     workerVersion: WORKER_VERSION, protocolVersion: PROTOCOL_VERSION,
     capabilities: ["node", "git", "test", "build"], maxConcurrency: 1,
-    publicKeyPem: workerPublicKeyPem, // Phase 18K: Register signing key.
+    publicKeyPem: workerPublicKeyPem, // Phase 18L: Same key on every restart.
   }, createRegToken());
   sessionToken = result.sessionToken;
   console.log(`[worker] Registered (with Ed25519 public key)`);
