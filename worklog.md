@@ -3094,3 +3094,330 @@ are GONE. The worker has zero access to the launcher key. Same state as
 - Wrote agent-ctx record at /home/z/my-project/agent-ctx/18X-B-control-plane-capability.md.
 
 Stage Status: ✅ COMPLETE
+
+---
+
+## Task 18X-C — E2E Integration Test, Full Suite, Commit, Push (Agent: e2e-commit)
+
+**Phase:** 18X-C (the final piece — definitive E2E acceptance test for 18X)
+**Repo HEAD:** 5735b1c (Phase 18W) + uncommitted 18X-A + 18X-B → 7b4123b (this commit)
+**Date:** 2025-08-17
+
+### The task
+
+18X-A built the substrate supervisor (port 3004), the in-memory launcher
+key, the anonymous fd, the `ExecutionCapability` module, and 15 key-
+isolation tests. 18X-B wired the job-spec endpoint to issue signed
+capabilities, the worker to relay them, the supervisor to verify them,
+the submit-runtime-evidence route to audit them, and added 14 capability
+tests. Both left the changes UNCOMMITTED on top of `5735b1c`.
+
+18X-C is the FINAL piece — the DEFINITIVE end-to-end acceptance test
+that proves the P0 is closed across the WHOLE path, then runs the full
+suite, lints, commits, pushes, and verifies via a clean clone.
+
+### What was created
+
+**`tests/e2e-launcher-key-isolation-invariants.ts`** (NEW, ~640 lines, 15 tests)
+
+The DEFINITIVE E2E acceptance test for Phase 18X. Exercises the FULL
+real path:
+  - control-plane Ed25519 signs an ExecutionCapability (binds executionId,
+    nonce, leaseId, repoSha, planHash, archHash, expiresAt).
+  - worker relays the capability to the supervisor (worker has ONLY its
+    own worker key, NEVER the launcher key).
+  - supervisor verifies the capability signature, runs `runInSubstrate`
+    with the launcher key from MEMORY (file deleted at startup).
+  - launcher reads the key from an anonymous fd (stdio[3]), observes
+    kernel facts, signs `canonicalFactsJson` with the launcher Ed25519
+    key.
+  - worker receives the signed attestation (NEVER the launcher key),
+    wraps it in an envelope, signs the envelope with the worker key.
+  - control plane verifies BOTH signatures + nonce + executionId binding.
+
+The 15 tests:
+  1. FULL E2E — control-plane → worker → supervisor → substrate →
+     attestation → verification (all signatures + binding + substrate
+     facts verified; envelope.passed=true; att.executionId/nonce match
+     the capability).
+  2. Worker CANNOT forge the launcher signature (sign
+     canonicalFactsJson with the WORKER's private key — launcher key ≠
+     worker key → rejected). This is the P0 closure proof.
+  3. Worker env has NO launcher key access (source inspection — poller,
+     verify.ts, start-worker.sh, runtime-execution-contract.ts,
+     substrate-namespace.ts: zero `launcherKeyFile`, zero
+     `FORGE_LAUNCHER_KEY_FILE` in code, zero `PRIVATE KEY` strings,
+     `runInSubstrate` takes `launcherKeyPem` string NOT a file path).
+  4. Launcher key file is DELETED at supervisor startup (file gone by
+     the time /health returns 200 — key only in supervisor memory).
+  5. Supervisor NEVER returns the launcher key in /execute response
+     (no "PRIVATE KEY" string, no launcher key PEM prefix; attestation +
+     launcherSignature present, but NOT the key PEM).
+  6. Supervisor rejects invalid capability (wrong signature) → HTTP 403
+     + error mentions signature/invalid/capability.
+  7. Supervisor rejects expired capability → HTTP 403 + error mentions
+     expired/expiry.
+  8. Supervisor rejects request with NO capability → HTTP 403 or 400.
+  9. Capability binds executionId + nonce (attestation matches the
+     CAPABILITY's values, not any value in the request body — worker
+     cannot override).
+  10. Attestation output binding (`workloadStdoutHash` = SHA-256 of
+      ACTUAL stdout from `/bin/echo E2E_OUTPUT_BINDING`; launcher signed
+      it; `workloadExitCode=0`).
+  11. Tampered attestation breaks the worker envelope signature (change
+      `substrateAttestation.workloadExitCode` from 0 to 1 without
+      re-signing → `verifyEvidenceEnvelope` returns false — the
+      attestation is cryptographically bound into the worker's signed
+      envelope).
+  12. Real substrate isolation in the E2E path (namespace inodes differ
+      from host's `/proc/self/ns/user`; `seccompMode=2`;
+      `seccompProfileHash === REQUIRED_SECCOMP_PROFILE_HASH`;
+      `networkMode === "hermetic-loopback"`).
+  13. Failed app still produces a valid (trusted) attestation
+      (`envelope.passed === false` — workload crashed; attestation
+      non-null + trusted — the substrate ran correctly, just the app
+      failed).
+  14. Production predicate requires trusted substrate
+      (`canReachProductionReadyWithRuntime` with
+      `executionEnvironmentSandboxed: false` → false; with
+      `executionEnvironmentSandboxed: true` +
+      `substrateAttestationVerified: true` + all other true → true;
+      `getProductionReadinessFailureReason` mentions "substrate" /
+      "attestation" / "sandboxed" / "unsandboxed").
+  15. Capability is execution-bound (sign cap-A for exec-A/nonce-A,
+      sign cap-B for exec-B/nonce-B; run substrate with cap-A; verify
+      attestation against cap-B's nonce/executionId → INVALID — anti-
+      replay across executions).
+
+### Test infrastructure
+
+- Reuses `tests/lib/test-supervisor.ts` (from 18X-A) — starts the
+  supervisor as a child process with the launcher key file + control-
+  plane public key. The supervisor reads + DELETES the key file at
+  startup. The test-supervisor helper returns `signCapability` bound to
+  the control-plane private key, so each test can sign a fresh
+  capability without re-deriving the signing logic.
+- Starts ONE supervisor for the whole suite (port 3004), stopped in the
+  test's final step. Each test makes its own HTTP requests or calls
+  `executeRuntimeVerificationInWorker` as appropriate.
+- For test 1 + test 13 (the full-pipeline tests), creates a real Node.js
+  HTTP server app in a real git repo (with a real SHA), runs
+  `executeRuntimeVerificationInWorker` end-to-end.
+- For tests 5, 6, 7, 8, 9, 10, 15 (the supervisor-rejection + binding
+  tests), POSTs directly to the supervisor's `/execute` endpoint with
+  crafted capabilities.
+- For test 3 (source inspection), reads the worker + contract +
+  substrate source files, strips comments, asserts the absence of
+  `launcherKeyFile`, `FORGE_LAUNCHER_KEY_FILE`, `PRIVATE KEY`, and the
+  presence of `launcherKeyPem` in `runInSubstrate`'s signature.
+- For test 12 (real isolation), reads `/proc/self/ns/user` via
+  `readlinkSync` and asserts the attestation's `userNamespaceInode`
+  differs from the host's.
+
+### Test results
+
+- **New E2E suite (`e2e-launcher-key-isolation-invariants`):** 15
+  passed, 0 failed.
+- **Full non-integration suite (27 files):** 660 passed, 0 failed.
+  - Pre-18X baseline (after 18X-A + 18X-B): 645 passed.
+  - 18X-C added: 15 NEW tests in `e2e-launcher-key-isolation-invariants`.
+  - 0 regressions.
+- **Lint:** 1 error + 12 warnings, ALL PRE-EXISTING (documented in
+  18W-C, 18X-A, 18X-B worklogs — `src/lib/evidence.ts:303` require()
+  import + unused eslint-disable directives in pre-existing files).
+  - 0 NEW errors/warnings in 18X-C's touched file
+    (`tests/e2e-launcher-key-isolation-invariants.ts`).
+  - 0 NEW errors/warnings in 18X-A's + 18X-B's files (already verified
+    in their respective worklogs; re-verified here).
+
+### Smoke test (clean clone verification)
+
+- Cloned the remote into `/tmp/forge-clean-clone`.
+- `git log --oneline -1` shows `7b4123b Phase 18X: launcher key
+  isolation — ...`.
+- `bun install` succeeded.
+- `bun run tests/e2e-launcher-key-isolation-invariants.ts` → 15 passed,
+  0 failed.
+- Clean clone HEAD matches local HEAD matches `origin/main` (triple-SHA
+  verification):
+
+  ```
+  local HEAD:        7b4123ba5efeebd134b54a59acc8d395aa3e4dae
+  origin/main:       7b4123ba5efeebd134b54a59acc8d395aa3e4dae
+  clean-clone HEAD:  7b4123ba5efeebd134b54a59acc8d395aa3e4dae
+  ```
+
+### Honest final assessment — does 18X close the P0?
+
+**The P0:** the worker process had access to the launcher private key
+(via `FORGE_LAUNCHER_KEY_FILE` env var → `launcherKeyFile` parameter →
+file path → `fopen()` in the launcher). A compromised worker could read
+the key and forge the launcher signature, collapsing the two-signature
+trust model to one signature (the worker's).
+
+**What 18X closes (PROVEN by 18X-A + 18X-B + 18X-C):**
+
+1. **Worker env isolation.** The worker has ZERO access to the launcher
+   private key:
+   - `mini-services/execution-worker/poller.ts`: no `FORGE_LAUNCHER_KEY_FILE`
+     read (only in comments). Proven by Test 3.
+   - `mini-services/execution-worker/runtime/verify.ts`: no
+     `launcherKeyFile` parameter, no `readFileSync` for a launcher key,
+     no `PRIVATE KEY` string in code. Proven by Test 3.
+   - `mini-services/execution-worker/start-worker.sh`: no
+     `FORGE_LAUNCHER_KEY_FILE=` assignment (only in comments). Proven by
+     Test 3.
+   - `src/lib/runtime-execution-contract.ts`: `RuntimeExecutionPolicy`
+     type has NO `launcherKeyFile` field. Proven by Test 3.
+   - `src/lib/substrate-namespace.ts`: `runInSubstrate` takes
+     `launcherKeyPem: string` (PEM), NOT `launcherKeyFile: string`
+     (path). Proven by Test 3.
+
+2. **Launcher key file deleted at supervisor startup.** The supervisor
+   (`mini-services/substrate-supervisor/index.ts`) reads
+   `FORGE_LAUNCHER_KEY_FILE` into memory, then `unlinkSync()`s the file.
+   If the unlink fails, the supervisor FATAL-exits (fail-closed). Proven
+   by Test 4 — `existsSync(launcherKeyFilePath)` returns false after
+   `/health` returns 200.
+
+3. **Supervisor never returns the launcher key.** The supervisor's
+   `/execute` response includes `{ attestation, result }` — the
+   attestation contains `launcherSignature` (the Ed25519 signature over
+   `canonicalFactsJson`), NOT the launcher key PEM. Proven by Test 5 —
+   the response body contains no "PRIVATE KEY" string and no launcher
+   key PEM prefix.
+
+4. **Launcher reads the key from an anonymous fd, not a file path.**
+   `runInSubstrate` writes the PEM to an unlinked temp file, opens it
+   for reading (giving a fresh fd), `unlinkSync()`s the file (so the
+   name is gone but the inode+data are alive), and passes the fd to the
+   launcher as `stdio[3]`. The launcher (`forge-launcher.c`) reads the
+   PEM via `fdopen(key_fd)` + `BIO_new_fp(kf, BIO_CLOSE)`, then closes
+   the fd. The supervisor closes the fd in a `finally` block (so even if
+   `runInSubstrate` throws, the fd is closed). The launcher key PEM is
+   NEVER on disk in a named form accessible to the worker process.
+   Proven by 18X-A's Tests 13 + 14 (source inspection of
+   `substrate-namespace.ts` and `forge-launcher.c`).
+
+5. **Capability is control-plane-signed and verified by the supervisor
+   BEFORE running the substrate.** The supervisor calls
+   `verifyExecutionCapability(cap, FORGE_CONTROL_PLANE_PUBLIC_KEY)`
+   first — if the signature is invalid, expired, or missing, it returns
+   HTTP 403 and never runs the substrate. Proven by Tests 6, 7, 8.
+
+6. **Capability binds executionId + nonce (anti-replay across
+   executions).** The supervisor passes `cap.nonce` and `cap.executionId`
+   to `runInSubstrate` (NOT any value from the request body). The
+   launcher signs `canonicalFactsJson` which includes the nonce +
+   executionId. The control plane verifies the attestation's nonce +
+   executionId against the EXPECTED values (issued at job-spec time). An
+   attestation from execution A CANNOT be replayed for execution B.
+   Proven by Tests 9 + 15.
+
+7. **Attestation output binding.** The launcher observes the workload's
+   actual stdout/stderr/exit code, includes their SHA-256 hashes in
+   `canonicalFactsJson`, and signs with the launcher key. The control
+   plane can verify the launcher observed the ACTUAL output, not worker-
+   claimed output. Proven by Test 10.
+
+8. **Attestation is Ed25519-bound into the worker's envelope.** The
+   worker's envelope signature covers `envelopeHash`, which includes
+   `substrateAttestation` (the full attestation object). Tampering with
+   any attestation field (without recomputing + re-signing) breaks
+   `verifyEvidenceEnvelope`. Proven by Test 11.
+
+9. **Real substrate isolation.** The E2E path actually runs inside the
+   real substrate (linux namespace + seccomp BPF + rlimits + cap-drop),
+   not a mock. The attestation's `userNamespaceInode` differs from the
+   host's `/proc/self/ns/user`; `seccompMode === 2`;
+   `seccompProfileHash === REQUIRED_SECCOMP_PROFILE_HASH`;
+   `networkMode === "hermetic-loopback"`. Proven by Test 12.
+
+10. **Failed workloads still produce valid attestations.** A crashed
+    workload does NOT invalidate the substrate attestation — the
+    substrate ran correctly, the workload just happened to fail. The
+    control plane can distinguish "substrate ran + workload failed"
+    from "substrate didn't run". Proven by Test 13.
+
+11. **Production gate requires trusted substrate.**
+    `canReachProductionReadyWithRuntime` returns false unless
+    `executionEnvironmentSandboxed === true` AND
+    `substrateAttestationVerified === true` (plus all the other
+    conditions). The failure reason mentions "substrate" / "attestation"
+    / "sandboxed" / "unsandboxed". Proven by Test 14.
+
+**What 18X does NOT close (residual — documented honestly):**
+
+1. **Root-compromised supervisor host.** A root compromise can `gcore`
+   the supervisor process, scan `/proc/<supervisor-pid>/fd/3` (while
+   the fd is open during a substrate run), or `ptrace` the supervisor.
+   The launcher key is in the supervisor's process memory; a root
+   attacker on the same host can extract it. Full closure requires
+   hardware attestation (TPM/SGX/SEV-SNP) — out of scope for Phase 18X.
+   **Mitigation:** dedicated host for the supervisor, no SSH for
+   workers, no shared filesystem, `PR_SET_DUMPABLE=0`, hardened kernel.
+
+2. **Co-located worker + supervisor.** In the current deployment model,
+   both run on the same host. A root compromise of the host compromises
+   both. The supervisor provides isolation against a COMPROMISED WORKER
+   KEY (the worker can't forge the launcher signature), NOT against a
+   compromised host. **Mitigation:** separate hosts in production.
+
+3. **Capability replay within the 5-minute expiry window.** The
+   supervisor does not track a replay cache. Bounded by `expiresAt` +
+   nonce/executionId binding — the control plane can detect a replayed
+   attestation at submission time via the nonce check (the nonce is
+   stored per-execution). **Mitigation:** supervisor-side replay cache
+   (TTL = expiry window). Tracked as a follow-up.
+
+4. **In-process runtime-executor.ts** (NOT the worker poller) still
+   reads `FORGE_LAUNCHER_KEY_FILE` from env directly (the control plane
+   is trusted — it has the launcher key file). For full consistency, it
+   should also delegate to the supervisor. Tracked as a follow-up from
+   18X-A. This is the control plane's in-process path, not the worker's
+   — the worker's path is fully closed.
+
+5. **DB-dependent audit path not directly testable in sandbox.** The
+   job-spec route's HTTP path requires a live Next.js server + PostgreSQL.
+   The 18X-C test exercises the signing logic, supervisor acceptance,
+   and the full E2E path directly. The route's source is inspected (in
+   18X-B's Test 11) to verify it wires the signing path correctly. The
+   DB write is best-effort (logged on failure) — the supervisor-side
+   check is authoritative.
+
+**Bottom line:** the P0 the user identified — "the worker had access to
+the launcher private key" — is CLOSED. A compromised worker key alone
+is NOW useless for forging substrate attestations:
+  - The worker cannot sign the launcher attestation (different key, the
+    worker doesn't have it).
+  - The worker cannot read the launcher key (not in env, not on disk,
+    not in the worker's process memory — only in the supervisor's
+    memory, which is a separate process).
+  - The worker cannot substitute values (the capability is control-
+    plane-signed; the supervisor uses the capability's nonce +
+    executionId, not the request body's).
+  - The worker cannot replay across executions (the attestation is
+    bound to a specific nonce + executionId via the launcher signature;
+    a different execution has a different nonce + executionId).
+
+The residual (root compromise of the supervisor host) is an inherent
+limitation of process-level isolation without hardware attestation. It
+is documented honestly in the supervisor's source, the worklog, and the
+commit message. Full closure (TPM/SGX/SEV-SNP) is out of scope for
+Phase 18X.
+
+### Stage summary
+
+- The DEFINITIVE E2E acceptance test for Phase 18X is committed:
+  `tests/e2e-launcher-key-isolation-invariants.ts` (15 tests, all pass).
+- The full non-integration suite is GREEN: 660 passed, 0 failed (across
+  27 files).
+- Lint is unchanged: 1 pre-existing error + 12 pre-existing warnings,
+  0 NEW errors/warnings in any 18X file.
+- The commit is pushed to `origin/main`:
+  `7b4123ba5efeebd134b54a59acc8d395aa3e4dae`.
+- A clean clone of the remote passes the E2E test (15 passed, 0 failed).
+- Triple-SHA verification: local HEAD == origin/main == clean-clone HEAD.
+- Wrote agent-ctx record at `/home/z/my-project/agent-ctx/18X-C-e2e-commit.md`.
+
+Stage Status: ✅ COMPLETE
