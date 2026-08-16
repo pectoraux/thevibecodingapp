@@ -382,11 +382,13 @@ async function triggerSchedulerTick(): Promise<void> {
 // 3004) which holds the launcher key IN MEMORY (file deleted at startup).
 // The worker needs:
 //   - SUBSTRATE_SUPERVISOR_URL (default http://localhost:3004) — where to
-//     POST { capability, workload, repoPath }.
+//     POST { capability, repoPath } (Phase 18Y — NO workload field).
 //   - The control plane's signed ExecutionCapability (carrying nonce,
-//     executionId, leaseId, repoSha, planHash, archHash, expiresAt).
+//     executionId, leaseId, repoSha, planHash, archHash, workloadHash,
+//     runtimePlan (the FULL plan), expiresAt).
 // The worker NEVER sees the launcher key file path, content, or any env
-// var pointing to it.
+// var pointing to it. The worker NEVER supplies the workload — the
+// supervisor DERIVES it from cap.runtimePlan.
 const SUBSTRATE_SUPERVISOR_URL =
   process.env.SUBSTRATE_SUPERVISOR_URL || "http://localhost:3004";
 

@@ -45,6 +45,10 @@ import {
   verifyEvidenceEnvelope,
   type ExecutionEvidenceEnvelope,
 } from "@/lib/runtime-execution-contract";
+import {
+  deriveWorkloadFromPlan,
+  computeWorkloadHash,
+} from "@/lib/execution-capability";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
 
 // ===========================================================================
@@ -196,6 +200,8 @@ async function runVerification(opts: {
         runtimePlanHash: "test-plan-hash",
         architectureHash: null,
         expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+        runtimePlan: plan as unknown as Record<string, unknown>,
+        workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
       });
   const envelope = await executeRuntimeVerificationInWorker({
     executionId,
@@ -458,6 +464,8 @@ console.log(`[wiring-test] Supervisor started at ${SUPERVISOR.url} (launcher key
     runtimePlanHash: "test-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const envelope = await executeRuntimeVerificationInWorker({
     executionId,

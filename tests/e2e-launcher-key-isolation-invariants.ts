@@ -58,6 +58,8 @@ import {
 import {
   signExecutionCapability,
   verifyExecutionCapability,
+  deriveWorkloadFromPlan,
+  computeWorkloadHash,
   type ExecutionCapability,
   type ExecutionCapabilityInput,
 } from "@/lib/execution-capability";
@@ -77,6 +79,7 @@ import {
 import { getHostNamespaceInodes } from "@/lib/substrate-namespace";
 import { executeRuntimeVerificationInWorker, generateSubstrateNonce } from "../mini-services/execution-worker/runtime/verify.js";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
+import { setupTestRepo as setupTestRepoHelper, setupTestWorkspace, makeTestPlan } from "./lib/test-capability.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -119,31 +122,11 @@ const TEST_APP_DIR = "/tmp/forge-e2e-launcher-iso-test-app";
 const CRASH_APP_DIR = "/tmp/forge-e2e-launcher-iso-crash-app";
 
 function setupTestApp(): string {
-  rmSync(TEST_APP_DIR, { recursive: true, force: true });
-  mkdirSync(TEST_APP_DIR, { recursive: true });
-  const serverJs = `const http = require("http");
-const server = http.createServer((req, res) => {
-  if (req.url === "/health") { res.writeHead(200); res.end("OK"); return; }
-  res.writeHead(404); res.end("Not found");
-});
-server.listen(parseInt(process.env.PORT || "3000"), "127.0.0.1", () => {
-  console.log("SERVER_LISTENING");
-});
-`;
-  writeFileSync(join(TEST_APP_DIR, "server.js"), serverJs);
-  writeFileSync(join(TEST_APP_DIR, "package.json"), JSON.stringify({
-    name: "forge-e2e-launcher-iso-app",
-    version: "1.0.0",
-    scripts: { start: "node server.js" },
-  }, null, 2));
-  execFileSync("git", ["init"], { cwd: TEST_APP_DIR, shell: false });
-  execFileSync("git", ["config", "user.email", "test@forge"], { cwd: TEST_APP_DIR, shell: false });
-  execFileSync("git", ["config", "user.name", "Test"], { cwd: TEST_APP_DIR, shell: false });
-  execFileSync("git", ["add", "."], { cwd: TEST_APP_DIR, shell: false });
-  execFileSync("git", ["commit", "-m", "init"], { cwd: TEST_APP_DIR, shell: false });
-  return execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: TEST_APP_DIR, encoding: "utf-8", shell: false,
-  }).trim();
+  // Phase 18Y: setupTestApp returns the SHA only (the caller uses TEST_APP_DIR
+  // as both the repoPath and the repositoryUrl). This is used by tests that
+  // call executeRuntimeVerificationInWorker (which clones TEST_APP_DIR into
+  // its own workspace, so the workspace/repo layout is correct).
+  return setupTestRepoHelper(TEST_APP_DIR);
 }
 
 function setupCrashingApp(): string {
@@ -168,28 +151,7 @@ function setupCrashingApp(): string {
 }
 
 function makePlan(port: number = 3000) {
-  return {
-    install: { binary: "/bin/echo", args: ["install-step"], timeoutMs: 10000 },
-    build: { binary: "/bin/echo", args: ["build-step"], timeoutMs: 10000 },
-    start: {
-      binary: "node",
-      args: ["/workspace/repo/server.js"],
-      env: { PORT: String(port) },
-      timeoutMs: 30000,
-    },
-    port,
-    startupTimeoutMs: 10000,
-    healthChecks: [
-      {
-        name: "health",
-        path: "/health",
-        expectedStatus: 200,
-        timeoutMs: 5000,
-        required: "required" as const,
-      },
-    ],
-    apiJourneys: [],
-  };
+  return makeTestPlan(port);
 }
 
 // ===========================================================================
@@ -231,6 +193,9 @@ async function runVerification(opts: {
   const nonce = opts.nonce || generateSubstrateNonce();
   const port = opts.port || 3000;
   const plan = makePlan(port);
+  // Phase 18Y: the capability MUST include the full runtimePlan +
+  // workloadHash. The supervisor DERIVES the workload from cap.runtimePlan
+  // and verifies workloadHash matches.
   const capability = SUPERVISOR.signCapability({
     executionId,
     nonce,
@@ -239,6 +204,8 @@ async function runVerification(opts: {
     runtimePlanHash: "e2e-iso-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const envelope = await executeRuntimeVerificationInWorker({
     executionId,
@@ -497,33 +464,34 @@ let test1Capability: ExecutionCapability | null = null;
 // TEST 5 — Supervisor NEVER returns the launcher key
 // ===========================================================================
 //
-// POST /execute with a valid capability + workload. The response body must
-// NOT contain "PRIVATE KEY" (the launcher key PEM marker). The response must
-// contain an attestation with launcherSignature but NOT the launcher key PEM.
+// Phase 18Y: POST /execute with a valid capability + repoPath (NO workload
+// field — the supervisor derives it from cap.runtimePlan). The response
+// body must NOT contain "PRIVATE KEY" (the launcher key PEM marker). The
+// response must contain an attestation with launcherSignature but NOT the
+// launcher key PEM.
 
 {
+  const { repoPath, sha } = setupTestWorkspace("e2e-iso-5");
   const executionId = randomUUID();
   const nonce = randomUUID();
+  const plan = makePlan(3000);
   const cap = SUPERVISOR.signCapability({
     executionId,
     nonce,
     leaseId: "lease-1",
-    repositoryHeadSha: "deadbeef",
+    repositoryHeadSha: sha,
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const resp = await fetch(`${SUPERVISOR.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      workload: {
-        binary: "/bin/echo",
-        args: ["supervisor-never-returns-key"],
-        cwd: "/tmp",
-        timeoutMs: 15000,
-      },
+      repoPath,
     }),
   });
   const respText = await resp.text();
@@ -569,15 +537,19 @@ let test1Capability: ExecutionCapability | null = null;
   const otherPrivPem = otherKey.privateKey
     .export({ type: "pkcs8", format: "pem" })
     .toString();
+  const { repoPath, sha } = setupTestWorkspace("e2e-iso-6");
   const executionId = randomUUID();
   const nonce = randomUUID();
+  const plan = makePlan(3000);
   const capInput: ExecutionCapabilityInput = {
     executionId,
     nonce,
     leaseId: "lease-1",
-    repositoryHeadSha: "deadbeef",
+    repositoryHeadSha: sha,
     runtimePlanHash: "plan-hash",
     architectureHash: null,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
+    runtimePlan: plan as unknown as Record<string, unknown>,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
   };
   const forgedCap = signExecutionCapability(capInput, otherPrivPem);
@@ -586,12 +558,7 @@ let test1Capability: ExecutionCapability | null = null;
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: forgedCap,
-      workload: {
-        binary: "/bin/echo",
-        args: ["should-not-run-wrong-sig"],
-        cwd: "/tmp",
-        timeoutMs: 15000,
-      },
+      repoPath,
     }),
   });
   let detail = "";
@@ -618,28 +585,27 @@ let test1Capability: ExecutionCapability | null = null;
 // A capability whose expiresAt is in the past must be rejected.
 
 {
+  const { repoPath, sha } = setupTestWorkspace("e2e-iso-7");
   const executionId = randomUUID();
   const nonce = randomUUID();
+  const plan = makePlan(3000);
   const cap = SUPERVISOR.signCapability({
     executionId,
     nonce,
     leaseId: "lease-1",
-    repositoryHeadSha: "deadbeef",
+    repositoryHeadSha: sha,
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() - 60000).toISOString(), // EXPIRED 60s ago
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const resp = await fetch(`${SUPERVISOR.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      workload: {
-        binary: "/bin/echo",
-        args: ["should-not-run-expired"],
-        cwd: "/tmp",
-        timeoutMs: 15000,
-      },
+      repoPath,
     }),
   });
   let detail = "";
@@ -663,19 +629,17 @@ let test1Capability: ExecutionCapability | null = null;
 // ===========================================================================
 //
 // POST /execute without a `capability` field must be rejected.
+// Phase 18Y: the request body is { capability, repoPath } — no workload.
+// We POST { repoPath } only (no capability).
 
 {
+  const { repoPath } = setupTestWorkspace("e2e-iso-8");
   const resp = await fetch(`${SUPERVISOR.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      // No capability field.
-      workload: {
-        binary: "/bin/echo",
-        args: ["should-not-run-no-cap"],
-        cwd: "/tmp",
-        timeoutMs: 15000,
-      },
+      // No capability field. Phase 18Y: NO workload field either.
+      repoPath,
     }),
   });
   const ok = resp.status === 403 || resp.status === 400;
@@ -705,28 +669,27 @@ let test1Capability: ExecutionCapability | null = null;
 // submission time.)
 
 {
+  const { repoPath, sha } = setupTestWorkspace("e2e-iso-9");
   const executionId = randomUUID();
   const nonce = randomUUID();
+  const plan = makePlan(3000);
   const cap = SUPERVISOR.signCapability({
     executionId,
     nonce,
     leaseId: "lease-1",
-    repositoryHeadSha: "abc123-bound-sha",
+    repositoryHeadSha: sha,
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const resp = await fetch(`${SUPERVISOR.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      workload: {
-        binary: "/bin/echo",
-        args: ["capability-binding-check"],
-        cwd: "/tmp",
-        timeoutMs: 15000,
-      },
+      repoPath,
     }),
   });
   let detail = "";
@@ -757,40 +720,46 @@ let test1Capability: ExecutionCapability | null = null;
 // TEST 10 — Attestation output binding (launcher observed + signed the actual workload output)
 // ===========================================================================
 //
-// Run a workload that produces known output (/bin/echo E2E_OUTPUT_BINDING).
-// The launcher observes the workload's stdout + exit code, includes their
-// hashes in canonicalFactsJson, and signs with the launcher key. The control
-// plane can verify the launcher observed the ACTUAL output, not worker-claimed
-// output.
+// Phase 18Y: the workload is ALWAYS `node /workspace/orchestrator.js`. The
+// launcher observes the orchestrator's stdout + exit code, includes their
+// hashes in canonicalFactsJson, and signs with the launcher key. The
+// control plane can verify the launcher observed the ACTUAL output, not
+// worker-claimed output.
+//
+// We run a real test app (server.js listening on /health) via the standard
+// plan. The orchestrator's stdout is captured in `result.stdout`. The
+// attestation's workloadStdoutHash MUST equal SHA-256 of that stdout.
 
 {
+  const { repoPath, sha } = setupTestWorkspace("e2e-iso-10");
   const executionId = randomUUID();
   const nonce = randomUUID();
+  const plan = makePlan(3000);
   const cap = SUPERVISOR.signCapability({
     executionId,
     nonce,
     leaseId: "lease-1",
-    repositoryHeadSha: "deadbeef",
+    repositoryHeadSha: sha,
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const resp = await fetch(`${SUPERVISOR.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: cap,
-      workload: {
-        binary: "/bin/echo",
-        args: ["E2E_OUTPUT_BINDING"],
-        cwd: "/tmp",
-        timeoutMs: 15000,
-      },
+      repoPath,
     }),
   });
   const body = await resp.json() as { attestation?: SandboxAttestation; result?: { stdout?: string } };
   const att = body.attestation;
-  const expectedStdoutHash = sha256("E2E_OUTPUT_BINDING\n");
+  // The orchestrator's stdout is in result.stdout. The launcher observed
+  // that stdout and hashed it. Verify the hash matches.
+  const orchestratorStdout = body.result?.stdout ?? "";
+  const expectedStdoutHash = sha256(orchestratorStdout);
   const stdoutHashMatches = !!att && att.workloadStdoutHash === expectedStdoutHash;
   const exitCodeMatches = !!att && att.workloadExitCode === 0;
   // The launcher signature covers the workload output hash — verify it.
@@ -808,7 +777,7 @@ let test1Capability: ExecutionCapability | null = null;
     `actualStdoutHash=${att?.workloadStdoutHash ?? "(none)"} expected=${expectedStdoutHash} ` +
     `actualExitCode=${att?.workloadExitCode ?? "(none)"}`;
   record(
-    "Test 10: attestation output binding (workloadStdoutHash = SHA-256 of actual stdout; launcher signed it)",
+    "Test 10: attestation output binding (workloadStdoutHash = SHA-256 of orchestrator stdout; launcher signed it)",
     ok,
     details
   );
@@ -1007,27 +976,28 @@ let test1Capability: ExecutionCapability | null = null;
   const executionIdB = randomUUID();
   const nonceB = randomUUID();
 
+  // Phase 18Y: set up a real workspace + repo (the supervisor verifies git HEAD + clean tree).
+  const { repoPath, sha } = setupTestWorkspace("e2e-iso-15");
+  const plan = makePlan(3000);
+
   // Sign capability A and run the substrate.
   const capA = SUPERVISOR.signCapability({
     executionId: executionIdA,
     nonce: nonceA,
     leaseId: "lease-1",
-    repositoryHeadSha: "deadbeef",
+    repositoryHeadSha: sha,
     runtimePlanHash: "plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const resp = await fetch(`${SUPERVISOR.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: capA,
-      workload: {
-        binary: "/bin/echo",
-        args: ["replay-prevention-check"],
-        cwd: "/tmp",
-        timeoutMs: 15000,
-      },
+      repoPath,
     }),
   });
   const body = await resp.json() as { attestation?: SandboxAttestation };

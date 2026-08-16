@@ -46,10 +46,13 @@ import { verifyLauncherAttestation, generateLauncherKeyPair } from "@/lib/substr
 import {
   signExecutionCapability,
   verifyExecutionCapability,
+  deriveWorkloadFromPlan,
+  computeWorkloadHash,
   type ExecutionCapability,
   type ExecutionCapabilityInput,
 } from "@/lib/execution-capability";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
+import { setupTestWorkspace, makeTestPlan } from "./lib/test-capability.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -208,35 +211,35 @@ function readFile(path: string): string {
 // ===========================================================================
 // TEST 6 — Supervisor NEVER returns the launcher key in /execute response
 // ===========================================================================
-// POST /execute with a valid capability + workload. The response body must
-// NOT contain the string "PRIVATE KEY" (the launcher key PEM marker).
+// POST /execute with a valid capability + repoPath (Phase 18Y — NO workload
+// field; the supervisor derives it from cap.runtimePlan). The response body
+// must NOT contain the string "PRIVATE KEY" (the launcher key PEM marker).
 
 {
   let sup: TestSupervisor | null = null;
   try {
     sup = await startTestSupervisor();
+    const { repoPath, sha } = setupTestWorkspace("key-iso-6");
     const executionId = randomUUID();
     const nonce = randomUUID();
+    const plan = makeTestPlan(3000);
     const cap = sup.signCapability({
       executionId,
       nonce,
       leaseId: "lease-1",
-      repositoryHeadSha: "deadbeef",
+      repositoryHeadSha: sha,
       runtimePlanHash: "plan-hash",
       architectureHash: null,
       expiresAt: new Date(Date.now() + 60000).toISOString(),
+      runtimePlan: plan as unknown as Record<string, unknown>,
+      workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
     });
     const resp = await fetch(`${sup.url}/execute`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: cap,
-        workload: {
-          binary: "/bin/echo",
-          args: ["key-isolation-test"],
-          cwd: "/tmp",
-          timeoutMs: 15000,
-        },
+        repoPath,
       }),
     });
     const respText = await resp.text();
@@ -270,28 +273,27 @@ function readFile(path: string): string {
   let sup: TestSupervisor | null = null;
   try {
     sup = await startTestSupervisor();
+    const { repoPath, sha } = setupTestWorkspace("key-iso-7");
     const executionId = randomUUID();
     const nonce = randomUUID();
+    const plan = makeTestPlan(3000);
     const cap = sup.signCapability({
       executionId,
       nonce,
       leaseId: "lease-1",
-      repositoryHeadSha: "deadbeef",
+      repositoryHeadSha: sha,
       runtimePlanHash: "plan-hash",
       architectureHash: null,
       expiresAt: new Date(Date.now() + 60000).toISOString(),
+      runtimePlan: plan as unknown as Record<string, unknown>,
+      workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
     });
     const resp = await fetch(`${sup.url}/execute`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: cap,
-        workload: {
-          binary: "/bin/echo",
-          args: ["HELLO_FROM_SUPERVISOR"],
-          cwd: "/tmp",
-          timeoutMs: 15000,
-        },
+        repoPath,
       }),
     });
     const body = await resp.json() as { attestation: any; result: any };
@@ -321,6 +323,11 @@ function readFile(path: string): string {
 // A capability signed by a DIFFERENT key (not the control plane's) must be
 // rejected. The worker cannot forge a capability — it doesn't have the
 // control plane's private key.
+//
+// Phase 18Y: the supervisor's verification order is:
+//   1. validate body (capability + repoPath required, no workload field)
+//   2. verify cap signature + expiry → REJECTS here for test 8.
+//   (Steps 3+ don't run.)
 
 {
   let sup: TestSupervisor | null = null;
@@ -329,15 +336,19 @@ function readFile(path: string): string {
     // Sign the capability with a DIFFERENT key (not the control plane's).
     const otherKey = generateKeyPairSync("ed25519");
     const otherPrivPem = otherKey.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const { repoPath, sha } = setupTestWorkspace("key-iso-8");
     const executionId = randomUUID();
     const nonce = randomUUID();
+    const plan = makeTestPlan(3000);
     const capInput: ExecutionCapabilityInput = {
       executionId,
       nonce,
       leaseId: "lease-1",
-      repositoryHeadSha: "deadbeef",
+      repositoryHeadSha: sha,
       runtimePlanHash: "plan-hash",
       architectureHash: null,
+      workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
+      runtimePlan: plan as unknown as Record<string, unknown>,
       expiresAt: new Date(Date.now() + 60000).toISOString(),
     };
     const forgedCap = signExecutionCapability(capInput, otherPrivPem);
@@ -346,12 +357,7 @@ function readFile(path: string): string {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: forgedCap,
-        workload: {
-          binary: "/bin/echo",
-          args: ["should-not-run"],
-          cwd: "/tmp",
-          timeoutMs: 15000,
-        },
+        repoPath,
       }),
     });
     let detail = "";
@@ -387,28 +393,27 @@ function readFile(path: string): string {
   let sup: TestSupervisor | null = null;
   try {
     sup = await startTestSupervisor();
+    const { repoPath, sha } = setupTestWorkspace("key-iso-9");
     const executionId = randomUUID();
     const nonce = randomUUID();
+    const plan = makeTestPlan(3000);
     const cap = sup.signCapability({
       executionId,
       nonce,
       leaseId: "lease-1",
-      repositoryHeadSha: "deadbeef",
+      repositoryHeadSha: sha,
       runtimePlanHash: "plan-hash",
       architectureHash: null,
       expiresAt: new Date(Date.now() - 60000).toISOString(), // EXPIRED 60s ago
+      runtimePlan: plan as unknown as Record<string, unknown>,
+      workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
     });
     const resp = await fetch(`${sup.url}/execute`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         capability: cap,
-        workload: {
-          binary: "/bin/echo",
-          args: ["should-not-run"],
-          cwd: "/tmp",
-          timeoutMs: 15000,
-        },
+        repoPath,
       }),
     });
     let detail = "";
@@ -439,22 +444,21 @@ function readFile(path: string): string {
 // TEST 10 — Supervisor rejects a request with NO capability → HTTP 403
 // ===========================================================================
 // POST /execute without a `capability` field must be rejected.
+//
+// Phase 18Y: the supervisor's request body is { capability, repoPath } —
+// no workload field. We POST { repoPath } only (no capability, no workload).
 
 {
   let sup: TestSupervisor | null = null;
   try {
     sup = await startTestSupervisor();
+    const { repoPath } = setupTestWorkspace("key-iso-10");
     const resp = await fetch(`${sup.url}/execute`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        // No capability field.
-        workload: {
-          binary: "/bin/echo",
-          args: ["should-not-run"],
-          cwd: "/tmp",
-          timeoutMs: 15000,
-        },
+        // No capability field. Phase 18Y: NO workload field either.
+        repoPath,
       }),
     });
     const ok = resp.status === 403;

@@ -64,6 +64,10 @@ import {
   getProductionReadinessFailureReason,
   type ProductionReadinessEvidence,
 } from "@/lib/runtime-verification";
+import {
+  deriveWorkloadFromPlan,
+  computeWorkloadHash,
+} from "@/lib/execution-capability";
 import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
 
 // ===========================================================================
@@ -229,6 +233,8 @@ async function runVerification(opts: {
     runtimePlanHash: "e2e-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const envelope = await executeRuntimeVerificationInWorker({
     executionId,

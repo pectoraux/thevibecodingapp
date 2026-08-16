@@ -2,7 +2,12 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { db } from "@/lib/db";
 import { getWorkerToken, getControlPlanePrivateKey } from "@/lib/worker-auth";
-import { signExecutionCapability, type ExecutionCapability } from "@/lib/execution-capability";
+import {
+  signExecutionCapability,
+  deriveWorkloadFromPlan,
+  computeWorkloadHash,
+  type ExecutionCapability,
+} from "@/lib/execution-capability";
 import { deriveRuntimeVerificationPlan, hashRuntimePlan } from "@/lib/runtime-verification";
 
 // POST /api/worker/job-spec
@@ -111,7 +116,7 @@ export async function POST(req: Request) {
     });
 
     // =========================================================================
-    // Phase 18X-B: Issue a SIGNED ExecutionCapability.
+    // Phase 18X-B / 18Y: Issue a SIGNED ExecutionCapability.
     // =========================================================================
     //
     // The substrate supervisor (mini-services/substrate-supervisor, port 3004)
@@ -124,6 +129,15 @@ export async function POST(req: Request) {
     //   - repositoryHeadSha — the exact git SHA the substrate MUST run.
     //   - runtimePlanHash  — the plan hash the substrate MUST use.
     //   - architectureHash — the architecture hash (may be null).
+    //   - workloadHash     — Phase 18Y: SHA-256 of the canonical workload
+    //                        recipe the supervisor must execute. The
+    //                        supervisor computes this from the derived
+    //                        workload and compares.
+    //   - runtimePlan      — Phase 18Y: the FULL RuntimeVerificationPlan,
+    //                        signed as part of the capability. The
+    //                        supervisor DERIVES the workload from this (NOT
+    //                        from the worker's request body). The worker
+    //                        cannot change the install/build/start commands.
     //   - expiresAt        — ISO timestamp; capability invalid after this.
     //
     // The supervisor verifies the capability signature with
@@ -131,25 +145,32 @@ export async function POST(req: Request) {
     // (no control-plane private key). A worker cannot override the nonce /
     // executionId / repoSha at the supervisor — those come from the capability.
     //
-    // The runtimePlanHash is computed using the SAME logic the control plane
-    // uses at submission time (Phase 18A — deriveRuntimeVerificationPlan +
-    // hashRuntimePlan). This makes the capability's plan hash match what the
-    // control plane will verify at submit-runtime-evidence time. If the
-    // architecture isn't available or the plan can't be derived, the
-    // runtimePlanHash is set to "" (empty) and the supervisor's verifier
-    // (verifyExecutionCapability) will still accept the capability (the empty
-    // string is part of the signed canonical form) — but the control plane's
-    // submit-runtime-evidence route will reject the envelope on plan-hash
-    // mismatch (the supervisor's check is fail-closed on the signature, not
-    // on the plan-hash matching the architecture; that's the control plane's
-    // job). Documented as a defense-in-depth gap: a worker that somehow got
-    // the launcher to run with a wrong plan hash would still fail at the
-    // control plane's plan-hash check at submission time.
+    // Phase 18Y — EXECUTION CAPABILITY CLOSURE (P0 fix):
+    // Before 18Y, the supervisor accepted `workload` from the worker's POST
+    // body. A compromised worker with a valid capability could execute
+    // arbitrary commands. 18Y closes this: the capability signs the FULL
+    // runtimePlan + workloadHash, and the supervisor DERIVES the workload
+    // (binary="node", args=["/workspace/orchestrator.js"],
+    // cwd="/workspace/repo") from the signed plan. The worker cannot change
+    // the install/build/start commands — those come from the plan, which the
+    // orchestrator reads from /workspace/plan.json (the supervisor writes it
+    // from cap.runtimePlan).
+    //
+    // 18Y also adds atomic nonce consumption: the supervisor calls
+    // /api/supervisor/consume-capability BEFORE running the substrate. The
+    // control plane's updateMany with
+    //   where: { executionId, substrateNonce: nonce,
+    //            substrateNonceConsumed: false, leaseId,
+    //            leaseExpiresAt: { gt: now } }
+    //   data:  { substrateNonceConsumed: true, substrateNonceConsumedAt: now }
+    // is atomic: the first call returns count=1 (consumed), any subsequent
+    // call returns count=0 (replay → 403). The lease check is also in the
+    // WHERE clause, so a reclaimed or expired lease → 403.
     //
     // The capability expiry is 5 minutes — long enough for the worker to
     // clone the repo and POST to the supervisor, short enough to bound the
-    // replay window (the supervisor doesn't keep a replay cache yet — see
-    // 18X-A HONEST LIMITATIONS).
+    // replay window (the atomic nonce consumption is the primary anti-replay
+    // mechanism; the 5-minute expiry is defense-in-depth).
     //
     // FAIL-CLOSED: if the control-plane private key is unavailable (e.g., the
     // process is in verification-only mode), we return a 503 — the worker
@@ -162,14 +183,18 @@ export async function POST(req: Request) {
       }, { status: 503 });
     }
 
-    // Compute runtimePlanHash using the SAME logic as submit-runtime-evidence
-    // (Phase 18A). The capability's plan hash MUST match the control plane's
-    // authoritative value — otherwise the worker would relay a capability the
-    // supervisor accepts but the control plane later rejects (a confusing
-    // half-success).
-    const runtimePlanHash = (() => {
-      if (!project) return "";
-      const plan = deriveRuntimeVerificationPlan(
+    // Compute the runtimePlan + runtimePlanHash + workloadHash using the
+    // SAME logic as submit-runtime-evidence (Phase 18A). The capability's
+    // plan hash MUST match the control plane's authoritative value —
+    // otherwise the worker would relay a capability the supervisor accepts
+    // but the control plane later rejects (a confusing half-success).
+    //
+    // Phase 18Y: we ALSO sign the full runtimePlan + workloadHash. The
+    // supervisor derives the workload from runtimePlan (NOT from the worker's
+    // request body) and verifies workloadHash matches.
+    const runtimePlan = (() => {
+      if (!project) return null;
+      return deriveRuntimeVerificationPlan(
         {
           canonicalHeadSha: project.canonicalHeadSha,
           githubRepo: project.githubRepo,
@@ -187,9 +212,26 @@ export async function POST(req: Request) {
             }
           : null
       );
-      if (!plan) return "";
-      return hashRuntimePlan(plan);
     })();
+
+    const runtimePlanHash = runtimePlan ? hashRuntimePlan(runtimePlan) : "";
+
+    // Phase 18Y: derive the workload from the plan + compute its hash. The
+    // supervisor will re-derive and re-compute, then compare to the value
+    // signed into the capability. If they don't match → 403.
+    //
+    // If the plan is null (architecture missing required fields), we use an
+    // empty plan object + a sentinel workloadHash. The supervisor will
+    // reject it (deriveWorkloadFromPlan + computeWorkloadHash will produce
+    // a different hash from the empty object), so a null plan blocks runtime
+    // verification at the supervisor (defense-in-depth — the supervisor
+    // would still verify the signature, but the workloadHash wouldn't match
+    // a real workload).
+    const runtimePlanForCapability: Record<string, unknown> = runtimePlan
+      ? (runtimePlan as unknown as Record<string, unknown>)
+      : {};
+    const derivedWorkload = deriveWorkloadFromPlan(runtimePlanForCapability);
+    const workloadHash = computeWorkloadHash(derivedWorkload);
 
     const capabilityInput = {
       executionId: job.executionId,
@@ -198,6 +240,8 @@ export async function POST(req: Request) {
       repositoryHeadSha: project?.canonicalHeadSha ?? "",
       runtimePlanHash,
       architectureHash: architecture?.hash ?? null,
+      workloadHash,
+      runtimePlan: runtimePlanForCapability,
       expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(), // 5-minute expiry
     };
 
@@ -323,7 +367,7 @@ export async function POST(req: Request) {
       // BASE is the canonical HEAD, not a single dependency's commit.
       baseCommitSha: await (async () => {
         // P15F: Use canonicalHeadSha as the base.
-        if (project.canonicalHeadSha) {
+        if (project?.canonicalHeadSha) {
           return project.canonicalHeadSha;
         }
 

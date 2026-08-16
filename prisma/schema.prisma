@@ -743,7 +743,25 @@ model ExecutionJob {
   // (defense-in-depth — the supervisor already verified the capability's
   // signature before running the substrate). Binds executionId + nonce +
   // leaseId + repoSha + planHash + archHash + expiresAt.
+  //
+  // Phase 18Y: the capability ALSO binds workloadHash + runtimePlan (the
+  // FULL plan). The supervisor DERIVES the workload from cap.runtimePlan —
+  // the worker does NOT supply the workload.
   substrateCapability String?
+
+  // Phase 18Y: Atomic nonce consumption (anti-replay). The supervisor calls
+  // /api/supervisor/consume-capability BEFORE running the substrate. The
+  // control plane's updateMany with:
+  //   where: { executionId, substrateNonce: nonce,
+  //            substrateNonceConsumed: false, leaseId,
+  //            leaseExpiresAt: { gt: now } }
+  //   data:  { substrateNonceConsumed: true,
+  //            substrateNonceConsumedAt: now }
+  // is atomic: the first call returns count=1 (consumed), any subsequent
+  // call returns count=0 (replay → 403). The lease check is in the WHERE
+  // clause, so a reclaimed or expired lease → 403.
+  substrateNonceConsumed     Boolean  @default(false)
+  substrateNonceConsumedAt   DateTime?
 
   @@index([projectId])
   @@index([status])

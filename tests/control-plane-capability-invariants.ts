@@ -56,6 +56,8 @@ import { randomUUID, generateKeyPairSync } from "node:crypto";
 import {
   signExecutionCapability,
   verifyExecutionCapability,
+  deriveWorkloadFromPlan,
+  computeWorkloadHash,
   type ExecutionCapability,
   type ExecutionCapabilityInput,
 } from "@/lib/execution-capability";
@@ -233,7 +235,21 @@ function issueCapabilityLikeJobSpecRoute(params: {
   } | null;
   expiresAt?: string; // override for testing (defaults to +5min)
 }): ExecutionCapability {
-  // Compute runtimePlanHash using the SAME logic as submit-runtime-evidence.
+  // Compute the runtime plan + runtimePlanHash + workloadHash using the
+  // SAME logic as the job-spec route (Phase 18Y).
+  const runtimePlan = (() => {
+    if (!params.project) return {} as Record<string, unknown>;
+    const plan = deriveRuntimeVerificationPlan(
+      {
+        canonicalHeadSha: params.project.canonicalHeadSha,
+        githubRepo: params.project.githubRepo,
+        githubDefaultBranch: params.project.githubDefaultBranch,
+      },
+      params.architecture ?? null
+    );
+    return (plan ?? {}) as unknown as Record<string, unknown>;
+  })();
+
   const runtimePlanHash = (() => {
     if (!params.project) return "";
     const plan = deriveRuntimeVerificationPlan(
@@ -248,6 +264,11 @@ function issueCapabilityLikeJobSpecRoute(params: {
     return hashRuntimePlan(plan);
   })();
 
+  // Phase 18Y: derive the workload from the plan + compute its hash. The
+  // supervisor will re-derive and re-compute, then compare to the value
+  // signed into the capability.
+  const workloadHash = computeWorkloadHash(deriveWorkloadFromPlan(runtimePlan));
+
   const capabilityInput: ExecutionCapabilityInput = {
     executionId: params.executionId,
     nonce: params.nonce,
@@ -255,6 +276,8 @@ function issueCapabilityLikeJobSpecRoute(params: {
     repositoryHeadSha: params.repositoryHeadSha,
     runtimePlanHash,
     architectureHash: params.architecture?.hash ?? null,
+    workloadHash,
+    runtimePlan,
     expiresAt: params.expiresAt ?? new Date(Date.now() + 5 * 60 * 1000).toISOString(),
   };
 
@@ -515,6 +538,9 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
 // Set expiresAt to the past → verify must fail.
 
 {
+  // Phase 18Y: ExecutionCapabilityInput now requires workloadHash + runtimePlan.
+  const runtimePlan: Record<string, unknown> = {};
+  const workloadHash = computeWorkloadHash(deriveWorkloadFromPlan(runtimePlan));
   const expiredInput: ExecutionCapabilityInput = {
     executionId: randomUUID(),
     nonce: randomUUID(),
@@ -522,6 +548,8 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
     repositoryHeadSha: "abc123",
     runtimePlanHash: "plan-hash",
     architectureHash: null,
+    workloadHash,
+    runtimePlan,
     expiresAt: new Date(Date.now() - 60 * 1000).toISOString(), // 1 minute ago
   };
   const controlPlanePrivateKey = getControlPlanePrivateKey();
@@ -565,6 +593,7 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
   const executionId = randomUUID();
   const nonce = generateSubstrateNonce();
   const plan = makePlan(3000);
+  // Phase 18Y: the capability MUST include runtimePlan + workloadHash.
   const capability = SUPERVISOR!.signCapability({
     executionId,
     nonce,
@@ -573,6 +602,8 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
     runtimePlanHash: "test-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
   const envelope = await executeRuntimeVerificationInWorker({
     executionId,
@@ -615,6 +646,9 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
   const executionId = randomUUID();
   const nonce = randomUUID();
   // Build a capability with NO signature (and no algorithm/signedAt).
+  // Phase 18Y: include runtimePlan + workloadHash so the structure is
+  // complete (but the signature is missing — the supervisor must reject).
+  const runtimePlan: Record<string, unknown> = {};
   const unsignedCap = {
     executionId,
     nonce,
@@ -622,20 +656,22 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
     repositoryHeadSha: "deadbeef",
     runtimePlanHash: "plan-hash",
     architectureHash: null,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(runtimePlan)),
+    runtimePlan,
     expiresAt: new Date(Date.now() + 60000).toISOString(),
     // signature, algorithm, signedAt MISSING.
   } as any;
+  // Phase 18Y: the supervisor requires a repoPath that exists. We need a
+  // real repo because the supervisor checks existsSync(repoPath) BEFORE
+  // verifying the cap signature. Use TEST_APP_DIR (a git repo set up below).
+  setupTestApp(); // initialize TEST_APP_DIR git repo so it exists
+  // Use TEST_APP_DIR as repoPath (it exists + is a git repo).
   const resp = await fetch(`${SUPERVISOR!.url}/execute`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       capability: unsignedCap,
-      workload: {
-        binary: "/bin/echo",
-        args: ["should-not-run"],
-        cwd: "/tmp",
-        timeoutMs: 10000,
-      },
+      repoPath: TEST_APP_DIR,
     }),
   });
   const ok = resp.status === 403;
@@ -708,6 +744,7 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
   // Sign the capability with the control-plane private key (this is what
   // the job-spec route does). We use the supervisor's control-plane keypair
   // so the supervisor accepts it.
+  // Phase 18Y: include runtimePlan + workloadHash.
   const capability = SUPERVISOR!.signCapability({
     executionId,
     nonce,
@@ -716,6 +753,8 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
     runtimePlanHash: "test-plan-hash",
     architectureHash: null,
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    runtimePlan: plan as unknown as Record<string, unknown>,
+    workloadHash: computeWorkloadHash(deriveWorkloadFromPlan(plan as unknown as Record<string, unknown>)),
   });
 
   // Verify the capability is valid (defense-in-depth — the supervisor will
