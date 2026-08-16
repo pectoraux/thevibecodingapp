@@ -75,7 +75,7 @@ const poller = readFile("mini-services/execution-worker/poller.ts");
 
 // Test 8: Register endpoint requires enrollment proof for new workers.
 {
-  const requires = registerRoute.includes("publicKeyPem, enrollmentSecret, and enrollmentSignature");
+  const requires = registerRoute.includes("publicKeyPem and enrollmentSignature");
   record("Register endpoint requires enrollment proof for new workers", requires, `requires: ${requires}`);
 }
 

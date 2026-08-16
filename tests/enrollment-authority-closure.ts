@@ -103,6 +103,33 @@ const poller = readFile("mini-services/execution-worker/poller.ts");
   record("Re-registration rejects different public key (key rotation via /rotate-key only)", rejectsDiff, `rejectsDiff: ${rejectsDiff}`);
 }
 
+// Test 13: State-aware validation — enrollmentSecret NOT required for ACTIVE.
+{
+  // The top-level check must NOT require enrollmentSecret unconditionally.
+  // It must only require publicKeyPem and enrollmentSignature always.
+  const topLevelRequires = registerRoute.includes("!publicKeyPem || !enrollmentSignature");
+  const doesNotRequireSecretAtTop = !registerRoute.includes("!publicKeyPem || !enrollmentSecret || !enrollmentSignature");
+  const stateAware = registerRoute.includes('enrollment.status === "PENDING" && !enrollmentSecret');
+  record(
+    "State-aware validation: enrollmentSecret NOT required at top level (only for PENDING)",
+    topLevelRequires && doesNotRequireSecretAtTop && stateAware,
+    `topLevelRequires: ${topLevelRequires}, doesNotRequireSecretAtTop: ${doesNotRequireSecretAtTop}, stateAware: ${stateAware}`
+  );
+}
+
+// Test 14: Restart path is reachable (no unconditional enrollmentSecret requirement).
+{
+  // The error message for missing fields must NOT mention enrollmentSecret
+  // in the top-level check (only publicKeyPem and enrollmentSignature).
+  const topErrorMsg = registerRoute.includes("Registration requires publicKeyPem and enrollmentSignature");
+  const noSecretInTopError = !registerRoute.includes("Registration requires publicKeyPem, enrollmentSecret, and enrollmentSignature");
+  record(
+    "Restart path reachable: top-level error does not require enrollmentSecret",
+    topErrorMsg && noSecretInTopError,
+    `topErrorMsg: ${topErrorMsg}, noSecretInTopError: ${noSecretInTopError}`
+  );
+}
+
 // ===========================================================================
 // Summary
 // ===========================================================================

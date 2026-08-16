@@ -42,11 +42,11 @@ export async function POST(req: Request) {
     const enrollmentSignature = body.enrollmentSignature as string | undefined;
 
     // Phase 18R P0 #4: ALL registrations require identity proof.
-    // No existing-worker bypass. The worker must ALWAYS prove possession of
-    // its Ed25519 private key, whether new or re-registering after restart.
-    if (!publicKeyPem || !enrollmentSecret || !enrollmentSignature) {
+    // publicKeyPem and enrollmentSignature are ALWAYS required.
+    // enrollmentSecret is required only for PENDING (first) enrollment.
+    if (!publicKeyPem || !enrollmentSignature) {
       return NextResponse.json({
-        error: "REJECTED: Registration requires publicKeyPem, enrollmentSecret, and enrollmentSignature. Obtain an enrollment from an admin via /api/admin/enroll-worker.",
+        error: "REJECTED: Registration requires publicKeyPem and enrollmentSignature. The worker must prove possession of its Ed25519 private key.",
       }, { status: 403 });
     }
 
@@ -65,6 +65,15 @@ export async function POST(req: Request) {
     if (enrollment.expiresAt && enrollment.expiresAt < new Date()) {
       return NextResponse.json({
         error: "REJECTED: Enrollment has expired. An admin must create a new enrollment via /api/admin/enroll-worker.",
+      }, { status: 403 });
+    }
+
+    // Phase 18S: State-aware validation.
+    // PENDING: requires enrollmentSecret (first registration).
+    // ACTIVE: does NOT require enrollmentSecret (restart re-registration).
+    if (enrollment.status === "PENDING" && !enrollmentSecret) {
+      return NextResponse.json({
+        error: "REJECTED: First registration (PENDING enrollment) requires enrollmentSecret. Obtain it from the admin who created the enrollment.",
       }, { status: 403 });
     }
 
