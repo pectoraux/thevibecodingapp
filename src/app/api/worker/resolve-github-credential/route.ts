@@ -32,13 +32,25 @@ export async function POST(req: Request) {
     }
 
     // Verify the execution job belongs to this project.
+    // Phase 18K: Also verify lease fencing.
     const job = await db.executionJob.findUnique({
       where: { executionId: token.executionId },
-      select: { projectId: true },
+      select: { projectId: true, workerId: true, leaseId: true, leaseExpiresAt: true },
     });
 
     if (!job || job.projectId !== projectId) {
       return NextResponse.json({ error: "Execution does not belong to this project" }, { status: 403 });
+    }
+
+    // Phase 18K: Lease-fenced — verify the lease is current.
+    if (job.workerId !== token.workerId) {
+      return NextResponse.json({ error: "Job not claimed by this worker" }, { status: 403 });
+    }
+    if (!token.leaseId || job.leaseId !== token.leaseId) {
+      return NextResponse.json({ error: "Lease mismatch — job may have been reclaimed" }, { status: 403 });
+    }
+    if (job.leaseExpiresAt && job.leaseExpiresAt < new Date()) {
+      return NextResponse.json({ error: "Lease expired" }, { status: 403 });
     }
 
     // Verify the project is GitHub-connected.

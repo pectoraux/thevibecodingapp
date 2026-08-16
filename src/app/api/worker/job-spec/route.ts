@@ -51,6 +51,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Job not claimed by this worker" }, { status: 403 });
     }
 
+    // Phase 18K: Lease-fenced — verify the lease is current and not expired.
+    if (!token.leaseId || job.leaseId !== token.leaseId) {
+      return NextResponse.json({ error: "Lease mismatch — job may have been reclaimed" }, { status: 403 });
+    }
+    if (job.leaseExpiresAt && job.leaseExpiresAt < new Date()) {
+      return NextResponse.json({ error: "Lease expired" }, { status: 403 });
+    }
+
     // Get the task.
     const task = await db.task.findUnique({ where: { id: job.taskId! } });
     if (!task) {

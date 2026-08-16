@@ -34,9 +34,10 @@ if (!WORKER_SECRET) {
 console.log(`[worker] Starting Forge Execution Worker (${WORKER_VERSION})`);
 
 // --- Token helpers ---
+// Phase 18K: Worker tokens now include tokenType field (required by 18J control plane).
 function signToken(payload: any): string {
   const data = [
-    payload.iss, payload.aud, payload.workerId,
+    payload.tokenType, payload.iss, payload.aud, payload.workerId,
     payload.executionId || "", payload.leaseId || "", payload.projectId || "",
     JSON.stringify(payload.capabilities), payload.iat, payload.exp, payload.nonce,
   ].join(".");
@@ -46,11 +47,24 @@ function signToken(payload: any): string {
 function createRegToken(): string {
   const now = Date.now();
   const payload = {
+    tokenType: "REGISTRATION" as const,
     iss: "forge-worker", aud: "forge-control-plane", workerId: WORKER_ID,
     capabilities: ["node", "git", "test", "build"],
     iat: now, exp: now + 60000, nonce: randomUUID(),
   };
   return `Bearer ${Buffer.from(JSON.stringify({ ...payload, signature: signToken(payload) })).toString("base64")}`;
+}
+
+// Phase 18K: Worker Ed25519 keypair for evidence signing.
+import { generateKeyPairSync } from "node:crypto";
+let workerPrivateKeyPem: string | null = null;
+let workerPublicKeyPem: string | null = null;
+
+function generateWorkerKeypair(): void {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  workerPrivateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  workerPublicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  console.log(`[worker] Generated Ed25519 keypair for evidence signing`);
 }
 
 let sessionToken: string | null = null;
@@ -74,12 +88,16 @@ async function apiCall(path: string, method: string, body?: any, token?: string)
 
 // --- Worker API functions ---
 async function register(): Promise<void> {
+  // Phase 18K: Generate Ed25519 keypair and register publicKeyPem.
+  generateWorkerKeypair();
+
   const result = await apiCall("/api/worker/register", "POST", {
     workerVersion: WORKER_VERSION, protocolVersion: PROTOCOL_VERSION,
     capabilities: ["node", "git", "test", "build"], maxConcurrency: 1,
+    publicKeyPem: workerPublicKeyPem, // Phase 18K: Register signing key.
   }, createRegToken());
   sessionToken = result.sessionToken;
-  console.log(`[worker] Registered`);
+  console.log(`[worker] Registered (with Ed25519 public key)`);
 }
 
 async function claimJob(): Promise<{ job: any; executionToken: string } | null> {
