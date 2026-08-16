@@ -344,7 +344,7 @@ const contractModule = readFile("src/lib/runtime-execution-contract.ts");
   const fp = captureEnvironmentFingerprint("npm", null);
   record(
     "captureEnvironmentFingerprint produces a hash (not raw env values)",
-    fp.environmentVariablesHash.length === 16,
+    fp.environmentVariablesHash.length === 64,
     `hash: ${fp.environmentVariablesHash}`
   );
 }
@@ -459,7 +459,7 @@ const contractModule = readFile("src/lib/runtime-execution-contract.ts");
   record(
     "deriveRuntimeExecutionPolicy captures environment fingerprint with packageManager",
     policy.environmentFingerprint.packageManager === "pnpm" &&
-    policy.environmentFingerprint.environmentVariablesHash.length === 16,
+    policy.environmentFingerprint.environmentVariablesHash.length === 64,
     `packageManager: ${policy.environmentFingerprint.packageManager}`
   );
 }
@@ -942,10 +942,135 @@ const endpointCode18F = readFile("src/app/api/worker/submit-runtime-evidence/rou
 }
 
 // ===========================================================================
+// PHASE 18G: Evidence authorization closure
+// ===========================================================================
+
+const endpointCode18G = readFile("src/app/api/worker/submit-runtime-evidence/route.ts");
+
+// Test 85: Endpoint does NOT accept workerPublicKey from body.
+{
+  // Check for actual code usage (not comments). The pattern `const workerPublicKey = body.workerPublicKey`
+  // would indicate the endpoint accepts the key from the body.
+  const acceptsFromBody = endpointCode18G.includes("body.workerPublicKey as string") ||
+    endpointCode18G.includes("const workerPublicKey = body");
+  record(
+    "Phase 18G: endpoint does NOT accept workerPublicKey from request body (code, not comments)",
+    !acceptsFromBody,
+    `acceptsFromBody: ${acceptsFromBody}`
+  );
+}
+
+// Test 86: Endpoint resolves public key from WorkerRegistry.
+{
+  const resolvesFromDb = endpointCode18G.includes("db.workerRegistry.findUnique") &&
+    endpointCode18G.includes("publicKeyPem: true");
+  record(
+    "Phase 18G: endpoint resolves public key from WorkerRegistry (not body)",
+    resolvesFromDb,
+    `resolvesFromDb: ${resolvesFromDb}`
+  );
+}
+
+// Test 87: Endpoint rejects worker without registered public key.
+{
+  const rejectsNoKey = endpointCode18G.includes("has no registered Ed25519 public key");
+  record(
+    "Phase 18G: endpoint rejects worker without registered public key",
+    rejectsNoKey,
+    `rejectsNoKey: ${rejectsNoKey}`
+  );
+}
+
+// Test 88: Endpoint has NO separate body.result (envelope is sole evidence).
+{
+  const hasBodyResult = endpointCode18G.includes("body.result as RuntimeVerificationResult");
+  record(
+    "Phase 18G: endpoint has NO separate body.result (envelope is sole evidence object)",
+    !hasBodyResult,
+    `hasBodyResult: ${hasBodyResult}`
+  );
+}
+
+// Test 89: Endpoint derives result FROM the signed envelope.
+{
+  const derivesFromEnvelope = endpointCode18G.includes("DERIVE the RuntimeVerificationResult from the signed envelope");
+  record(
+    "Phase 18G: endpoint derives RuntimeVerificationResult FROM the signed envelope",
+    derivesFromEnvelope,
+    `derivesFromEnvelope: ${derivesFromEnvelope}`
+  );
+}
+
+// Test 90: WorkerRegistry schema has publicKeyPem field.
+{
+  const hasField = readFile("prisma/schema.prisma").includes("publicKeyPem      String?");
+  record(
+    "Phase 18G: WorkerRegistry schema has publicKeyPem field",
+    hasField,
+    `hasField: ${hasField}`
+  );
+}
+
+// Test 91: Register endpoint stores publicKeyPem.
+{
+  const storesKey = readFile("src/app/api/worker/register/route.ts").includes("publicKeyPem");
+  record(
+    "Phase 18G: register endpoint stores publicKeyPem",
+    storesKey,
+    `storesKey: ${storesKey}`
+  );
+}
+
+// Test 92: Envelope includes logs field.
+{
+  const hasLogs = readFile("src/lib/runtime-execution-contract.ts").includes("logs: string;");
+  record(
+    "Phase 18G: ExecutionEvidenceEnvelope includes logs field (inside signed envelope)",
+    hasLogs,
+    `hasLogs: ${hasLogs}`
+  );
+}
+
+// Test 93: No truncated hashes (.slice(0, 16)).
+{
+  const contractCode = readFile("src/lib/runtime-execution-contract.ts");
+  const verificationCode = readFile("src/lib/runtime-verification.ts");
+  const hasTruncation = contractCode.includes(".slice(0, 16)") || verificationCode.includes(".slice(0, 16)");
+  record(
+    "Phase 18G: no truncated hashes (.slice(0, 16) removed — full SHA-256)",
+    !hasTruncation,
+    `hasTruncation: ${hasTruncation}`
+  );
+}
+
+// Test 94: Hashes are 64 characters (full SHA-256 hex).
+{
+  const keyPair = generateWorkerKeyPair("test");
+  const data = {
+    executionId: "e", workerId: "w", leaseId: "l",
+    repositoryHeadSha: "sha", architectureHash: "ah", runtimePlanHash: "ph",
+    environmentFingerprint: { os: "l", architecture: "x", nodeVersion: "v", packageManager: "n", containerImageHash: null, environmentVariablesHash: "eh", timestamp: "t" },
+    dependencyInstallResult: { success: true, durationMs: 1, exitCode: 0, output: "" },
+    buildResult: { success: true, durationMs: 1, exitCode: 0, output: "" },
+    startupResult: { success: true, durationMs: 1, exitCode: 0, output: "", port: 1, pid: 1 },
+    healthChecks: [], apiJourneys: [], integrationChecks: [], backgroundJobChecks: [], browserJourneys: [],
+    teardownResult: { success: true, durationMs: 1 },
+    passed: true, failureReason: null, startedAt: "t", completedAt: "t", logs: "",
+  };
+  const rh = computeResultHash(data);
+  const eh = computeEnvelopeHash({ ...data, resultHash: rh });
+  record(
+    "Phase 18G: hashes are 64 hex chars (full SHA-256, not truncated)",
+    rh.length === 64 && eh.length === 64,
+    `resultHash: ${rh.length} chars, envelopeHash: ${eh.length} chars`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 18F: Verifiable Execution Boundary ===\n");
+console.log("=== Forge Phase 18G: Evidence Authorization Closure ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {

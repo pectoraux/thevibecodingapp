@@ -279,7 +279,7 @@ function canonicalSerialize(value: any): string {
  */
 export function hashRuntimePlan(plan: RuntimeVerificationPlan): string {
   const canonical = canonicalSerialize(plan);
-  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+  return createHash("sha256").update(canonical).digest("hex");
 }
 
 // ---------------------------------------------------------------------------

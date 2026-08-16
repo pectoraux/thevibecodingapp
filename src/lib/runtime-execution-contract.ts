@@ -255,7 +255,7 @@ export function captureEnvironmentFingerprint(
 ): EnvironmentFingerprintFull {
   // Hash environment variable NAMES only (not values — never secrets).
   const envNames = Object.keys(process.env).sort().join(",");
-  const envHash = createHash("sha256").update(envNames).digest("hex").slice(0, 16);
+  const envHash = createHash("sha256").update(envNames).digest("hex");
 
   return {
     os: process.platform,
@@ -525,6 +525,9 @@ export interface ExecutionEvidenceEnvelope {
   startedAt: string;
   completedAt: string;
 
+  // Phase 18G: Logs are INSIDE the signed envelope (not a separate unsigned field).
+  logs: string;
+
   // Derived hashes (computed from the above, included in envelope)
   resultHash: string;
   envelopeHash: string;
@@ -592,7 +595,7 @@ export function computeResultHash(result: Omit<ExecutionEvidenceEnvelope, "resul
     startupResult: result.startupResult,
     teardownResult: result.teardownResult,
   };
-  return createHash("sha256").update(canonicalSerialize(resultFields)).digest("hex").slice(0, 16);
+  return createHash("sha256").update(canonicalSerialize(resultFields)).digest("hex");
 }
 
 /**
@@ -610,6 +613,7 @@ export function computeEnvelopeHash(
     executionId: envelope.executionId,
     failureReason: envelope.failureReason,
     leaseId: envelope.leaseId,
+    logs: envelope.logs, // Phase 18G: logs are INSIDE the signed envelope.
     passed: envelope.passed,
     repositoryHeadSha: envelope.repositoryHeadSha,
     resultHash: envelope.resultHash,
@@ -626,7 +630,7 @@ export function computeEnvelopeHash(
     startupResult: envelope.startupResult,
     teardownResult: envelope.teardownResult,
   };
-  return createHash("sha256").update(canonicalSerialize(envelopeFields)).digest("hex").slice(0, 16);
+  return createHash("sha256").update(canonicalSerialize(envelopeFields)).digest("hex");
 }
 
 /**

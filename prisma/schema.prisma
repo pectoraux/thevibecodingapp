@@ -607,6 +607,11 @@ model WorkerRegistry {
   currentJobId      String?
   registeredAt      DateTime @default(now())
 
+  // Phase 18G: Worker's Ed25519 public key for evidence signing.
+  // Registered at worker registration. NEVER accepted from request body.
+  // The control plane resolves this from the DB by workerId.
+  publicKeyPem      String?
+
   @@index([status])
   @@index([lastHeartbeat])
 }

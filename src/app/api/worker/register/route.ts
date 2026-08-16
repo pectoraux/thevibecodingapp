@@ -29,6 +29,11 @@ export async function POST(req: Request) {
 
     const capabilities = body.capabilities || token.capabilities || ["node", "git", "test", "build"];
 
+    // Phase 18G: Worker registers its Ed25519 public key at registration time.
+    // This key is used to verify evidence signatures. It is NEVER accepted
+    // from the runtime-evidence submission body — only from the DB.
+    const publicKeyPem = body.publicKeyPem as string | undefined;
+
     const worker = await db.workerRegistry.upsert({
       where: { workerId },
       create: {
@@ -39,6 +44,7 @@ export async function POST(req: Request) {
         maxConcurrency: body.maxConcurrency || 1,
         status: "READY",
         lastHeartbeat: new Date(),
+        publicKeyPem: publicKeyPem || null,
       },
       update: {
         workerVersion: body.workerVersion,
@@ -47,6 +53,8 @@ export async function POST(req: Request) {
         maxConcurrency: body.maxConcurrency || 1,
         status: "READY",
         lastHeartbeat: new Date(),
+        // Phase 18G: Update public key if provided (allows key rotation).
+        ...(publicKeyPem ? { publicKeyPem } : {}),
       },
     });
 

@@ -83,48 +83,67 @@ export async function POST(req: Request) {
     }
 
     const body = await req.json();
-    const result = body.result as RuntimeVerificationResult;
+
+    // Phase 18G: The SIGNED ENVELOPE is the ONLY evidence object.
+    // No unsigned body.result. No body.workerPublicKey.
+    // The envelope is signed, verified, evaluated, and persisted — ONE object.
     const envelope = body.envelope as ExecutionEvidenceEnvelope | undefined;
 
-    if (!result || !result.repositoryHeadSha) {
-      return NextResponse.json({ error: "Missing runtime verification result" }, { status: 400 });
-    }
-
-    // Phase 18F: REQUIRE a signed evidence envelope. No signature = REJECTED.
-    // The Ed25519 signature is no longer an unused primitive — it is REQUIRED.
     if (!envelope || !envelope.signature) {
       return NextResponse.json({
-        error: "REJECTED: Missing signed evidence envelope. Phase 18F requires Ed25519-signed ExecutionEvidenceEnvelope.",
+        error: "REJECTED: Missing signed evidence envelope. Phase 18G requires Ed25519-signed ExecutionEvidenceEnvelope as the sole evidence object.",
       }, { status: 403 });
     }
 
-    // Phase 18F: Verify the envelope signature before doing anything else.
-    // The worker's public key must be registered. In production, this would
-    // look up the worker's registered public key from the WorkerRegistry.
-    // For now, we require the envelope to be valid against a registered key.
-    // TODO: Look up worker public key from WorkerRegistry by workerId.
-    // For now, if a workerPublicKey is provided in the body (development mode),
-    // verify against it. In production, the key is server-side only.
-    const workerPublicKey = body.workerPublicKey as string | undefined;
-    if (!workerPublicKey) {
+    // Phase 18G: Resolve the worker's public key from the WorkerRegistry.
+    // NEVER from the request body. The body.workerPublicKey is IGNORED.
+    const workerReg = await db.workerRegistry.findUnique({
+      where: { workerId: token.workerId },
+      select: { publicKeyPem: true },
+    });
+
+    if (!workerReg || !workerReg.publicKeyPem) {
       return NextResponse.json({
-        error: "REJECTED: Worker public key not provided. The control plane must verify the evidence signature.",
+        error: `REJECTED: Worker ${token.workerId} has no registered Ed25519 public key. The worker must register its public key at /api/worker/register before submitting runtime evidence.`,
       }, { status: 403 });
     }
 
-    const signatureValid = verifyEvidenceEnvelope(envelope, workerPublicKey);
+    // Phase 18G: Verify the envelope signature with the SERVER-RESOLVED key.
+    const signatureValid = verifyEvidenceEnvelope(envelope, workerReg.publicKeyPem);
     if (!signatureValid) {
       return NextResponse.json({
-        error: "REJECTED: Evidence envelope signature verification FAILED. The complete evidence (including all stage results) must be signed by the worker's Ed25519 private key.",
+        error: "REJECTED: Evidence envelope signature verification FAILED against the worker's registered public key.",
       }, { status: 403 });
     }
 
-    // Phase 18F: Verify envelope identity matches the token identity.
+    // Phase 18G: Verify envelope identity matches the token identity.
     if (envelope.executionId !== token.executionId || envelope.workerId !== token.workerId) {
       return NextResponse.json({
         error: "REJECTED: Envelope identity mismatch. envelope.executionId/workerId must match the authenticated token.",
       }, { status: 403 });
     }
+
+    // Phase 18G: DERIVE the RuntimeVerificationResult from the signed envelope.
+    // There is no separate unsigned result. The envelope IS the evidence.
+    const result: RuntimeVerificationResult = {
+      repositoryHeadSha: envelope.repositoryHeadSha,
+      headVerified: true, // Verified independently below.
+      environmentFingerprint: envelope.environmentFingerprint as any,
+      dependencyInstallResult: envelope.dependencyInstallResult as any,
+      buildResult: envelope.buildResult as any,
+      startupResult: envelope.startupResult as any,
+      healthChecks: envelope.healthChecks as any,
+      apiJourneys: envelope.apiJourneys as any,
+      integrationChecks: envelope.integrationChecks as any,
+      backgroundJobChecks: envelope.backgroundJobChecks as any,
+      browserJourneys: envelope.browserJourneys as any,
+      teardownResult: envelope.teardownResult as any,
+      passed: envelope.passed,
+      failureReason: envelope.failureReason,
+      startedAt: envelope.startedAt,
+      completedAt: envelope.completedAt,
+      logs: envelope.logs || "", // Phase 18G: logs come from the signed envelope.
+    };
 
     // Phase 18A: Verify the worker's SHA matches the server's expected SHA.
     const expectedSha = project.canonicalHeadSha;

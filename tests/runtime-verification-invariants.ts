@@ -816,7 +816,7 @@ const evidenceRoutePhase18A = readFile("src/app/api/worker/submit-runtime-eviden
   const hash2 = hashRuntimePlan(plan);
   record(
     "hashRuntimePlan produces a stable hash for the same plan",
-    hash1 === hash2 && hash1.length === 16,
+    hash1 === hash2 && hash1.length === 64,
     `hash1: ${hash1}, hash2: ${hash2}`
   );
 }
