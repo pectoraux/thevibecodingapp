@@ -1793,3 +1793,42 @@ Stage Summary:
 - EXECUTION CONTRACT: sandbox isolation, commands as data, process lifecycle (SIGTERM→grace→SIGKILL), network policy (hermetic default), environment fingerprint (no secrets), continuous evidence capture.
 - TESTS: 358 passed, 0 failed from clean clone.
 - MILESTONE: Forge crosses the threshold from "can prove a system should work" to "can independently run a system and prove whether it works."
+
+---
+Task ID: 18D
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 18D — Runtime executor security freeze. Address six security concerns from audit: sandbox isolation transparency, command execution safety, evidence signing, replayability, process cleanup verification, honest limitations.
+
+Work Log:
+- Audited Phase 18C code against user's six concerns:
+  1. SANDBOX: Just mkdirSync — confirmed (directory, not container).
+  2. COMMAND SAFETY: spawn(binary, args) without shell — good, but shell:false not explicit.
+  3. NETWORK: Policy is data only — not enforced.
+  4. EVIDENCE SIGNING: None — executor creates unsigned evidence.
+  5. PROCESS CLEANUP: detached:true + process.kill(-pid) — partial (process group, not full tree walk).
+  6. APPLICATION DISCOVERY: Addressed in 18B (no defaults).
+- Fix 1: Added shell: false to ALL spawn calls (runCommand + ProcessSupervisor start). Mechanically verified no exec() or execSync() in executor.
+- Fix 2: Added SandboxIsolationLevel type ('filesystem-only' | 'container' | 'microvm'). SandboxModel records isolationLevel + networkEnforced. Current: filesystem-only, networkEnforced=false. This is HONEST about what the sandbox actually provides.
+- Fix 3: Added evidence signing (HMAC-SHA256). signEvidence() signs canonical serialization of repositoryHeadSha + passed + failureReason + runtimePlanHash + architectureHash + environmentVariablesHash. verifyEvidenceSignature() verifies. Fails with wrong secret or tampered result.
+- Fix 4: Added replayability. ReplayabilityIdentity = SHA + planHash + archHash + envHash. isReplayCompatible() checks if two evidence records are replay-compatible.
+- Fix 5: Verified existing process cleanup (detached:true + process.kill(-pid) = process group kill). Not full tree walk but covers child processes in the same process group.
+- HONEST LIMITATIONS documented in code:
+  * Network NOT physically enforced (no iptables/netns). Policy recorded but not blocked.
+  * No CPU/memory limits (no cgroups).
+  * No syscall restrictions (no seccomp).
+  * No artifact capture (build logs, screenshots).
+  * These require container mode (Docker/Firecracker) — future phase.
+- Added 15 Phase 18D tests (Tests 56-70).
+- CLEAN-CLONE VERIFICATION:
+  * Clean clone HEAD = 50e928b (matches local + remote).
+  * Verified: shell:false (2), SandboxIsolationLevel (2), signEvidence (2), verifyEvidenceSignature (1), ReplayabilityIdentity (5), isReplayCompatible (1), no exec() (0).
+  * 373 passed, 0 failed from clean clone.
+- Committed as 50e928b. Pushed to origin main (76527e1..50e928b).
+- SHA: local == remote == clean clone == 50e928bba22bc9043223960a82648bb8ce6e6d70.
+
+Stage Summary:
+- CANONICAL: GitHub main = 50e928b, Local = 50e928b, Clean clone = 50e928b (ALL MATCH).
+- SECURITY: shell:false on all spawn, no exec(), evidence signing (HMAC-SHA256), replayability identity, process group cleanup.
+- HONEST LIMITATIONS: filesystem-only isolation (no container), network not physically enforced, no resource quotas, no seccomp. Documented in SandboxIsolationLevel type.
+- TESTS: 373 passed, 0 failed from clean clone.
+- NEXT: Phase 19 — Worker Network (distributed verification). OR container mode upgrade for real sandbox isolation.
