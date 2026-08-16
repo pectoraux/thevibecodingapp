@@ -44,11 +44,12 @@ export async function POST(req: Request) {
       });
 
       // Issue an execution-specific token (with leaseId) for heartbeat/complete.
+      // Phase 18I: Use the ACTUAL leaseId from the DB, not job.id.
       const { createExecutionToken } = await import("@/lib/worker-auth");
       const executionToken = createExecutionToken(
         workerId,
         job.executionId,
-        job.id, // use job.id as leaseId
+        job.leaseId, // Phase 18I: The real lease ID from claimExecutionJob.
         job.projectId,
         capabilities
       );

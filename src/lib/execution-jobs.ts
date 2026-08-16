@@ -20,6 +20,7 @@ export interface ClaimedJob {
   taskId: string | null;
   attempt: number;
   requiredCapabilities: string[];
+  leaseId: string; // Phase 18I: Return the actual lease ID for token fencing.
 }
 
 /**
@@ -72,18 +73,34 @@ export async function claimExecutionJob(workerId: string, workerCapabilities: st
     taskId: job.taskId,
     attempt: job.attempt,
     requiredCapabilities: JSON.parse(job.requiredCapabilities || "[]"),
+    leaseId: job.leaseId!, // Phase 18I: Return the actual DB lease ID.
   };
 }
 
 /**
  * Renew the lease on a claimed job.
  * The worker calls this periodically to indicate it's still alive.
+ *
+ * Phase 18I: Lease-fenced renewal. Requires:
+ *   - executionId matches
+ *   - workerId matches
+ *   - leaseId matches the current lease
+ *   - lease has not expired (can't renew an expired lease)
+ *
+ * This prevents a stale worker from extending a lease that has been
+ * reclaimed by another worker.
  */
-export async function renewExecutionJobLease(jobId: string, workerId: string): Promise<boolean> {
+export async function renewExecutionJobLease(
+  executionId: string,
+  workerId: string,
+  leaseId: string
+): Promise<boolean> {
   const result = await db.executionJob.updateMany({
     where: {
-      id: jobId,
+      executionId,
       workerId,
+      leaseId,
+      leaseExpiresAt: { gt: new Date() }, // Can't renew an expired lease.
       status: { in: ["CLAIMED", "RUNNING", "VERIFYING"] },
     },
     data: {
@@ -97,9 +114,19 @@ export async function renewExecutionJobLease(jobId: string, workerId: string): P
 /**
  * Complete a job with a result.
  * Idempotent — if the job is already completed, returns true without duplicating.
+ *
+ * Phase 18I: Lease-fenced completion. Requires:
+ *   - executionId matches
+ *   - workerId matches
+ *   - leaseId matches the current lease
+ *   - lease has not expired
+ *
+ * An expired or reclaimed worker cannot mutate the execution.
  */
 export async function completeExecutionJob(
   executionId: string,
+  workerId: string,
+  leaseId: string,
   result: {
     status: "SUCCEEDED" | "FAILED" | "TIMED_OUT" | "BLOCKED";
     commitSha?: string;
@@ -107,21 +134,15 @@ export async function completeExecutionJob(
     errorMessage?: string;
   }
 ): Promise<boolean> {
-  // Check if already completed (idempotency).
-  const existing = await db.executionJob.findUnique({
-    where: { executionId },
-    select: { id: true, status: true },
-  });
-
-  if (!existing) return false;
-
-  // If already in a terminal state, don't duplicate.
-  if (["SUCCEEDED", "FAILED", "TIMED_OUT", "BLOCKED", "CANCELLED"].includes(existing.status)) {
-    return true; // Idempotent — already completed.
-  }
-
-  await db.executionJob.update({
-    where: { id: existing.id },
+  // Phase 18I: Lease-fenced update — all conditions checked atomically.
+  const updateResult = await db.executionJob.updateMany({
+    where: {
+      executionId,
+      workerId,
+      leaseId,
+      leaseExpiresAt: { gt: new Date() }, // Lease must not be expired.
+      status: { in: ["CLAIMED", "RUNNING", "VERIFYING"] },
+    },
     data: {
       status: result.status,
       commitSha: result.commitSha || null,
@@ -132,7 +153,21 @@ export async function completeExecutionJob(
     },
   });
 
-  return true;
+  if (updateResult.count > 0) {
+    return true; // Successfully completed.
+  }
+
+  // Check if already completed (idempotency).
+  const existing = await db.executionJob.findUnique({
+    where: { executionId },
+    select: { status: true },
+  });
+
+  if (existing && ["SUCCEEDED", "FAILED", "TIMED_OUT", "BLOCKED", "CANCELLED"].includes(existing.status)) {
+    return true; // Idempotent — already completed.
+  }
+
+  return false; // Lease mismatch, expired, or reclaimed by another worker.
 }
 
 /**

@@ -157,8 +157,13 @@ export function verifyWorkerToken(authHeader: string | null): WorkerToken | null
       return null;
     }
 
-    // Verify replay.
-    if (usedNonces.has(token.nonce)) {
+    // Phase 18I: Replay protection — only for registration/session tokens.
+    // Execution tokens (with executionId + leaseId) are DESIGNED for repeated
+    // use (heartbeat, complete, submit-evidence). They must NOT be single-use.
+    // The lease itself is the fencing mechanism for execution tokens —
+    // if the lease is expired or reclaimed, the endpoint checks that.
+    const isExecutionToken = !!token.executionId && !!token.leaseId;
+    if (!isExecutionToken && usedNonces.has(token.nonce)) {
       return null;
     }
 
@@ -182,8 +187,11 @@ export function verifyWorkerToken(authHeader: string | null): WorkerToken | null
       return null;
     }
 
-    // Mark nonce as used.
-    usedNonces.add(token.nonce);
+    // Phase 18I: Only mark nonce as used for non-execution tokens.
+    // Execution tokens are reusable within their lease period.
+    if (!isExecutionToken) {
+      usedNonces.add(token.nonce);
+    }
     if (usedNonces.size > MAX_NONCE_CACHE) {
       // Simple cleanup — clear half.
       const iter = usedNonces.values();

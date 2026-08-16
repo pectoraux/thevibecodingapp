@@ -14,9 +14,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }
 
-    // For completion, the token must include executionId.
+    // For completion, the token must include executionId and leaseId.
     if (!token.executionId) {
       return NextResponse.json({ error: "Execution token required for completion" }, { status: 403 });
+    }
+
+    // Phase 18I: Require leaseId for lease-fenced completion.
+    if (!token.leaseId) {
+      return NextResponse.json({ error: "Lease ID required for completion" }, { status: 403 });
     }
 
     const body = await req.json();
@@ -26,13 +31,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "status required" }, { status: 400 });
     }
 
-    // Complete the job (idempotent — uses executionId from token).
-    const completed = await completeExecutionJob(token.executionId, {
-      status,
-      commitSha,
-      results,
-      errorMessage,
-    });
+    // Phase 18I: Lease-fenced completion — requires workerId + leaseId + not-expired.
+    const completed = await completeExecutionJob(
+      token.executionId,
+      token.workerId,
+      token.leaseId,
+      {
+        status,
+        commitSha,
+        results,
+        errorMessage,
+      }
+    );
 
     // Update worker concurrency.
     const worker = await db.workerRegistry.findUnique({ where: { workerId: token.workerId } });

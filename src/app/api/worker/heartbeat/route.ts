@@ -7,6 +7,9 @@ import { renewExecutionJobLease } from "@/lib/execution-jobs";
 //
 // Phase 8: AUTHENTICATED — requires a valid execution token with leaseId.
 // The worker identity AND lease are verified cryptographically.
+//
+// Phase 18I: Lease-fenced heartbeat. Uses token.executionId and token.leaseId
+// (not body.jobId) for authorization. The lease must be current and not expired.
 export async function POST(req: Request) {
   try {
     const token = getWorkerToken(req);
@@ -14,20 +17,21 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }
 
-    // For heartbeat, the token must include executionId (proving lease ownership).
+    // For heartbeat, the token must include executionId and leaseId.
     if (!token.executionId) {
       return NextResponse.json({ error: "Execution token required for heartbeat" }, { status: 403 });
     }
-
-    const body = await req.json();
-    const jobId = body.jobId;
-
-    if (!jobId) {
-      return NextResponse.json({ error: "jobId required" }, { status: 400 });
+    if (!token.leaseId) {
+      return NextResponse.json({ error: "Lease ID required for heartbeat" }, { status: 403 });
     }
 
-    // The workerId comes from the token.
-    const renewed = await renewExecutionJobLease(jobId, token.workerId);
+    // Phase 18I: Use token.executionId + token.leaseId (not body.jobId).
+    // The lease is the fencing primitive — body.jobId is IGNORED.
+    const renewed = await renewExecutionJobLease(
+      token.executionId,
+      token.workerId,
+      token.leaseId
+    );
 
     // Update worker heartbeat.
     await db.workerRegistry.update({
