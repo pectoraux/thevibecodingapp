@@ -12,7 +12,7 @@ import { renewExecutionJobLease } from "@/lib/execution-jobs";
 // (not body.jobId) for authorization. The lease must be current and not expired.
 export async function POST(req: Request) {
   try {
-    const token = getWorkerToken(req);
+    const token = getWorkerToken(req, "EXECUTION");
     if (!token) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }

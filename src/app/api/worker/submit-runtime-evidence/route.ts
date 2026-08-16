@@ -33,7 +33,7 @@ import {
 //      result. Required vs optional checks are enforced.
 export async function POST(req: Request) {
   try {
-    const token = getWorkerToken(req);
+    const token = getWorkerToken(req, "EXECUTION");
     if (!token) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }

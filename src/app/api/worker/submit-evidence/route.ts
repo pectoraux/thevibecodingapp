@@ -21,7 +21,7 @@ import { canCompleteTask, getFailureReason, type TaskEvidence as TaskEvidenceObj
 // The control plane independently verifies GitHub state using DERIVED values.
 export async function POST(req: Request) {
   try {
-    const token = getWorkerToken(req);
+    const token = getWorkerToken(req, "EXECUTION");
     if (!token) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }

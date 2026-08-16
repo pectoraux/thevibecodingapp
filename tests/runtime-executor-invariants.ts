@@ -1153,7 +1153,7 @@ const rotateKeyCode18H = readFile("src/app/api/worker/rotate-key/route.ts");
 
 // Test 102: Rotation endpoint is authenticated.
 {
-  const hasAuth = rotateKeyCode18H.includes("getWorkerToken(req)");
+  const hasAuth = rotateKeyCode18H.includes("getWorkerToken(req");
   record(
     "Phase 18H: rotation endpoint requires worker authentication",
     hasAuth,

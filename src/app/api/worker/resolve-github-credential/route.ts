@@ -16,7 +16,7 @@ import { getWorkerToken } from "@/lib/worker-auth";
 // After clone/push, the worker removes the credential from .git/config.
 export async function POST(req: Request) {
   try {
-    const token = getWorkerToken(req);
+    const token = getWorkerToken(req, "EXECUTION");
     if (!token) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }

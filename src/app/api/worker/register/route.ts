@@ -9,7 +9,7 @@ import { getWorkerToken } from "@/lib/worker-auth";
 // The workerId is derived from the token (cryptographic identity), not the body.
 export async function POST(req: Request) {
   try {
-    const token = getWorkerToken(req);
+    const token = getWorkerToken(req, "REGISTRATION");
     if (!token) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }

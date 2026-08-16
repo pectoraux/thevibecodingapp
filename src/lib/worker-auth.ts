@@ -1,21 +1,25 @@
-// Forge — Phase 8 Worker Authentication
+// Forge — Phase 8/18J Worker Authentication
 //
-// Restores the HMAC security boundary on all worker API endpoints.
-// Every worker endpoint requires a valid signed token — no exceptions.
+// Phase 18J: Token type scoping + issuer/audience enforcement.
 //
-// The token is signed with FORGE_WORKER_SECRET (shared between control plane
-// and worker). It establishes worker identity cryptographically.
+// KNOWN LIMITATION (documented honestly):
+//   The HMAC shared secret (FORGE_WORKER_SECRET) is used for both signing
+//   and verification. A worker that knows this secret can theoretically
+//   forge control-plane tokens. Full asymmetric control-plane authority
+//   (separate control-plane key pair) is future work (Phase 18K).
+//
+//   What IS fixed in 18J:
+//     1. Token type field (REGISTRATION/SESSION/EXECUTION) — endpoints enforce.
+//     2. Valid issuer/audience pairs — not all combinations accepted.
+//     3. Registration tokens cannot be used for execution endpoints.
 //
 // Token claims:
-//   iss: "forge-control-plane" (for control-plane-issued tokens)
-//   iss: "forge-worker" (for worker-issued registration tokens)
-//   aud: "forge-worker"
-//   workerId: the worker's identity
-//   executionId: the job being executed (for execution-specific tokens)
-//   leaseId: the lease identifier (for heartbeat/complete tokens)
-//   capabilities: what the worker can do
-//   iat/exp: validity window
-//   nonce: replay protection
+//   tokenType: "REGISTRATION" | "SESSION" | "EXECUTION"
+//   iss: "forge-control-plane" (for session/execution tokens)
+//   iss: "forge-worker" (for registration tokens)
+//   aud: "forge-control-plane" (for registration tokens)
+//   aud: "forge-worker" (for session/execution tokens)
+//   workerId, executionId, leaseId, projectId, capabilities, iat, exp, nonce
 
 import { createHmac, timingSafeEqual, randomUUID } from "node:crypto";
 
@@ -25,7 +29,10 @@ if (!WORKER_SECRET) {
   console.error("[worker-auth] WARNING: FORGE_WORKER_SECRET not set — worker endpoints will be unauthenticated");
 }
 
+export type TokenType = "REGISTRATION" | "SESSION" | "EXECUTION";
+
 export interface WorkerToken {
+  tokenType: TokenType;
   iss: string;
   aud: string;
   workerId: string;
@@ -45,12 +52,30 @@ const MAX_NONCE_CACHE = 10000;
 
 function signTokenPayload(payload: Omit<WorkerToken, "signature">): string {
   const data = [
-    payload.iss, payload.aud, payload.workerId,
+    payload.tokenType, payload.iss, payload.aud, payload.workerId,
     payload.executionId || "", payload.leaseId || "", payload.projectId || "",
     JSON.stringify(payload.capabilities), payload.iat, payload.exp, payload.nonce,
   ].join(".");
   return createHmac("sha256", WORKER_SECRET || "").update(data).digest("hex");
 }
+
+/**
+ * Phase 18J: Valid issuer/audience pairs.
+ * Only these combinations are accepted — not all four.
+ */
+const VALID_PAIRS: Record<string, string[]> = {
+  "forge-control-plane": ["forge-worker"],     // Control plane → worker (session/execution)
+  "forge-worker": ["forge-control-plane"],      // Worker → control plane (registration)
+};
+
+/**
+ * Phase 18J: Token type → required issuer/audience pair.
+ */
+const TOKEN_TYPE_CONSTRAINTS: Record<TokenType, { iss: string; aud: string }> = {
+  REGISTRATION: { iss: "forge-worker", aud: "forge-control-plane" },
+  SESSION: { iss: "forge-control-plane", aud: "forge-worker" },
+  EXECUTION: { iss: "forge-control-plane", aud: "forge-worker" },
+};
 
 /**
  * Create a worker registration token (used by the worker to bootstrap).
@@ -59,12 +84,13 @@ function signTokenPayload(payload: Omit<WorkerToken, "signature">): string {
 export function createRegistrationToken(workerId: string, capabilities: string[]): string {
   const now = Date.now();
   const payload: Omit<WorkerToken, "signature"> = {
+    tokenType: "REGISTRATION",
     iss: "forge-worker",
     aud: "forge-control-plane",
     workerId,
     capabilities,
     iat: now,
-    exp: now + 60000, // 60 seconds — registration token is short-lived
+    exp: now + 60000,
     nonce: randomUUID(),
   };
   const token: WorkerToken = { ...payload, signature: signTokenPayload(payload) };
@@ -73,17 +99,18 @@ export function createRegistrationToken(workerId: string, capabilities: string[]
 
 /**
  * Create a worker session token (issued by control plane after registration).
- * Used for claim, heartbeat, complete operations.
+ * Used for claim operations.
  */
 export function createWorkerSessionToken(workerId: string, capabilities: string[]): string {
   const now = Date.now();
   const payload: Omit<WorkerToken, "signature"> = {
+    tokenType: "SESSION",
     iss: "forge-control-plane",
     aud: "forge-worker",
     workerId,
     capabilities,
     iat: now,
-    exp: now + 300000, // 5 minutes
+    exp: now + 300000,
     nonce: randomUUID(),
   };
   const token: WorkerToken = { ...payload, signature: signTokenPayload(payload) };
@@ -91,7 +118,7 @@ export function createWorkerSessionToken(workerId: string, capabilities: string[
 }
 
 /**
- * Create an execution-specific token (for heartbeat/complete with lease).
+ * Create an execution-specific token (for heartbeat/complete/evidence with lease).
  */
 export function createExecutionToken(
   workerId: string,
@@ -102,6 +129,7 @@ export function createExecutionToken(
 ): string {
   const now = Date.now();
   const payload: Omit<WorkerToken, "signature"> = {
+    tokenType: "EXECUTION",
     iss: "forge-control-plane",
     aud: "forge-worker",
     workerId,
@@ -110,7 +138,7 @@ export function createExecutionToken(
     projectId,
     capabilities,
     iat: now,
-    exp: now + 300000, // 5 minutes
+    exp: now + 300000,
     nonce: randomUUID(),
   };
   const token: WorkerToken = { ...payload, signature: signTokenPayload(payload) };
@@ -120,9 +148,16 @@ export function createExecutionToken(
 /**
  * Verify a worker token from the Authorization header.
  * Returns the token if valid, null otherwise.
- * Checks: signature, issuer, audience, expiry, replay.
+ *
+ * Phase 18J: Enforces token type, valid issuer/audience pairs, and replay.
+ *
+ * @param expectedTokenType If provided, the token must match this type.
+ *   Endpoints should pass their expected type to enforce scoping.
  */
-export function verifyWorkerToken(authHeader: string | null): WorkerToken | null {
+export function verifyWorkerToken(
+  authHeader: string | null,
+  expectedTokenType?: TokenType
+): WorkerToken | null {
   if (!WORKER_SECRET) return null;
   if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
 
@@ -135,14 +170,25 @@ export function verifyWorkerToken(authHeader: string | null): WorkerToken | null
       return null;
     }
 
-    // Verify issuer (must be forge-control-plane for session/execution tokens,
-    // or forge-worker for registration tokens).
-    if (token.iss !== "forge-control-plane" && token.iss !== "forge-worker") {
+    // Phase 18J: Verify tokenType is present and valid.
+    if (!token.tokenType || !["REGISTRATION", "SESSION", "EXECUTION"].includes(token.tokenType)) {
       return null;
     }
 
-    // Verify audience.
-    if (token.aud !== "forge-worker" && token.aud !== "forge-control-plane") {
+    // Phase 18J: Enforce expected token type if specified.
+    if (expectedTokenType && token.tokenType !== expectedTokenType) {
+      return null;
+    }
+
+    // Phase 18J: Enforce valid issuer/audience pair for this token type.
+    const constraints = TOKEN_TYPE_CONSTRAINTS[token.tokenType];
+    if (token.iss !== constraints.iss || token.aud !== constraints.aud) {
+      return null;
+    }
+
+    // Phase 18J: Also check against the valid pairs table.
+    const validAudiences = VALID_PAIRS[token.iss];
+    if (!validAudiences || !validAudiences.includes(token.aud)) {
       return null;
     }
 
@@ -157,18 +203,15 @@ export function verifyWorkerToken(authHeader: string | null): WorkerToken | null
       return null;
     }
 
-    // Phase 18I: Replay protection — only for registration/session tokens.
-    // Execution tokens (with executionId + leaseId) are DESIGNED for repeated
-    // use (heartbeat, complete, submit-evidence). They must NOT be single-use.
-    // The lease itself is the fencing mechanism for execution tokens —
-    // if the lease is expired or reclaimed, the endpoint checks that.
-    const isExecutionToken = !!token.executionId && !!token.leaseId;
+    // Phase 18I: Replay protection — only for non-execution tokens.
+    const isExecutionToken = token.tokenType === "EXECUTION";
     if (!isExecutionToken && usedNonces.has(token.nonce)) {
       return null;
     }
 
     // Verify signature.
     const expectedSignature = signTokenPayload({
+      tokenType: token.tokenType,
       iss: token.iss,
       aud: token.aud,
       workerId: token.workerId,
@@ -188,12 +231,10 @@ export function verifyWorkerToken(authHeader: string | null): WorkerToken | null
     }
 
     // Phase 18I: Only mark nonce as used for non-execution tokens.
-    // Execution tokens are reusable within their lease period.
     if (!isExecutionToken) {
       usedNonces.add(token.nonce);
     }
     if (usedNonces.size > MAX_NONCE_CACHE) {
-      // Simple cleanup — clear half.
       const iter = usedNonces.values();
       for (let i = 0; i < MAX_NONCE_CACHE / 2; i++) {
         iter.next();
@@ -209,9 +250,10 @@ export function verifyWorkerToken(authHeader: string | null): WorkerToken | null
 
 /**
  * Extract and verify a worker token from a Next.js Request.
- * Returns the token if valid, null otherwise.
+ *
+ * Phase 18J: Accepts an optional expectedTokenType for endpoint-specific scoping.
  */
-export function getWorkerToken(req: Request): WorkerToken | null {
+export function getWorkerToken(req: Request, expectedTokenType?: TokenType): WorkerToken | null {
   const authHeader = req.headers.get("authorization");
-  return verifyWorkerToken(authHeader);
+  return verifyWorkerToken(authHeader, expectedTokenType);
 }

@@ -9,7 +9,7 @@ import { claimExecutionJob } from "@/lib/execution-jobs";
 // The worker identity is established cryptographically via the token.
 export async function POST(req: Request) {
   try {
-    const token = getWorkerToken(req);
+    const token = getWorkerToken(req, "SESSION");
     if (!token) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }

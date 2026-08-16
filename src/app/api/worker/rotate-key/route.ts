@@ -22,7 +22,7 @@ import { verify as cryptoVerify } from "node:crypto";
 // Alternative: admin authorization (future — via admin API key).
 export async function POST(req: Request) {
   try {
-    const token = getWorkerToken(req);
+    const token = getWorkerToken(req, "SESSION");
     if (!token) {
       return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }
