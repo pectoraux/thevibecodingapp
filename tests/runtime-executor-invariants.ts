@@ -890,22 +890,35 @@ const endpointCode18F = readFile("src/app/api/worker/submit-runtime-evidence/rou
   record("Phase 18F: endpoint verifies envelope identity matches token", endpointCode18F.includes("envelope.executionId !== token.executionId"), "");
 }
 
-// Test 82: Endpoint does NOT trust FORGE_EXECUTION_MODE (Phase 18V: now derives sandboxed flag from verified substrate attestation).
+// Test 82: Endpoint does NOT trust FORGE_EXECUTION_MODE (Phase 18W: now derives
+// sandboxed flag from TRUSTED substrate attestation — facts + launcher signature).
 {
   const noConfigTrust = !endpointCode18F.includes('FORGE_EXECUTION_MODE === "sandbox"');
-  // Phase 18V: the route no longer hardcodes `executionEnvironmentSandboxed: false`.
+  // Phase 18V: the route stopped hardcoding `executionEnvironmentSandboxed: false`.
   // It now derives both `executionEnvironmentSandboxed` and
   // `substrateAttestationVerified` from `substrateVerified` (the result of
-  // `verifySubstrateAttestation` + `isSubstrateVerified` cross-check). When
-  // the attestation is null/invalid, `substrateVerified` is false → both
-  // fields are false → PRODUCTION_READY blocked. Same fail-closed semantics,
-  // but now backed by a real attestation rather than a placeholder false.
+  // `verifySubstrateAttestation` + `isSubstrateVerified` cross-check).
+  //
+  // Phase 18W: the route now requires TWO signatures for production:
+  //   1. The worker's Ed25519 signature over the envelope (verifyEvidenceEnvelope).
+  //   2. The launcher's Ed25519 signature over canonicalFactsJson in the
+  //      attestation (verifyLauncherAttestation). The launcher key is PINNED
+  //      by the control plane (FORGE_LAUNCHER_PUBLIC_KEY env var, NEVER from
+  //      the request body). A compromised worker key alone cannot forge the
+  //      launcher signature.
+  //
+  // The production gate uses `substrateTrusted` (facts + launcher signature +
+  // nonce/executionId binding). When the attestation is null/invalid/forged,
+  // `substrateTrusted` is false → both `executionEnvironmentSandboxed` and
+  // `substrateAttestationVerified` are false → PRODUCTION_READY blocked.
   const usesAttestation = endpointCode18F.includes("verifySubstrateAttestation") &&
     endpointCode18F.includes("isSubstrateVerified") &&
-    endpointCode18F.includes("executionEnvironmentSandboxed: substrateVerified") &&
-    endpointCode18F.includes("substrateAttestationVerified: substrateVerified");
+    endpointCode18F.includes("verifyLauncherAttestation") &&
+    endpointCode18F.includes("isSubstrateTrusted") &&
+    endpointCode18F.includes("executionEnvironmentSandboxed: substrateTrusted") &&
+    endpointCode18F.includes("substrateAttestationVerified: substrateTrusted");
   record(
-    "Phase 18V: endpoint derives sandboxed flag from verified substrate attestation (fail-closed when null/invalid)",
+    "Phase 18V/18W: endpoint derives sandboxed flag from TRUSTED substrate attestation (facts + launcher signature; fail-closed when null/invalid/forged)",
     noConfigTrust && usesAttestation,
     `noConfig: ${noConfigTrust}, usesAttestation: ${usesAttestation}`
   );

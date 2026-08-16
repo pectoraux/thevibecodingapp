@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { db } from "@/lib/db";
 import { getWorkerToken } from "@/lib/worker-auth";
 
@@ -57,6 +58,38 @@ export async function POST(req: Request) {
     }
     if (job.leaseExpiresAt && job.leaseExpiresAt < new Date()) {
       return NextResponse.json({ error: "Lease expired" }, { status: 403 });
+    }
+
+    // Phase 18W-B: Issue a substrate nonce for this execution. The worker
+    // passes the nonce to the launcher, which binds it into canonicalFactsJson
+    // (the JSON the launcher signs with its Ed25519 key). At runtime evidence
+    // submission time, the control plane verifies the attestation's nonce
+    // matches this stored value (Phase 18W-C) — preventing replay of a
+    // launcher-signed attestation from a different execution.
+    //
+    // The nonce is persisted on the ExecutionJob. If the job already has a
+    // nonce (job-spec was called before), reuse it — the nonce is stable for
+    // the execution's lifetime. If DB write fails (e.g., DB unavailable in
+    // sandbox), generate one anyway and return it in the response — the
+    // worker uses it directly. Phase 18W-C verification will fail if the
+    // control plane can't track the nonce, but that's a control-plane concern.
+    let substrateNonce = (job as any).substrateNonce as string | null | undefined;
+    if (!substrateNonce) {
+      substrateNonce = randomUUID();
+      try {
+        await db.executionJob.update({
+          where: { executionId: token.executionId },
+          data: { substrateNonce } as any,
+        });
+      } catch (err: any) {
+        // DB write failed — log and continue. The nonce is returned in the
+        // response so the worker can use it. Phase 18W-C verification will
+        // require the control plane to track nonces (e.g., in-memory cache
+        // when DB is unavailable).
+        console.warn(
+          `[job-spec] Failed to persist substrateNonce for ${token.executionId}: ${err.message}. Returning nonce in response only.`
+        );
+      }
     }
 
     // Get the task.
@@ -177,6 +210,11 @@ export async function POST(req: Request) {
 
       // Required capabilities
       requiredCapabilities: JSON.parse(job.requiredCapabilities || "[]"),
+
+      // Phase 18W-B: Substrate nonce for launcher-signed attestation. The
+      // worker passes this to the launcher; the control plane verifies it
+      // matches at runtime evidence submission time (Phase 18W-C).
+      substrateNonce,
     };
 
     return NextResponse.json({ spec });

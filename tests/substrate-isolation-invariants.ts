@@ -30,12 +30,14 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { writeFileSync, mkdirSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { runInSubstrate } from "@/lib/substrate-namespace";
 import {
   isSubstrateVerified,
   verifySubstrateAttestation,
   REQUIRED_SECCOMP_PROFILE_HASH,
+  generateLauncherKeyPair,
   type SandboxAttestation,
 } from "@/lib/substrate-attestation";
 import { WorkspaceManager } from "@/lib/runtime-executor";
@@ -83,9 +85,15 @@ function record(name: string, passedFlag: boolean, details: string): void {
 
 const HOSTILE_CWD = "/tmp/forge-hostile-cwd";
 
+// Phase 18W: launcher trust — generate a launcher keypair once for all tests.
+const LAUNCHER_KEY = generateLauncherKeyPair();
+const LAUNCHER_KEY_FILE = `/tmp/forge-test-launcher-key-${Date.now()}.pem`;
+writeFileSync(LAUNCHER_KEY_FILE, LAUNCHER_KEY.privateKeyPem, { mode: 0o600 });
+
 function ensureHostileCwd(): void {
   mkdirSync(HOSTILE_CWD, { recursive: true });
 }
+ensureHostileCwd();
 
 /**
  * Compile a C helper for use as a hostile payload.
@@ -145,6 +153,10 @@ async function runHostile(
     cwd: HOSTILE_CWD,
     timeoutMs: opts?.timeoutMs ?? 10000,
     includeProc: opts?.includeProc,
+    // Phase 18W: launcher trust — pass nonce/executionId/launcherKeyFile.
+    nonce: randomUUID(),
+    executionId: `hostile-${name}-${Date.now()}`,
+    launcherKeyFile: LAUNCHER_KEY_FILE,
   });
 }
 
@@ -798,7 +810,7 @@ int main(void){
 }
 
 // ===========================================================================
-// Final cleanup — kill any stray forge-hostile processes
+// Final cleanup — kill any stray forge-hostile processes + remove launcher key
 // ===========================================================================
 killStrays();
 await new Promise((r) => setTimeout(r, 300));
@@ -810,6 +822,8 @@ if (finalSurvivors > 0) {
     `${finalSurvivors} survivors detected after pkill`
   );
 }
+// Phase 18W: clean up the launcher key file.
+try { rmSync(LAUNCHER_KEY_FILE, { force: true }); } catch { /* best-effort */ }
 
 // ===========================================================================
 // Summary

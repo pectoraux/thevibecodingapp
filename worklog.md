@@ -1986,3 +1986,630 @@ Stage Summary:
 - FULL SUITE: 621 passed, 23 failed (23 pre-existing integration test failures requiring a live server — NOT my changes; verified by stash-and-rerun). 22 non-integration test files: 595 passed, 0 failed.
 - LINT: 0 new errors/warnings in my files. 1 pre-existing error + 12 pre-existing warnings in other files.
 - COMMIT + PUSH + CLEAN-CLONE: see git log for SHA. Triple-SHA verification (local == origin/main == clean-clone) confirmed in the report.
+
+---
+Task ID: 18W-A
+Agent: launcher-trust (full-stack-developer)
+Task: Phase 18W — trusted substrate attestation layer (two-signature trust model). The worker cannot manufacture a valid substrate claim by itself.
+
+Work Log:
+- Read prior context: worklog tail (18V-A substrate core, 18V-B contract/executor/gate integration, 18V-C hostile tests + commit). Repo HEAD = 4515cbb. Verified the substrate core exists: src/lib/substrate-attestation.ts (SandboxAttestation, verifySubstrateAttestation, isSubstrateVerified, computeAttestationHash, REQUIRED_SECCOMP_PROFILE_HASH=883bb01705d5b36d1cee386a8b7e3f67ba7274a981b7a56eed338e64ce48c274), src/lib/substrate/forge-launcher.c (setrlimit+chroot+seccomp+facts JSON+execvp), src/lib/substrate-namespace.ts (runInSubstrate), src/lib/runtime-execution-contract.ts (ExecutionEvidenceEnvelope, computeResultHash/computeEnvelopeHash/signEvidenceEnvelope).
+- Verified environment: OpenSSL available — /usr/include/openssl/evp.h present, `gcc -lcrypto` links, EVP_DigestSign/Verify for Ed25519 tested (sign+verify round-trip = 1, signature = 64 bytes), PEM_read_bio_PrivateKey/PEM_read_bio_PUBKEY work. Used the OpenSSL C approach (not the Node.js fallback).
+- CHANGE 1 (forge-launcher.c): REWROTE the launcher. New arg layout: `<launcher_key_file> <nonce> <execution_id> <substrate_instance_id> <facts_file> <rootfs_dir> <workspace_dir> <binary> [args...]`. Flow: (1) read launcher Ed25519 private key from PEM file BEFORE chroot (BIO_new_file + PEM_read_bio_PrivateKey + verify EVP_PKEY_id == ED25519); (2) setrlimit (CPU/AS fail-closed; NPROC/NOFILE/FSIZE clamp-to-hard); (3) readlink 4 ns inodes + open /proc/self/status fd + open facts fd (before chroot); (4) prctl(NO_NEW_PRIVS); (5) bind-mounts (system/dev/workspace/proc) inside user ns; (6) chroot+chdir (fail-closed exit 3); (7) seccomp BPF (25 blocked syscalls, fail-closed exit 4); (8) parse_proc_status (Seccomp:/CapEff:); (9) getrlimit (observed soft values); (10) create stdout_pipe + stderr_pipe; (11) fork — child: dup2 stdout/stderr to pipes, restore SIGPIPE default, execvp workload; parent: poll() both pipes with 100ms timeout, forward bytes to own stdout/stderr via write_all(), compute SHA-256 via EVP_DigestUpdate (sha256_stream), check waitpid(WNOHANG) to detect workload exit; (12) after workload exits OR pipes reach EOF: final non-blocking drain (fcntl O_NONBLOCK + read until EAGAIN), close pipes; (13) blocking waitpid (should be instant if WNOHANG already reaped); (14) build canonicalFactsJson via open_memstream (sorted keys, no whitespace) — contains executionId, nonce, signedAt, substrateFacts (nested: blockedSyscalls, capEffHex, cpuLimitSeconds, fileDescriptorLimit, fileSizeLimitBytes, memoryLimitBytes, mntNamespaceInode, netNamespaceInode, networkMode, pidNamespaceInode, processLimit, runtimeVersion, seccompMode, userNamespaceInode), substrateInstanceId, workloadExitCode, workloadSignal, workloadStderrHash, workloadStdoutHash; (15) sign canonicalFactsJson UTF-8 bytes with Ed25519 (EVP_DigestSignInit + EVP_DigestSign); (16) write facts file JSON via fdopen(dup(fd)) — includes ALL old fields + nonce, executionId, substrateInstanceId, workloadExitCode, workloadSignal, workloadStdoutHash, workloadStderrHash, canonicalFactsJson (JSON-escaped), launcherSignature (hex), launcherAlgorithm="ed25519", launcherKeyId="forge-launcher-v2", launcherSignedAt; (17) exit with workload's exit code (or 128+signal if killed). Fail-closed: missing key, signing failure, write failure, or any setup failure → exit non-zero with NO/empty facts file. Helpers: read_launcher_key, sha_stream_init/update/final, build_canonical_facts, sign_canonical, write_facts_json, json_escape, to_hex, write_all. SIGPIPE ignored (signal(SIGPIPE, SIG_IGN)) so the launcher can finish computing hashes even if the TS side closes its read end. Compile: `gcc -O2 -Wall -Wextra -o forge-launcher forge-launcher.c -lcrypto` → ZERO warnings. RUNTIME_VERSION bumped to "forge-namespace-launcher-v2".
+- CHANGE 2 (substrate-attestation.ts): EXTENDED SandboxAttestation with 12 new REQUIRED fields: nonce, executionId, substrateInstanceId, workloadExitCode (number|null), workloadSignal (number|null), workloadStdoutHash, workloadStderrHash, canonicalFactsJson, launcherSignature, launcherAlgorithm, launcherKeyId, launcherSignedAt. Updated computeAttestationHash to include ALL 12 new fields (sorted in the fields object). Updated canonicalString() to use `unknown` type (strict mode). Added verifyLauncherAttestation(attestation, launcherPublicKeyPem, expectedNonce, expectedExecutionId) — checks: (1) launcherSignature present, (2) sigBuf length === 64, (3) crypto.verify(null, Buffer.from(canonicalFactsJson,'utf-8'), launcherPublicKeyPem, sigBuf) === true, (4) JSON.parse(canonicalFactsJson), (5) parsed.nonce === expectedNonce, (6) parsed.executionId === expectedExecutionId, (7) parsed.substrateInstanceId present, (8) parsed.workloadStdoutHash present, (9) parsed.workloadStderrHash present. Returns {valid, reasons}. Added isSubstrateTrusted(attestation, launcherPublicKeyPem, expectedNonce, expectedExecutionId) — returns true ONLY when BOTH verifySubstrateAttestation().valid AND verifyLauncherAttestation().valid. Added generateLauncherKeyPair() — generateKeyPairSync('ed25519'), exports pkcs8 private + spki public PEM.
+- CHANGE 3 (substrate-namespace.ts): RunInSubstrateOptions now REQUIRES nonce, executionId, launcherKeyFile. runInSubstrate validates all three are non-empty (fail-closed). Generates substrateInstanceId = crypto.randomUUID(). Passes new args to the launcher (launcherKeyFile, nonce, executionId, substrateInstanceId, factsFile, rootfsDir, workspaceDir, binary, ...args). LauncherFacts interface extended with 12 new fields. buildAttestation() copies all new fields from facts to SandboxAttestation. compileLauncher() now links with -lcrypto (`gcc -O2 -o binary source -lcrypto`). Added randomUUID import.
+- CHANGE 4 (runtime-execution-contract.ts): RuntimeExecutionPolicy now has executionId: string + launcherKeyFile: string. deriveRuntimeExecutionPolicy() options accepts launcherKeyFile? (defaults to ""). Returns policy with executionId + launcherKeyFile populated.
+- CHANGE 5 (runtime-executor.ts): Install + build runInSubstrate() calls now pass nonce (randomUUID()), executionId (policy.executionId), launcherKeyFile (policy.launcherKeyFile). Added randomUUID import from node:crypto.
+- CHANGE 6 (tests/substrate-isolation-invariants.ts): Generates a launcher keypair once at the top (generateLauncherKeyPair), writes private key to /tmp/forge-test-launcher-key-*.pem (mode 0600). runHostile() now passes nonce (randomUUID), executionId (`hostile-${name}-${Date.now()}`), launcherKeyFile. Cleans up key file at end. Added randomUUID + generateLauncherKeyPair imports.
+- CHANGE 7 (tests/substrate-trust-invariants.ts): NEW test file, 12 tests. makeTestLauncherSignedAttestation() helper generates a launcher keypair, writes to temp file, runs /bin/echo in substrate with nonce+executionId+launcherKeyFile, returns {attestation, launcherPublicKeyPem, nonce, executionId}. Tests: (1) signing round-trip valid; (2) fabricated signature (ff*64) rejected; (3) wrong nonce rejected (nonce mismatch reason); (4) wrong executionId rejected; (5) wrong public key rejected (signature INVALID reason); (6) tampered canonicalFactsJson rejected (seccompMode 2→0, signature no longer matches); (7) null/empty/short signature rejected; (8) worker-key forgery fails — generates a WORKER Ed25519 keypair, signs canonicalFactsJson with the worker private key, verifies with a FRESH launcher public key → INVALID (proves the worker key is not the launcher key); also verifies the worker signature IS valid against the worker public key (proving the signature itself is valid Ed25519, just for the wrong key); (9) output binding — echo HELLO → workloadStdoutHash === SHA-256("HELLO\n"); (10) isSubstrateTrusted requires BOTH — (a) valid facts + bad signature → false, (b) host sentinel inodes → facts invalid → false, (c) all valid → true; (11) host sentinel inodes rejected by facts check even with valid signature (verifySubstrateAttestation finds "sentinel" reason, isSubstrateTrusted false); (12) computeAttestationHash includes ALL 12 launcher fields — tampering each field (launcherSignature, canonicalFactsJson, nonce, executionId, substrateInstanceId, workloadStdoutHash, workloadStderrHash, workloadExitCode, workloadSignal, launcherSignedAt, launcherKeyId, launcherAlgorithm) changes the hash.
+- DEVIATION 1 (documented): The launcher's poll loop checks waitpid(WNOHANG) every 100ms. When the workload exits, the launcher breaks out of the poll loop, does a final non-blocking drain, and closes the pipes. This handles orphaned children (e.g., double-forked daemons) that hold the pipe write ends open — without this, poll() would never return EOF and the launcher would hang forever. Data from orphans (after the workload exits) is intentionally discarded.
+- DEVIATION 2 (documented): The launcher's stdout/stderr forwarding mixes launcher diagnostic messages (prefixed "forge-launcher:") with workload output. Existing tests check for workload-specific strings (CONNECT_DENIED, FORKS_SUCCEEDED, SERVER_HEALTH_OK, etc.) which are still present. No assertion weakened.
+- VERIFICATION:
+  * Lint: `bun run lint` → 1 pre-existing error (src/lib/evidence.ts:303 require() — NOT my file), 12 pre-existing warnings (NOT my files). My files (substrate-attestation.ts, substrate-namespace.ts, runtime-executor.ts, runtime-execution-contract.ts, substrate-trust-invariants.ts, substrate-isolation-invariants.ts): ZERO lint errors, ZERO warnings (verified with `npx eslint` on just my files).
+  * Smoke test: generate launcher keypair → run /bin/echo HELLO_FROM_SUBSTRATE in substrate with nonce+executionId+key → STDOUT="HELLO_FROM_SUBSTRATE\n", exitCode=0, attestation valid (substrateType=linux-namespace-sandbox, seccompMode=2, networkMode=hermetic-loopback, runtimeVersion=forge-namespace-launcher-v2). verifySubstrateAttestation=true, verifyLauncherAttestation=true, isSubstrateTrusted=true. Wrong nonce → false (nonce mismatch). Wrong key → false (signature INVALID). Output binding: workloadStdoutHash=61b9fb70... matches SHA-256("HELLO_FROM_SUBSTRATE\n"). computeAttestationHash deterministic. ✅ SMOKE TEST PASSED.
+  * Test suites:
+    - substrate-trust-invariants: 12/12 passed.
+    - substrate-isolation-invariants: 14/14 passed.
+    - runtime-executor-invariants: 102/102 passed.
+    - runtime-verification-invariants: 87/87 passed.
+    - evidence-protocol-closure: 16/16 passed.
+    - Total: 231 passed, 0 failed.
+  * Dev server log: still running clean (200 responses, no errors).
+- Wrote agent-ctx record at /home/z/my-project/agent-ctx/18W-A-launcher-trust.md.
+
+Stage Summary:
+- SEVEN CHANGES applied:
+  1. forge-launcher.c REWRITTEN — fork+capture+sign with OpenSSL Ed25519. Compile: gcc -O2 -Wall -Wextra -lcrypto → zero warnings.
+  2. SandboxAttestation EXTENDED with 12 launcher-trust fields. computeAttestationHash includes all.
+  3. verifyLauncherAttestation + isSubstrateTrusted + generateLauncherKeyPair ADDED.
+  4. runInSubstrate UPDATED — requires nonce/executionId/launcherKeyFile, generates substrateInstanceId, passes new args, reads signed facts.
+  5. RuntimeExecutionPolicy + deriveRuntimeExecutionPolicy UPDATED with executionId + launcherKeyFile.
+  6. runtime-executor.ts UPDATED — install+build pass nonce/executionId/launcherKeyFile.
+  7. tests/substrate-isolation-invariants.ts UPDATED + tests/substrate-trust-invariants.ts CREATED (12 tests).
+- TWO-SIGNATURE TRUST MODEL ENFORCED: the launcher signs canonicalFactsJson with its OWN Ed25519 key (separate from the worker key, provisioned by admin). The control plane verifies BOTH signatures (worker envelope signature + launcher attestation signature). A compromised worker CANNOT forge the launcher signature — it does not have the launcher private key.
+- FAIL-CLOSED: missing launcherKeyFile → runInSubstrate throws → no attestation → PRODUCTION_READY blocked. Missing/invalid signature → verifyLauncherAttestation returns {valid:false} → isSubstrateTrusted false → PRODUCTION_READY blocked.
+- CANONICAL JSON IS DETERMINISTIC: sorted keys, no whitespace, constructed in C via open_memstream. The TS verifier uses the exact string from the facts file (not a reconstruction), so signature verification is byte-for-byte correct.
+- SIGNING HAPPENS INSIDE THE SUBSTRATE (after chroot+seccomp) — the signature attests to the post-seccomp kernel state. The launcher private key is read BEFORE chroot (from the host filesystem) but the signing operation happens after, inside the isolation boundary.
+- OUTPUT BINDING PROVEN: echo HELLO → workloadStdoutHash = SHA-256("HELLO\n"). The launcher actually observed the workload's output (not fabricated).
+- HONEST LIMITATIONS (documented in agent-ctx):
+  1. Root-compromised worker can extract the launcher key file (mitigation: run worker as non-root, key file owned by root mode 0400; in microVM/container, use TPM/KMS-sealed secrets).
+  2. The control plane MUST pin the launcher public key in its config and verify against THAT key (not trust any key from the worker).
+  3. A compromised launcher binary (if the binary itself is tampered) could leak the key — mitigated by code signing / measured boot in production.
+  4. Orphaned child output (after workload exit) is intentionally discarded — correct behavior, the attestation covers the workload's output only.
+- TESTS: 231 passed, 0 failed across 5 suites.
+- LINT: 0 new errors/warnings in my files.
+
+---
+Task ID: 18W-B
+Agent: worker-wiring (full-stack-developer)
+Task: Phase 18W-B — real worker runtime wiring. Replace the poller's
+`substrateAttestation: null` stub with a real call to
+`executeRuntimeVerificationInWorker`, which runs an in-substrate orchestrator
+(Node.js script) inside the linux-namespace-sandbox and captures the
+launcher-signed attestation.
+
+Work Log:
+- Read prior context: worklog tail (18V-A substrate core, 18V-B contract
+  integration, 18V-C hostile tests, 18W-A launcher trust). Repo HEAD =
+  4515cbb. Verified the launcher trust infrastructure exists: SandboxAttestation
+  extended with 12 launcher-signed fields, verifyLauncherAttestation +
+  isSubstrateTrusted + generateLauncherKeyPair in substrate-attestation.ts,
+  runInSubstrate requires nonce/executionId/launcherKeyFile, forge-launcher.c
+  signs canonicalFactsJson with OpenSSL Ed25519.
+- Verified the user's critique: the poller (mini-services/execution-worker/poller.ts)
+  had a `buildAndSubmitRuntimeEvidenceEnvelope` stub that hardcoded
+  `substrateAttestation = null` with a `TODO(phase-18V-integration)`. The
+  control plane correctly fail-closed on null, but the phase claimed to
+  secure a path that didn't actually run.
+- Verified `node` availability in the rootfs: `which node` = `/usr/bin/node`.
+  The launcher's `system_binds` (forge-launcher.c lines 162-168) bind-mount
+  `/usr` into the rootfs. `ldd /usr/bin/node` shows all shared libs under
+  `/lib/x86_64-linux-gnu/` and `/lib64/` — both bind-mounted. No rootfs
+  changes needed.
+- CHANGE 1: Created mini-services/execution-worker/runtime/orchestrator.js
+  (380 lines). Self-contained Node.js script (CommonJS, no npm deps) that
+  runs INSIDE the substrate. Reads /workspace/plan.json, runs install →
+  build → start → port wait → health checks → API journeys → stop, writes
+  /workspace/results.json. Uses ONLY child_process, net, http, fs. Brings
+  lo up via `ip link set lo up` (fresh net namespace starts with lo DOWN).
+  Fail-closed: if install fails, skip build/start; if start fails, skip
+  health/journeys. Always write results.json and tear down the app.
+- CHANGE 2: Created mini-services/execution-worker/tsconfig.json with
+  `paths: { "@/*": ["../../src/*"] }` so the worker can import contract /
+  substrate modules from the main project. Bun reads tsconfig paths natively.
+- CHANGE 3: Created mini-services/execution-worker/runtime/verify.ts (460
+  lines). Exports `executeRuntimeVerificationInWorker(job)`: creates workspace,
+  gitCloneAtSha (execFileSync with arg array, NO shell), writes plan.json +
+  copies orchestrator.js, calls runInSubstrate({ binary: "node",
+  args: ["/workspace/orchestrator.js"], cwd: workspace, timeoutMs, nonce,
+  executionId, launcherKeyFile }), reads results.json, constructs
+  ExecutionEvidenceEnvelope via computeResultHash/computeEnvelopeHash/
+  signEvidenceEnvelope from @/lib/runtime-execution-contract. Returns the
+  signed envelope with substrateAttestation = the REAL attestation from
+  runInSubstrate (NEVER null). Imports only @/lib/runtime-execution-contract,
+  @/lib/substrate-namespace, @/lib/substrate-attestation — verified NONE
+  pull in @/lib/db.
+- CHANGE 4: Modified mini-services/execution-worker/poller.ts. Replaced the
+  `buildAndSubmitRuntimeEvidenceEnvelope` stub (which hardcoded
+  `substrateAttestation = null`) with a real implementation that: validates
+  worker key + FORGE_LAUNCHER_KEY_FILE (throws on missing — fail-closed),
+  resolves GitHub credential via /api/worker/resolve-github-credential,
+  builds authenticated clone URL, resolves substrate nonce (prefers
+  spec.substrateNonce; generates locally as fallback), calls
+  executeRuntimeVerificationInWorker(job), asserts envelope.substrateAttestation
+  non-null (defensive), POSTs to /api/worker/submit-runtime-evidence. Added
+  orchestratorPlanFromSpec(spec) — converts control plane's
+  RuntimeVerificationPlan (string commands) to OrchestratorPlan (binary+args).
+  Added maybeRunRuntimeVerification(spec, result, evidenceResponse) — invoked
+  from workerLoop AFTER successful task completion. Pragmatic gate: only runs
+  if candidate pushed + evidence accepted + plan in spec + GitHub repo
+  connected + canonical HEAD available. If substrate call throws, the task
+  itself already succeeded — throw is caught and logged. PRODUCTION_READY is
+  blocked at the control plane. workerLoop calls maybeRunRuntimeVerification
+  after completeJob succeeds.
+- CHANGE 5: Modified src/app/api/worker/job-spec/route.ts. Issues a
+  substrateNonce (randomUUID) for the execution. Persists it on the
+  ExecutionJob row (so the same nonce is returned on subsequent job-spec
+  calls for the same execution). Returns it in the spec response as
+  spec.substrateNonce. If DB write fails (sandbox), generates a nonce anyway
+  and returns it in the response — the worker uses it directly. Phase 18W-C
+  verification will require the control plane to track nonces.
+- CHANGE 6: Modified prisma/schema.prisma. Added `substrateNonce String?`
+  to ExecutionJob (issued by control plane, passed to launcher, verified at
+  submission time in 18W-C) and to RuntimeEvidence (persisted with evidence
+  for verification by reviewers).
+- CHANGE 7: Created tests/worker-runtime-wiring-invariants.ts (370 lines,
+  8 tests). Tests: (1) orchestrator runs inside the substrate — real HTTP
+  server, real health check, real attestation. (2) attestation is real
+  (non-null) — launcher signature valid, namespace inodes valid, seccompMode=2,
+  seccomp profile hash matches. (3) envelope is properly signed by the
+  worker's Ed25519 key (and rejects other keys). (4) attestation is bound
+  to the execution (executionId + nonce match; wrong values rejected by
+  verifyLauncherAttestation). (5) workload results bound in attestation
+  (workloadExitCode matches orchestrator exit code, workloadStdoutHash
+  matches SHA-256 of orchestrator stdout). (6) failed app (wrong port) →
+  failed result + failureReason mentions startup, but attestation STILL
+  present (substrate ran, workload just failed). (7) no null-attestation
+  path — substrate failure (missing launcher key) THROWS, never returns
+  null attestation. (8) orchestrator handles a real app — all stages
+  produce results (install + build + start + health + teardown),
+  attestation trusted, envelope signed.
+- CHANGE 8: Modified eslint.config.mjs. Added
+  mini-services/execution-worker/runtime/orchestrator.js to the ignores
+  list — the orchestrator is a CommonJS Node.js script (uses require())
+  that runs inside a chroot with no module resolution guarantees. ESLint's
+  @typescript-eslint/no-require-imports rule flags it, but the require()
+  calls are intentional — ESM would require --experimental-modules flags
+  or .mjs extension that complicates the launcher's exec path.
+- SMOKE TEST: generate launcher keypair → generate worker keypair → create
+  test app (Node.js HTTP server with /health endpoint) → call
+  executeRuntimeVerificationInWorker → print envelope details. Results:
+  envelope.passed=true, substrateAttestation non-null, substrateType=
+  linux-namespace-sandbox, seccompMode=2, executionId matches, nonce
+  matches, workloadExitCode=0, workloadStdoutHash matches SHA-256 of
+  orchestrator stdout, launcherSignature present. Worker envelope
+  signature valid (verifyEvidenceEnvelope=true), substrate facts valid,
+  launcher signature valid, isSubstrateTrusted=true. Health check
+  passed=true, status=200. ✅ SMOKE TEST PASSED.
+- TESTS:
+  - worker-runtime-wiring-invariants: 8/8 passed (NEW).
+  - substrate-trust-invariants: 12/12 passed (unchanged).
+  - substrate-isolation-invariants: 14/14 passed (unchanged).
+  - runtime-executor-invariants: 102/102 passed (unchanged).
+  - runtime-verification-invariants: 87/87 passed (unchanged).
+  - evidence-protocol-closure: 16/16 passed (unchanged).
+  - Total: 239 passed, 0 failed across 6 suites.
+- LINT: `bun run lint` → 1 error + 12 warnings, ALL PRE-EXISTING (the 1
+  error is in src/lib/evidence.ts:303, documented in 18W-A as "NOT my
+  file"; the 12 warnings are unused eslint-disable directives in other
+  files). My new/modified files (orchestrator.js [ignored], verify.ts,
+  poller.ts, tsconfig.json, job-spec/route.ts, worker-runtime-wiring-
+  invariants.ts, eslint.config.mjs, schema.prisma): ZERO new lint errors,
+  ZERO new lint warnings.
+- DEVIATION 1 (documented): The poller uses `spec.baseCommitSha` as the
+  canonical HEAD proxy for runtime verification. In production, runtime
+  verification should run on the POST-MERGE canonical HEAD (after the
+  candidate PR is merged). The poller currently uses the pre-merge
+  baseCommitSha. The wiring is correct for Phase 18W-B; production
+  deployment will need a separate "post-merge runtime verification"
+  trigger.
+- DEVIATION 2 (documented): The poller uses `${architectureHash}-runtime`
+  as a placeholder runtimePlanHash (it doesn't import hashRuntimePlan).
+  The control plane re-derives the real runtimePlanHash at submission
+  time from the architecture contract. The poller's placeholder is only
+  used to populate the envelope field; the control plane ignores it.
+- DEVIATION 3 (documented): The runtime-executor.ts (in-process executor,
+  NOT the worker poller) still has a `substrateAttestation = null` fallback
+  at line 616. This is a DIFFERENT code path (runs inside the control
+  plane's Next.js process, not the worker). It's a defensive catch for
+  when the substrate setup itself fails — the executor records a failed
+  install result and the attestation stays null. The production gate
+  blocks. This is consistent with the fail-closed model. NOT the same as
+  the poller stub the user identified.
+- Wrote agent-ctx record at /home/z/my-project/agent-ctx/18W-B-worker-wiring.md.
+
+Stage Summary:
+- EIGHT CHANGES applied:
+  1. orchestrator.js CREATED — in-substrate Node.js script (CommonJS, no
+     deps). Runs install → build → start → port wait → health → journeys →
+     stop, writes results.json. Brings lo up.
+  2. worker tsconfig.json CREATED — @/* path alias for main-project imports.
+  3. verify.ts CREATED — executeRuntimeVerificationInWorker. Clones at SHA,
+     writes plan, calls runInSubstrate, reads results, constructs signed
+     envelope with REAL attestation (NEVER null).
+  4. poller.ts MODIFIED — buildAndSubmitRuntimeEvidenceEnvelope stub GONE.
+     Real call to executeRuntimeVerificationInWorker. workerLoop calls
+     maybeRunRuntimeVerification after task completion. Fail-closed: throws
+     on substrate failure.
+  5. job-spec/route.ts MODIFIED — issues substrateNonce, persists on
+     ExecutionJob, returns in spec response. DB-unavailable fallback.
+  6. schema.prisma MODIFIED — substrateNonce String? on ExecutionJob +
+     RuntimeEvidence. db:push failed (no PostgreSQL in sandbox, expected).
+  7. worker-runtime-wiring-invariants.ts CREATED — 8 tests, all pass.
+  8. eslint.config.mjs MODIFIED — ignores orchestrator.js (CommonJS,
+     intentional require()).
+- THE `substrateAttestation: null` STUB IS GONE. Grep confirms only ONE
+  match in the worker dir: a comment documenting the invariant ("There is
+  NO path where this function submits an envelope with substrateAttestation:
+  null."). The actual `const substrateAttestation = null;` line is gone —
+  replaced by a real call to executeRuntimeVerificationInWorker.
+- FAIL-CLOSED ENFORCED: substrate failure (missing launcher key, gcc
+  missing, unshare fails, launcher won't compile, facts file missing) →
+  executeRuntimeVerificationInWorker THROWS → poller catches and logs →
+  PRODUCTION_READY blocked at the control plane. Test 7 proves this with
+  a missing launcher key file.
+- TWO-SIGNATURE TRUST MODEL PRESERVED: the worker's envelope signature is
+  Ed25519 with the worker's private key (separate from the launcher key).
+  The launcher's substrate attestation signature is Ed25519 with the
+  launcher's private key (provisioned by admin). The control plane verifies
+  BOTH signatures. A compromised worker cannot forge the launcher signature
+  (it doesn't have the launcher private key).
+- WORKLOAD BINDING PROVEN: the attestation's workloadExitCode matches the
+  orchestrator's exit code, workloadStdoutHash matches SHA-256 of the
+  orchestrator's stdout. The launcher actually observed the workload's
+  output (not fabricated). Test 5 verifies this.
+- EXECUTION BINDING PROVEN: attestation.executionId matches the job's
+  executionId, attestation.nonce matches the job's nonce. Prevents replay
+  across executions. Test 4 verifies this.
+- TESTS: 239 passed, 0 failed across 6 suites (8 NEW + 231 existing).
+- LINT: 0 new errors/warnings in my files. 1 pre-existing error in
+  src/lib/evidence.ts:303 (documented). 12 pre-existing warnings
+  (unused eslint-disable directives in other files).
+- HONEST LIMITATIONS (documented in agent-ctx):
+  1. DB-dependent claim loop not testable in sandbox (no PostgreSQL).
+     The wiring is correct for production; the smoke test verifies the
+     integration point (executeRuntimeVerificationInWorker) directly.
+  2. The poller uses spec.baseCommitSha as the canonical HEAD proxy (pre-
+     merge). Production needs a post-merge trigger.
+  3. The poller uses a placeholder runtimePlanHash (${architectureHash}-
+     runtime). The control plane re-derives the real hash at submission.
+  4. The orchestrator brings lo up via `ip link set lo up` (best-effort).
+     If `ip` is missing, the app may fail to bind — the substrate itself
+     still enforces the net namespace.
+  5. The in-process runtime-executor.ts (NOT the worker poller) still has
+     a `substrate = null` fallback at line 616. This is a DIFFERENT code
+     path — the in-process executor that runs inside the control plane's
+     Next.js process. Defensive catch for substrate setup failure. The
+     production gate blocks. NOT the same as the poller stub.
+
+---
+Task ID: 18W-C
+Agent: control-plane-e2e (full-stack-developer)
+Task: Phase 18W closing piece — control-plane dual-signature verification + E2E integration test + commit
+
+Work Log:
+- Read prior context: worklog tail (18W-A launcher signing + verifyLauncherAttestation
+  + isSubstrateTrusted in substrate-attestation.ts; 18W-B worker wiring +
+  executeRuntimeVerificationInWorker in mini-services/execution-worker/runtime/
+  verify.ts; 18W-B poller.ts real call replacing the substrateAttestation=null
+  stub; 18W-B substrateNonce added to ExecutionJob + RuntimeEvidence in
+  prisma/schema.prisma). Git HEAD = 4515cbb (Phase 18V) with uncommitted 18W-A +
+  18W-B changes. Verified the user's critique is now addressable: 18W-A and
+  18W-B provide the substrate-side machinery; 18W-C wires the control plane
+  to actually VERIFY it.
+- Verified the 18V-B submit-runtime-evidence route (src/app/api/worker/
+  submit-runtime-evidence/route.ts): it currently calls verifySubstrateAttestation
+  (facts-only) and uses the result as the production gate. This is INSUFFICIENT
+  for the two-signature trust model — a compromised worker could construct a
+  structurally-valid SandboxAttestation (right inodes, right seccompMode,
+  right profile hash, right caps dropped) WITHOUT actually running the
+  launcher, since the facts-only check has no signature to verify.
+- CHANGE 1: Updated src/app/api/worker/submit-runtime-evidence/route.ts.
+  Added launcher attestation verification AFTER the existing envelope-
+  signature check + envelope identity check. The control plane now verifies
+  BOTH signatures:
+    (a) Worker envelope signature (Phase 18G, unchanged).
+    (b) LAUNCHER attestation signature (Phase 18W, NEW).
+  The launcher signature is verified against the PINNED launcher public key
+  (FORGE_LAUNCHER_PUBLIC_KEY env var), NEVER from the request body. The
+  expectedNonce comes from ExecutionJob.substrateNonce (issued at job-spec
+  time, persisted in 18W-B). The expectedExecutionId comes from the
+  AUTHENTICATED token (NOT the envelope body — envelope identity was
+  already verified above).
+  - Renamed the facts-only `substrateVerified` to `substrateFactsVerified`
+    (diagnostic only). Added `substrateTrusted` (facts + launcher signature
+    + binding — the production gate). Defense-in-depth: substrateTrusted
+    re-runs isSubstrateTrusted() as a cross-check.
+  - When the pinned key OR expected nonce is missing → fail-closed:
+    launcherVerification.valid=false with a clear reason; substrateTrusted
+    remains false; PRODUCTION_READY blocked.
+  - When envelope.substrateAttestation is null (defensive — 18W-B
+    guarantees this never happens, but if it does, log
+    NO_SUBSTRATE_ATTESTATION and block production).
+  - When launcherVerification.valid is false (and attestation is non-null),
+    emit a SUBSTRATE_ATTESTATION_REJECTED event with the specific failure
+    reasons.
+  - prodEvidence.executionEnvironmentSandboxed AND substrateAttestationVerified
+    now both use `substrateTrusted` (Phase 18W: facts + launcher signature).
+    Replaces the 18V facts-only placeholder.
+  - Persisted RuntimeEvidence.substrateVerified now means FULLY TRUSTED
+    (was: facts-only). The semantic change is documented in the schema
+    comment. Also persists substrateNonce (Phase 18W-B field) on the
+    evidence row so a reviewer can verify the nonce binding without re-
+    reading the ExecutionJob row.
+  - Response payload surfaces BOTH verdicts (substrateFactsVerified +
+    substrateTrusted + launcherVerified) plus BOTH reasons arrays
+    (substrateVerificationReasons + launcherVerificationReasons) so
+    reviewers can see exactly which check failed.
+- CHANGE 2: Created tests/e2e-substrate-trust-invariants.ts (12 tests,
+  ~640 lines). The END-TO-END ACCEPTANCE TEST for the two-signature trust
+  model. Exercises the REAL path (worker → substrate → evidence → control-
+  plane verification) by calling executeRuntimeVerificationInWorker()
+  directly — no HTTP, no DB. Tests:
+    1. FULL E2E valid path: worker → substrate → evidence → verification.
+       Asserts: attestation non-null, worker sig valid, launcher sig valid,
+       isSubstrateTrusted=true, envelope.passed=true, workloadExitCode=0,
+       executionId+nonce bound.
+    2. Fabricated attestation rejected (random launcherSignature).
+    3. Worker-key forgery rejected (sign canonicalFactsJson with the
+       WORKER's private key, put as launcherSignature; launcher key ≠
+       worker key → verify fails).
+    4. Wrong nonce rejected (anti-replay — attestation from execution A
+       cannot be replayed for execution B).
+    5. Wrong executionId rejected (attestation is bound to a specific
+       execution).
+    6. Wrong launcher public key rejected (control plane pins ONE key;
+       a different launcher keypair fails verification).
+    7. No launcher public key configured → fail-closed (empty key →
+       isSubstrateTrusted returns false, verifyLauncherAttestation reports
+       the empty-key reason).
+    8. Envelope tampering breaks worker signature (flip envelope.passed;
+       verifyEvidenceEnvelope returns false — either envelopeHash mismatch
+       or signature mismatch).
+    9. Attestation bound into envelope hash (change substrateInstanceId →
+       computeEnvelopeHash produces a DIFFERENT hash — proves the
+       attestation is Ed25519-bound by the worker's signature).
+    10. Failed app still produces valid attestation (app crashes on start;
+        envelope.passed=false; attestation STILL non-null; isSubstrateTrusted
+        STILL true; workloadExitCode !== 0 — the substrate ran correctly,
+        just the workload failed).
+    11. Production predicate requires trusted attestation
+        (canReachProductionReadyWithRuntime: no trust → false + reason
+        mentions substrate/attestation/sandboxed; trust + all other
+        conditions → true).
+    12. Real substrate isolation in the E2E path (attestation's namespace
+        inodes differ from host's — read via both getHostNamespaceInodes()
+        AND a direct readlinkSync("/proc/self/ns/user"); seccompMode === 2;
+        seccompProfileHash matches REQUIRED_SECCOMP_PROFILE_HASH). Proves
+        the E2E path actually ran inside the real substrate, not a mock.
+- CHANGE 3: Updated tests/runtime-executor-invariants.ts Test 82. The
+  previous test asserted that the route source contained
+  `executionEnvironmentSandboxed: substrateVerified` (Phase 18V facts-
+  only). After 18W, the route uses `substrateTrusted` (Phase 18W facts +
+  launcher signature). Updated the assertion to require:
+    - verifySubstrateAttestation (facts check)
+    - isSubstrateVerified (facts shortcut, defense-in-depth)
+    - verifyLauncherAttestation (launcher signature check)
+    - isSubstrateTrusted (combined check, defense-in-depth)
+    - executionEnvironmentSandboxed: substrateTrusted
+    - substrateAttestationVerified: substrateTrusted
+  Test now passes (was failing because the route's variable name changed).
+  Test count: 102 passed, 0 failed (was 101 passed, 1 failed).
+- E2E TEST RESULTS: 12/12 passed.
+  - Test 1 FULL E2E valid path: attestation non-null, worker sig valid,
+    launcher sig valid, isSubstrateTrusted=true, passed=true, exitCode=0,
+    execId+nonce bound. ✅
+  - Test 2 fabricated attestation: verifyLauncherAttestation.valid=false,
+    isSubstrateTrusted=false. ✅
+  - Test 3 worker-key forgery: signing canonicalFactsJson with the WORKER's
+    private key, then verifying with the LAUNCHER's public key → invalid. ✅
+  - Test 4 wrong nonce: rejected with "nonce" in the reason. ✅
+  - Test 5 wrong executionId: rejected with "executionId" in the reason. ✅
+  - Test 6 wrong launcher key: different keypair fails. ✅
+  - Test 7 no launcher key: empty key → fail-closed with "empty" reason. ✅
+  - Test 8 envelope tampering: flipping passed → verifyEvidenceEnvelope=false. ✅
+  - Test 9 attestation bound into envelope hash: tampered substrateInstanceId
+    → different envelopeHash. ✅
+  - Test 10 failed app: app crashes → passed=false, attestation STILL
+    present, isSubstrateTrusted=true, workloadExitCode=1 (orchestrator
+    exits 1 when passed=false). ✅
+  - Test 11 production predicate: no trust → false + reason mentions
+    "substrate"/"sandboxed"; trust → true. ✅
+  - Test 12 real substrate isolation: user/pid/net/mnt namespace inodes
+    all differ from host (via both getHostNamespaceInodes AND direct
+    readlinkSync); seccompMode=2; seccompProfileHash matches. ✅
+- FULL TEST SUITE: 627 passed, 0 failed across 25 non-integration test
+  files. Integration tests (hostile-security-test 0/13, security-test 0/7,
+  regression-test 17/2, worker-security-test 9/1) fail as pre-existing —
+  they require a live Next.js server + PostgreSQL. Total test count:
+  627 + 26 (partial integration passes) = 653.
+  Breakdown:
+    - architecture-invariants: 16
+    - asymmetric-authority-invariants: 15
+    - canonical-import-gate: 33
+    - challenge-persistence: 14
+    - durable-identity-invariants: 11
+    - e2e-substrate-trust-invariants: 12 (NEW)
+    - enrollment-authority-closure: 14
+    - evidence-context-binding: 14
+    - evidence-protocol-closure: 16
+    - lease-fencing-invariants: 16
+    - manifest-verification: 40
+    - phase10-invariants: 7
+    - protocol-convergence-invariants: 10
+    - readiness-source-invariants: 11
+    - repository-scanner-invariants: 99
+    - repository-source-invariants: 10
+    - reregister-lifetime-closure: 13
+    - runtime-executor-invariants: 102 (Test 82 fixed for Phase 18W)
+    - runtime-verification-invariants: 87
+    - substrate-isolation-invariants: 14
+    - substrate-trust-invariants: 12 (18W-A)
+    - token-scoping-invariants: 24
+    - trusted-enrollment-invariants: 18
+    - worker-identity-integration: 11
+    - worker-runtime-wiring-invariants: 8 (18W-B)
+  Sum: 627 (matches spec's expected ~595 + 12 + 8 + 12 = 627).
+- LINT: `bun run lint` → 1 error + 12 warnings, ALL PRE-EXISTING:
+    - 1 error: src/lib/evidence.ts:303 — `@typescript-eslint/no-require-imports`
+      (documented in 18W-A and 18W-B worklogs as "NOT my file").
+    - 12 warnings: unused eslint-disable directives in src/app/api/_lib.ts,
+      src/lib/github.ts, src/lib/secret-store.ts, src/lib/worker.ts — none
+      of which I touched in 18W-C.
+  My touched files (src/app/api/worker/submit-runtime-evidence/route.ts,
+  tests/e2e-substrate-trust-invariants.ts, tests/runtime-executor-
+  invariants.ts): ZERO new lint errors, ZERO new lint warnings.
+- ROUTE VERIFICATION FLOW (step by step, post-18W-C):
+    1. Authenticate the EXECUTION token (workerId, executionId, leaseId).
+    2. Load the ExecutionJob (now selects substrateNonce too).
+    3. Load the project (canonicalHeadSha, githubRepo, etc.).
+    4. Parse body.envelope (the signed ExecutionEvidenceEnvelope).
+    5. Resolve the worker's public key from WorkerRegistry (NEVER from body).
+    6. verifyEvidenceEnvelope(envelope, workerReg.publicKeyPem) — worker
+       envelope signature check. Rejects on failure (HTTP 403).
+    7. verifySubstrateAttestation(envelope.substrateAttestation) — Phase 18V
+       facts-only check (inodes, seccompMode, profile hash, rlimits, caps,
+       networkMode, readonlyRootfs). Cross-checked with isSubstrateVerified
+       for defense-in-depth. Produces substrateFactsVerified (diagnostic).
+    8. Verify envelope identity: envelope.executionId === token.executionId
+       AND envelope.workerId === token.workerId. Rejects on mismatch (403).
+    9. Resolve the PINNED launcher public key from FORGE_LAUNCHER_PUBLIC_KEY
+       env var (NEVER from body). Resolve expectedNonce from
+       executionJob.substrateNonce. Resolve expectedExecutionId from token.
+    10. If envelope.substrateAttestation is null (defensive — 18W-B
+        guarantees non-null), emit NO_SUBSTRATE_ATTESTATION event and
+        fail-closed on production.
+    11. If pinned key OR expected nonce is missing, set launcherVerification
+        to {valid:false, reasons:[...fail-closed...]}.
+        Else, verifyLauncherAttestation(envelope.substrateAttestation,
+        launcherPublicKeyPem, expectedNonce, expectedExecutionId) — checks
+        Ed25519 signature over canonicalFactsJson + nonce binding +
+        executionId binding + substrateInstanceId/workloadStdoutHash/
+        workloadStderrHash presence.
+    12. If attestation non-null AND launcherVerification.valid is false,
+        emit SUBSTRATE_ATTESTATION_REJECTED event with the reasons.
+    13. Compute substrateTrusted (the production gate):
+        - envelope.substrateAttestation is non-null AND
+        - substrateFactsVerified (Phase 18V facts) AND
+        - launcherVerification.valid (Phase 18W launcher sig + binding) AND
+        - isSubstrateTrusted(...) re-runs the combined check (defense-in-
+          depth).
+    14. Derive RuntimeVerificationResult from the envelope (server-
+        authoritative SHA, plan derivation, plan-aware evaluation).
+    15. Verify GitHub freshness (headVerified).
+    16. Persist RuntimeEvidence (append-only): substrateVerified =
+        substrateTrusted, substrateNonce = expectedNonce (NEW).
+    17. Emit RUNTIME_VERIFIED event with substrateFactsVerified,
+        substrateTrusted, launcherVerified, both reasons arrays.
+    18. If runtime passed but NOT substrateTrusted, emit
+        RUNTIME_VERIFIED_NO_TRUSTED_SUBSTRATE warning (fail-closed).
+    19. Evaluate production predicate: prodEvidence.
+        executionEnvironmentSandboxed = substrateTrusted (Phase 18W).
+        prodEvidence.substrateAttestationVerified = substrateTrusted.
+    20. If predicate passes → emit PRODUCTION_READY. Else → emit
+        RUNTIME_VERIFIED_NOT_PRODUCTION_READY with failureReason.
+    21. Return response: substrateFactsVerified, substrateTrusted,
+        launcherVerified, both reasons arrays.
+- HONEST ASSESSMENT (does 18W close the two gaps the user identified?):
+  GAP 1: "Worker actually runs runtime verification in the sandbox."
+    YES. 18W-B replaced the `substrateAttestation = null` stub with a real
+    call to executeRuntimeVerificationInWorker, which calls runInSubstrate
+    (real fork + unshare + seccomp BPF + cap-drop + rlimits + readonly
+    rootfs + hermetic-loopback net namespace). The orchestrator runs
+    INSIDE the substrate (Node.js script with no module resolution beyond
+    what's bind-mounted). The launcher signs the observed facts (inodes
+    read from /proc/self/ns/*, seccompMode from /proc/self/status, etc.)
+    with its OWN Ed25519 key — INSIDE the substrate, after the workload
+    finishes. The E2E test (test 12) proves the namespace inodes differ
+    from the host (so the substrate really entered a new namespace) and
+    the seccompProfileHash matches the required filter (so seccomp is
+    actually applied). Gap 1 is CLOSED for the worker poller path.
+    CAVEAT: the in-process runtime-executor.ts (used by the control plane
+    itself for tasks that don't go through the worker) STILL has a
+    `substrate = null` fallback at line 616. This is a DIFFERENT code path
+    (in-process execution, not worker execution). Documented in 18W-B as
+    DEVIATION 3. If the substrate setup fails in-process, the executor
+    records a failed install result and the attestation stays null. The
+    production gate blocks (substrateTrusted = false). This is fail-closed,
+    NOT a security hole — but it means the in-process executor doesn't
+    PROVE the substrate ran. For full closure, the in-process executor
+    should also call executeRuntimeVerificationInWorker (or an equivalent
+    that produces a real attestation). Tracked as a follow-up.
+  GAP 2: "Worker cannot manufacture a valid substrate claim by itself."
+    YES. 18W-A added verifyLauncherAttestation + isSubstrateTrusted.
+    18W-C wired the control plane to call them. The launcher signs
+    canonicalFactsJson with its OWN Ed25519 key (separate from the worker
+    key, provisioned by admin). The control plane verifies with the
+    PINNED launcher public key (FORGE_LAUNCHER_PUBLIC_KEY env, NEVER from
+    the request body). A compromised worker CANNOT:
+      - Forge the launcher signature (doesn't have the launcher private
+        key). Test 3 proves this (signing with the worker key fails).
+      - Replay a launcher-signed attestation from a different execution
+        (nonce + executionId are bound into canonicalFactsJson and checked
+        at verification time). Tests 4 and 5 prove this.
+      - Substitute its own launcher key (control plane uses the pinned
+        key, not the worker's). Test 6 proves this (different launcher
+        keypair fails).
+      - Construct a structurally-valid facts-only attestation (the
+        launcher signature is over canonicalFactsJson which includes ALL
+        the facts — host sentinel inodes, wrong seccompMode, etc. would
+        all be in the signed payload; even if the worker fabricated the
+        facts, it can't forge the signature over them).
+    Gap 2 is CLOSED.
+  RESIDUAL (documented): a ROOT-compromised worker host can extract the
+  launcher private key from the launcherKeyFile on disk. With the launcher
+  private key, the attacker can sign arbitrary canonicalFactsJson and
+  construct a valid-looking attestation WITHOUT actually running the
+  substrate. The control plane cannot distinguish this from a real
+  attestation. Full closure requires HARDWARE attestation (TPM measured
+  boot, Intel SGX enclaves, AMD SEV-SNP) — the launcher would attest
+  that it ran on trusted hardware with the workload measured into a
+  PCR register. This is out of scope for Phase 18W; documented in the
+  commit message. The current model raises the bar significantly (a
+  compromised worker key alone is useless; the attacker needs root on
+  the worker host AND the launcher private key file), but does not close
+  the root-compromise gap.
+- Wrote agent-ctx record at /home/z/my-project/agent-ctx/18W-C-control-plane-e2e.md.
+
+Stage Summary:
+- THREE CHANGES applied:
+  1. submit-runtime-evidence route.ts: dual-signature verification. Worker
+     envelope signature (Phase 18G, unchanged) + launcher attestation
+     signature (Phase 18W, NEW). Pinned launcher key from env. Nonce from
+     ExecutionJob.substrateNonce. ExecutionId from authenticated token.
+     Production gate = isSubstrateTrusted (facts + launcher sig + binding).
+     Fail-closed when key/nonce missing OR signature invalid OR attestation
+     null. Persists substrateTrusted as RuntimeEvidence.substrateVerified
+     (semantic changed from facts-only in 18V to fully-trusted in 18W).
+     Persists substrateNonce on the evidence row.
+  2. tests/e2e-substrate-trust-invariants.ts CREATED — 12 E2E tests.
+     Exercises the REAL path: worker → substrate → evidence → control-
+     plane verification. Uses executeRuntimeVerificationInWorker (no HTTP,
+     no DB). Proves: full valid path, fabrication/tamper/forgery rejected,
+     fail-closed without pinned key, real substrate isolation (inodes
+     differ from host, seccompMode=2, profile hash matches).
+  3. tests/runtime-executor-invariants.ts Test 82 UPDATED — assertion now
+     requires verifyLauncherAttestation + isSubstrateTrusted in the route
+     source (Phase 18W two-signature model). Test was failing because the
+     route's variable name changed from substrateVerified to substrateTrusted.
+- TRUST MODEL ENFORCED:
+    trusted launcher (Ed25519 key, admin-provisioned, runs inside substrate)
+        ↓ signs: substrate facts + nonce + executionId + workload results
+    launcher-signed attestation
+        ↓
+    worker includes attestation in envelope, signs envelope with worker key
+        ↓
+    control plane verifies BOTH signatures + nonce + executionId binding
+  A compromised worker key cannot forge the launcher signature (different
+  key). A worker that doesn't run the launcher cannot produce a valid
+  attestation. A worker that runs the workload outside the substrate is
+  caught by the output binding (workloadStdoutHash, workloadExitCode are
+  in the signed canonicalFactsJson).
+- FAIL-CLOSED: no launcher key pinned → ALL attestations untrusted → ALL
+  production blocked. Invalid launcher signature → attestation rejected,
+  PRODUCTION_READY blocked, event logged. Null attestation (defensive —
+  18W-B guarantees non-null) → NO_SUBSTRATE_ATTESTATION event, production
+  blocked.
+- TESTS: 627 passed, 0 failed across 25 non-integration suites (12 NEW
+  in 18W-C + 12 from 18W-A + 8 from 18W-B + 595 pre-existing). 4
+  integration suites fail as pre-existing (require live server + DB).
+- LINT: 0 new errors/warnings in my files. 1 pre-existing error in
+  src/lib/evidence.ts:303 (documented). 12 pre-existing warnings (unused
+  eslint-disable directives in other files).
+- HONEST LIMITATIONS (documented):
+  1. Root-compromised worker host can extract the launcher private key
+     from launcherKeyFile. Full closure requires hardware attestation
+     (TPM/SGX/SEV). Out of scope for 18W; documented in the commit message.
+  2. The in-process runtime-executor.ts (NOT the worker poller) still has
+     a `substrate = null` fallback at line 616. Different code path
+     (in-process execution inside the control plane's Next.js process).
+     Defensive catch for substrate setup failure. Production gate blocks.
+     NOT the same as the poller stub. For full closure, the in-process
+     executor should also call executeRuntimeVerificationInWorker or
+     equivalent. Tracked as a follow-up.
+  3. LauncherRegistry DB table NOT yet implemented. The pinned launcher
+     key currently comes from FORGE_LAUNCHER_PUBLIC_KEY env var only. A
+     DB-backed registry (admin-enrolled, like WorkerRegistry) would let
+     admin rotate keys without a redeploy. Documented in the route
+     comment as a follow-up.
+  4. The control plane re-derives the runtimePlanHash at submission time
+     (it doesn't trust the worker's value). The poller uses a placeholder
+     (${architectureHash}-runtime). The control plane's value is the
+     authoritative one. Documented in 18W-B.
+  5. DB-dependent verification flow (route.ts) is not directly testable
+     in the sandbox (no PostgreSQL). The E2E test exercises the
+     verification FUNCTIONS (verifyLauncherAttestation, isSubstrateTrusted,
+     verifyEvidenceEnvelope, canReachProductionReadyWithRuntime) directly
+     with real substrate-produced attestations. The route's logic is a
+     thin wrapper around these functions. The integration is verified by
+     the route source-level test in runtime-executor-invariants Test 82.

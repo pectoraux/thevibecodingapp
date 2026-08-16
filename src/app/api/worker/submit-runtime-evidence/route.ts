@@ -19,6 +19,9 @@ import {
 import {
   verifySubstrateAttestation,
   isSubstrateVerified,
+  verifyLauncherAttestation,
+  isSubstrateTrusted,
+  type SubstrateVerificationResult,
 } from "@/lib/substrate-attestation";
 
 // POST /api/worker/submit-runtime-evidence
@@ -48,7 +51,7 @@ export async function POST(req: Request) {
 
     const executionJob = await db.executionJob.findUnique({
       where: { executionId: token.executionId },
-      select: { id: true, projectId: true, workerId: true, leaseId: true, leaseExpiresAt: true },
+      select: { id: true, projectId: true, workerId: true, leaseId: true, leaseExpiresAt: true, substrateNonce: true },
     });
 
     if (!executionJob) {
@@ -120,9 +123,9 @@ export async function POST(req: Request) {
       }, { status: 403 });
     }
 
-    // Phase 18V: Verify the substrate attestation. This replaces the Phase 18F
-    // placeholder (hardcoded `executionEnvironmentSandboxed: false`). The
-    // attestation is OBSERVED substrate facts (kernel namespace inodes,
+    // Phase 18V: Verify the substrate attestation FACTS. This replaces the
+    // Phase 18F placeholder (hardcoded `executionEnvironmentSandboxed: false`).
+    // The attestation is OBSERVED substrate facts (kernel namespace inodes,
     // seccomp BPF mode, rlimits, cap-drop), bound into the signed envelope
     // (Phase 18V-A added `substrateAttestation` to the envelope hash, which
     // is what Ed25519 signs). No attestation => fail-closed.
@@ -130,6 +133,13 @@ export async function POST(req: Request) {
     // The evidence is ACCEPTED even when the attestation is null/invalid —
     // the worker still produced RUNTIME_VERIFIED evidence. But PRODUCTION_READY
     // is BLOCKED (fail-closed) when the attestation is missing or invalid.
+    //
+    // Phase 18W: This block now produces TWO verdicts:
+    //   - substrateFactsVerified  (Phase 18V: facts-only, diagnostic)
+    //   - substrateTrusted         (Phase 18W: facts AND launcher signature,
+    //                                the production gate)
+    // The launcher signature is verified BELOW, AFTER the envelope identity
+    // check (we need token.executionId to bind against the attestation).
     const substrateVerification = verifySubstrateAttestation(
       envelope.substrateAttestation ?? null
     );
@@ -157,7 +167,7 @@ export async function POST(req: Request) {
     // Canonical verdict: fail-closed when the two verifiers disagree OR when
     // the detailed verifier reports invalid. We use a separate const so the
     // rest of the route can rely on a single source of truth.
-    const substrateVerified =
+    const substrateFactsVerified =
       substrateVerification.valid &&
       substrateVerifiedShortcut &&
       substrateVerification.valid === substrateVerifiedShortcut;
@@ -167,6 +177,123 @@ export async function POST(req: Request) {
       return NextResponse.json({
         error: "REJECTED: Envelope identity mismatch. envelope.executionId/workerId must match the authenticated token.",
       }, { status: 403 });
+    }
+
+    // =========================================================================
+    // Phase 18W: TWO-SIGNATURE TRUST MODEL — LAUNCHER ATTESTATION VERIFICATION.
+    // =========================================================================
+    // The worker signs the envelope (verified above with the server-resolved
+    // worker key). The LAUNCHER signs the substrate attestation (observed
+    // facts + nonce + executionId + workload results) with its OWN Ed25519
+    // private key — separate from the worker key, provisioned by admin.
+    //
+    // This is the trust separation: a compromised worker key cannot forge the
+    // launcher signature, so it cannot manufacture a valid substrate claim
+    // without actually running the real launcher inside the real substrate.
+    //
+    // The control plane uses its OWN pinned launcher public key. It NEVER
+    // trusts a launcher key from the request body (the worker could send any
+    // key in the body — that would defeat the model).
+    //
+    // PINNED KEY SOURCES (in order of preference):
+    //   1. FORGE_LAUNCHER_PUBLIC_KEY env var (PEM string). Primary.
+    //   2. LauncherRegistry DB table (admin-enrolled, like WorkerRegistry).
+    //      NOT yet implemented; tracked as a follow-up. When present, it will
+    //      be the authoritative source (so admin can rotate keys without a
+    //      redeploy).
+    // If NEITHER source yields a key, ALL attestations are UNTRUSTED → ALL
+    // production is blocked. This is the correct fail-closed behavior.
+    //
+    // The expectedNonce comes from the ExecutionJob.substrateNonce column
+    // (issued by the control plane at job-spec time, persisted, returned to
+    // the worker). If the job has no nonce, we cannot verify anti-replay →
+    // fail-closed: accept the evidence (RUNTIME_VERIFIED) but block production.
+    //
+    // The expectedExecutionId comes from the AUTHENTICATED token (NOT from
+    // the envelope body — envelope identity was already checked above, so
+    // token.executionId === envelope.executionId by this point, but we use
+    // the token as the authoritative source).
+
+    const launcherPublicKeyPem = process.env.FORGE_LAUNCHER_PUBLIC_KEY ?? "";
+    const expectedNonce = executionJob.substrateNonce ?? "";
+    const expectedExecutionId = token.executionId;
+
+    // Defensive: 18W-B guarantees the envelope always carries a non-null
+    // attestation. If it's null here, the worker is buggy or malicious — log
+    // NO_SUBSTRATE_ATTESTATION and fail-closed on production.
+    if (!envelope.substrateAttestation) {
+      await ensureBuildEvent({
+        projectId,
+        type: BuildEventType.TASK_FAILED,
+        level: "error",
+        message: `NO_SUBSTRATE_ATTESTATION — envelope.substrateAttestation is null after Phase 18W-B. PRODUCTION_READY blocked (fail-closed). Worker may be running an outdated runtime or attempting to bypass the substrate.`,
+        payload: JSON.stringify({
+          executionId: token.executionId,
+          workerId: token.workerId,
+          eventType: "NO_SUBSTRATE_ATTESTATION",
+        }),
+      });
+    }
+
+    // 1. Compute the launcher verification result (signature + nonce + execId
+    //    binding). If the pinned key or expected nonce is missing, we cannot
+    //    verify — fail-closed with a clear reason.
+    let launcherVerification: SubstrateVerificationResult;
+    if (!launcherPublicKeyPem || !expectedNonce) {
+      launcherVerification = {
+        valid: false,
+        reasons: [
+          `Launcher attestation UNVERIFIABLE — ${
+            !launcherPublicKeyPem ? "FORGE_LAUNCHER_PUBLIC_KEY env var not set" : ""
+          }${!launcherPublicKeyPem && !expectedNonce ? "; " : ""}${
+            !expectedNonce ? "ExecutionJob.substrateNonce missing (control plane did not issue a nonce)" : ""
+          }. PRODUCTION_READY blocked (fail-closed).`,
+        ],
+      };
+    } else {
+      launcherVerification = verifyLauncherAttestation(
+        envelope.substrateAttestation ?? null,
+        launcherPublicKeyPem,
+        expectedNonce,
+        expectedExecutionId
+      );
+    }
+
+    // 2. The production predicate requires isSubstrateTrusted: facts valid
+    //    AND launcher signature valid AND nonce/executionId bound. A null
+    //    attestation is untrusted by definition.
+    const substrateTrusted =
+      !!envelope.substrateAttestation &&
+      substrateFactsVerified &&
+      launcherVerification.valid &&
+      // Defense-in-depth: re-run the combined check so a future refactor
+      // that breaks one of the two verifiers but not the other cannot
+      // silently grant trust.
+      (launcherPublicKeyPem && expectedNonce
+        ? isSubstrateTrusted(
+            envelope.substrateAttestation,
+            launcherPublicKeyPem,
+            expectedNonce,
+            expectedExecutionId
+          )
+        : false);
+
+    // 3. If the launcher verification failed (and the attestation was
+    //    present), log the specific failure reasons. The evidence is still
+    //    ACCEPTED as RUNTIME_VERIFIED — but PRODUCTION_READY is blocked.
+    if (envelope.substrateAttestation && !launcherVerification.valid) {
+      await ensureBuildEvent({
+        projectId,
+        type: BuildEventType.TASK_FAILED,
+        level: "error",
+        message: `SUBSTRATE_ATTESTATION_REJECTED — launcher verification failed: ${launcherVerification.reasons.join("; ")}`,
+        payload: JSON.stringify({
+          executionId: token.executionId,
+          workerId: token.workerId,
+          eventType: "SUBSTRATE_ATTESTATION_REJECTED",
+          reasons: launcherVerification.reasons,
+        }),
+      });
     }
 
     // Phase 18G: DERIVE the RuntimeVerificationResult from the signed envelope.
@@ -328,16 +455,28 @@ export async function POST(req: Request) {
         idempotencyKey,
         startedAt: new Date(result.startedAt),
         completedAt: new Date(result.completedAt),
-        // Phase 18V: Substrate attestation — observed isolation facts bound
-        // into the signed envelope. Persisted as JSON so reviewers can inspect
-        // the exact namespace inodes, seccomp profile hash, rlimits, cap-drop.
-        // `substrateVerified` records whether the attestation passed
-        // `verifySubstrateAttestation` (cross-checked with `isSubstrateVerified`)
-        // at submission time. The production gate consults this.
+        // Phase 18V/18W: Substrate attestation — observed isolation facts
+        // bound into the signed envelope. Persisted as JSON so reviewers can
+        // inspect the exact namespace inodes, seccomp profile hash, rlimits,
+        // cap-drop, AND the launcher signature over canonicalFactsJson.
+        //
+        // `substrateVerified` records whether the attestation is FULLY TRUSTED
+        // at submission time: facts valid (verifySubstrateAttestation) AND
+        // launcher signature valid (verifyLauncherAttestation) AND nonce /
+        // executionId bound to the authenticated token. Phase 18W changed the
+        // semantic from facts-only (18V) to fully-trusted (18W) — this is the
+        // production gate, and a trusted attestation requires BOTH the facts
+        // AND the launcher signature.
         substrateAttestation: envelope.substrateAttestation
           ? JSON.stringify(envelope.substrateAttestation)
           : null,
-        substrateVerified,
+        substrateVerified: substrateTrusted,
+        // Phase 18W-B: Persist the substrate nonce the control plane issued
+        // for this execution. The attestation's canonicalFactsJson includes
+        // this nonce (signed by the launcher), so persisting it here lets a
+        // reviewer / auditor verify the binding without re-reading the
+        // ExecutionJob row (which may have been GC'd or mutated).
+        substrateNonce: expectedNonce || null,
       },
     });
 
@@ -364,32 +503,44 @@ export async function POST(req: Request) {
         // Phase 18B: Explicit event type — RUNTIME_VERIFIED, NOT PRODUCTION_READY.
         eventType: runtimeEventPassed ? "RUNTIME_VERIFIED" : "RUNTIME_VERIFICATION_FAILED",
         productionReadyEligible: false,
-        // Phase 18V: Substrate attestation status in the event payload.
-        substrateVerified,
+        // Phase 18V/18W: Substrate attestation status in the event payload.
+        // `substrateFactsVerified` is the facts-only verdict (Phase 18V);
+        // `substrateTrusted` is the production-gate verdict (Phase 18W: facts
+        // AND launcher signature AND binding). `launcherVerification` exposes
+        // the detailed launcher signature / nonce / executionId check.
+        substrateFactsVerified,
+        substrateTrusted,
+        launcherVerified: launcherVerification.valid,
         substrateAttestationPresent: envelope.substrateAttestation !== null,
         substrateVerificationReasons: substrateVerification.reasons,
+        launcherVerificationReasons: launcherVerification.reasons,
       }),
     });
 
-    // Phase 18V: If the runtime passed but the substrate attestation is
-    // missing or invalid, emit a build event warning that PRODUCTION_READY
-    // is blocked (fail-closed). The evidence is still accepted as
-    // RUNTIME_VERIFIED — but production deployment requires a verified
-    // isolation boundary.
-    if (runtimeEventPassed && !substrateVerified) {
-      const reasons = substrateVerification.reasons.join("; ");
+    // Phase 18V/18W: If the runtime passed but the substrate attestation is
+    // NOT TRUSTED (either facts invalid OR launcher signature invalid OR not
+    // bound to this execution), emit a build event warning that
+    // PRODUCTION_READY is blocked (fail-closed). The evidence is still
+    // accepted as RUNTIME_VERIFIED — but production deployment requires a
+    // TRUSTED isolation boundary (Phase 18W: facts + launcher signature).
+    if (runtimeEventPassed && !substrateTrusted) {
+      const factsReasons = substrateVerification.reasons.join("; ");
+      const launcherReasons = launcherVerification.reasons.join("; ");
       await ensureBuildEvent({
         projectId,
         type: BuildEventType.HUMAN_REVIEW_REQUIRED,
         level: "warn",
-        message: `RUNTIME_VERIFIED but NO verified substrate attestation — PRODUCTION_READY blocked (fail-closed). Reasons: ${reasons}`,
+        message: `RUNTIME_VERIFIED but NO TRUSTED substrate attestation — PRODUCTION_READY blocked (fail-closed). Facts: ${factsReasons}. Launcher: ${launcherReasons}`,
         payload: JSON.stringify({
           runtimeEvidenceId: evidence.id,
           repositoryHeadSha: result.repositoryHeadSha,
-          eventType: "RUNTIME_VERIFIED_NO_SUBSTRATE",
-          substrateVerified: false,
+          eventType: "RUNTIME_VERIFIED_NO_TRUSTED_SUBSTRATE",
+          substrateFactsVerified,
+          substrateTrusted: false,
+          launcherVerified: launcherVerification.valid,
           substrateAttestationPresent: envelope.substrateAttestation !== null,
           substrateVerificationReasons: substrateVerification.reasons,
+          launcherVerificationReasons: launcherVerification.reasons,
           productionReadyEligible: false,
         }),
       });
@@ -417,15 +568,19 @@ export async function POST(req: Request) {
         staticReadinessPassed,
         runtimeVerificationPassed: evaluation.passed,
         runtimeEvidencePersisted: true, // just persisted
-        // Phase 18V: Now derived from the VERIFIED substrate attestation —
-        // NOT a config label. `isSubstrateVerified` runs the full attestation
-        // check (namespace inodes differ from host, seccompMode=2, seccomp
-        // profile hash matches the required filter, all rlimits finite, all
-        // 41 caps dropped, networkMode=hermetic-loopback, readonlyRootfs=true).
-        // No attestation => false => PRODUCTION_READY blocked (fail-closed).
-        // Replaces the Phase 18F hardcoded-false placeholder.
-        executionEnvironmentSandboxed: substrateVerified,
-        substrateAttestationVerified: substrateVerified,
+        // Phase 18W: executionEnvironmentSandboxed now requires isSubstrateTrusted
+        // — facts verified (verifySubstrateAttestation) AND launcher signature
+        // verified (verifyLauncherAttestation) AND nonce/executionId bound to
+        // the authenticated token. This replaces the 18V facts-only check (which
+        // a compromised worker could satisfy by constructing a structurally
+        // valid SandboxAttestation without actually running the launcher).
+        //
+        // A compromised worker key alone cannot forge the launcher signature
+        // (the launcher key is provisioned by admin and never shipped to the
+        // worker as a public-key target the worker can substitute). Production
+        // is blocked unless the attestation is FULLY trusted.
+        executionEnvironmentSandboxed: substrateTrusted,
+        substrateAttestationVerified: substrateTrusted,
         repositoryHeadVerified: headVerified,
       };
 
@@ -478,13 +633,21 @@ export async function POST(req: Request) {
       productionReady,
       headVerified,
       expectedSha,
-      // Phase 18V: Surface the substrate attestation verification result so
-      // the worker (and reviewers) can see exactly why PRODUCTION_READY was
-      // blocked when it is. `substrateVerified` is the canonical
-      // `isSubstrateVerified(envelope.substrateAttestation)` result.
-      substrateVerified,
+      // Phase 18V/18W: Surface BOTH verdicts so the worker (and reviewers)
+      // can see exactly why PRODUCTION_READY was blocked when it is.
+      //   - substrateFactsVerified: Phase 18V facts-only verdict (diagnostic).
+      //   - substrateTrusted: Phase 18W production-gate verdict (facts +
+      //     launcher signature + nonce/execId binding).
+      //   - launcherVerified: whether the launcher Ed25519 signature over
+      //     canonicalFactsJson verified against the pinned launcher public key.
+      // The reasons arrays let reviewers see the exact field-level failure
+      // (which inode was a host sentinel, which nonce mismatched, etc.).
+      substrateFactsVerified,
+      substrateTrusted,
+      launcherVerified: launcherVerification.valid,
       substrateAttestationPresent: envelope.substrateAttestation !== null,
       substrateVerificationReasons: substrateVerification.reasons,
+      launcherVerificationReasons: launcherVerification.reasons,
     });
   } catch (e: any) {
     return NextResponse.json({ error: e.message ?? "Failed to submit runtime evidence" }, { status: 500 });

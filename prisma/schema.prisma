@@ -728,6 +728,13 @@ model ExecutionJob {
   // Idempotency
   idempotencyKey  String   @unique  // projectId+taskId+attempt
 
+  // Phase 18W-B: Substrate nonce issued by the control plane for this
+  // execution. The worker passes it to the launcher; the launcher binds it
+  // into the canonicalFactsJson that gets signed. The control plane verifies
+  // the nonce at submission time (Phase 18W-C) — preventing replay of a
+  // launcher-signed attestation from a different execution.
+  substrateNonce  String?
+
   @@index([projectId])
   @@index([status])
   @@index([leaseExpiresAt])
@@ -816,6 +823,14 @@ model RuntimeEvidence {
   // Whether verifySubstrateAttestation passed at submission time. False when
   // the attestation is null OR invalid. PRODUCTION_READY requires true.
   substrateVerified     Boolean @default(false)
+
+  // Phase 18W-B: The substrate nonce the control plane issued for this
+  // execution. The launcher signs canonicalFactsJson (which includes this
+  // nonce), so the persisted evidence binds the attestation to this nonce.
+  // At verification time, the control plane confirms the attestation's nonce
+  // matches this stored value (Phase 18W-C). Prevents replay across
+  // executions.
+  substrateNonce        String?
 
   @@index([projectId])
   @@index([repositoryHeadSha])

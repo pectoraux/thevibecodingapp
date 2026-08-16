@@ -44,7 +44,22 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "no-useless-escape": "off",
   },
 }, {
-  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills"]
+  ignores: [
+    "node_modules/**",
+    ".next/**",
+    "out/**",
+    "build/**",
+    "next-env.d.ts",
+    "examples/**",
+    "skills",
+    // Phase 18W-B: the in-substrate orchestrator is a CommonJS Node.js script
+    // (uses require()) that runs inside a chroot with no module resolution
+    // guarantees. ESLint's @typescript-eslint/no-require-imports rule flags
+    // it, but the require() calls are intentional — ESM would require
+    // --experimental-modules flags or .mjs extension that complicates the
+    // launcher's exec path. Ignore the orchestrator from lint.
+    "mini-services/execution-worker/runtime/orchestrator.js",
+  ]
 }];
 
 export default eslintConfig;

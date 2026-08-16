@@ -18,6 +18,7 @@
 import { spawn, ChildProcess } from "node:child_process";
 import { mkdirSync, rmSync, existsSync, readdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   type RuntimeExecutionPolicy,
   type EvidenceEvent,
@@ -591,6 +592,10 @@ export async function executeRuntimeVerification(
         cwd: workspace.getPaths().repo,
         env: policy.commands.install.env,
         timeoutMs: policy.commands.install.timeoutMs,
+        // Phase 18W: launcher trust — bind nonce/executionId/launcherKeyFile.
+        nonce: randomUUID(),
+        executionId: policy.executionId,
+        launcherKeyFile: policy.launcherKeyFile,
       });
       if (!substrateAttestation) substrateAttestation = installRun.attestation;
       installResult = installRun.result;
@@ -633,6 +638,10 @@ export async function executeRuntimeVerification(
         cwd: workspace.getPaths().repo,
         env: policy.commands.build.env,
         timeoutMs: policy.commands.build.timeoutMs,
+        // Phase 18W: launcher trust — bind nonce/executionId/launcherKeyFile.
+        nonce: randomUUID(),
+        executionId: policy.executionId,
+        launcherKeyFile: policy.launcherKeyFile,
       });
       if (!substrateAttestation) substrateAttestation = buildRun.attestation;
       buildResult = buildRun.result;

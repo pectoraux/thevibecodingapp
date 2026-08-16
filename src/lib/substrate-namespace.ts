@@ -53,7 +53,7 @@ import {
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 import type { CommandResult } from "@/lib/runtime-executor";
 import {
@@ -113,7 +113,8 @@ export function compileLauncher(): string {
 
   if (needsCompile) {
     try {
-      execFileSync("gcc", ["-O2", "-o", binaryPath, LAUNCHER_SOURCE], {
+      // Phase 18W: link with -lcrypto for Ed25519 signing + SHA-256.
+      execFileSync("gcc", ["-O2", "-o", binaryPath, LAUNCHER_SOURCE, "-lcrypto"], {
         stdio: ["pipe", "pipe", "pipe"],
         shell: false,
       });
@@ -421,6 +422,24 @@ export interface RunInSubstrateOptions {
   env?: Record<string, string>;
   timeoutMs: number;
   includeProc?: boolean;
+  /**
+   * Phase 18W: The nonce bound into the launcher signature. The control plane
+   * passes this and verifies it matches the nonce in canonicalFactsJson.
+   * Prevents replay of a launcher-signed attestation from a different execution.
+   */
+  nonce: string;
+  /**
+   * Phase 18W: The executionId bound into the launcher signature. The control
+   * plane verifies it matches. Binds the attestation to a specific execution.
+   */
+  executionId: string;
+  /**
+   * Phase 18W: Path to the launcher's Ed25519 private key (PEM). The launcher
+   * reads this BEFORE chroot and uses it to sign canonicalFactsJson. The key
+   * is SEPARATE from the worker key and provisioned by admin. REQUIRED —
+   * without it, the launcher cannot sign, and the attestation is untrusted.
+   */
+  launcherKeyFile: string;
 }
 
 export interface SubstrateRunResult {
@@ -459,9 +478,15 @@ export async function runInSubstrate(
     throw new Error("runInSubstrate: timeoutMs must be a positive number");
   }
   if (!opts.cwd) throw new Error("runInSubstrate: cwd is required");
+  if (!opts.nonce) throw new Error("runInSubstrate: nonce is required (Phase 18W launcher trust)");
+  if (!opts.executionId) throw new Error("runInSubstrate: executionId is required (Phase 18W launcher trust)");
+  if (!opts.launcherKeyFile) throw new Error("runInSubstrate: launcherKeyFile is required (Phase 18W launcher trust)");
 
   const launcherBinary = compileLauncher();
   const hostInodes = getHostNamespaceInodes();
+
+  // Phase 18W: Generate a unique substrateInstanceId for this invocation.
+  const substrateInstanceId = randomUUID();
 
   // 1. Create temp dir for rootfs + facts file.
   // IMPORTANT: the rootfs must NOT be under opts.cwd, because the launcher
@@ -488,10 +513,17 @@ export async function runInSubstrate(
     buildRootfs(rootfsDir, opts.cwd, { includeProc: opts.includeProc });
 
     // 3. Spawn unshare with the launcher.
+    // Phase 18W: new arg layout — launcher takes <launcher_key_file> <nonce>
+    // <execution_id> <substrate_instance_id> <facts_file> <rootfs_dir>
+    // <workspace_dir> <binary> [args...].
     const unshareArgs: string[] = [
       "-U", "-r", "-p", "-f", "-n", "-m",
       "--propagation=private",
       launcherBinary,
+      opts.launcherKeyFile,
+      opts.nonce,
+      opts.executionId,
+      substrateInstanceId,
       factsFile,
       rootfsDir,
       opts.cwd, // workspace_dir — bind-mounted into rootfs/workspace (RW)
@@ -622,6 +654,19 @@ interface LauncherFacts {
   fileDescriptorLimit: number;
   fileSizeLimitBytes: number;
   createdAt: string;
+  // Phase 18W: launcher trust fields.
+  nonce: string;
+  executionId: string;
+  substrateInstanceId: string;
+  workloadExitCode: number | null;
+  workloadSignal: number | null;
+  workloadStdoutHash: string;
+  workloadStderrHash: string;
+  canonicalFactsJson: string;
+  launcherSignature: string;
+  launcherAlgorithm: string;
+  launcherKeyId: string;
+  launcherSignedAt: string;
 }
 
 function buildAttestation(
@@ -661,6 +706,19 @@ function buildAttestation(
     readonlyRootfs: REQUIRED_SUBSTRATE_POLICY.readonlyRootfs,
     createdAt: facts.createdAt,
     substrateVerified,
+    // Phase 18W: launcher trust fields.
+    nonce: facts.nonce,
+    executionId: facts.executionId,
+    substrateInstanceId: facts.substrateInstanceId,
+    workloadExitCode: facts.workloadExitCode,
+    workloadSignal: facts.workloadSignal,
+    workloadStdoutHash: facts.workloadStdoutHash,
+    workloadStderrHash: facts.workloadStderrHash,
+    canonicalFactsJson: facts.canonicalFactsJson,
+    launcherSignature: facts.launcherSignature,
+    launcherAlgorithm: facts.launcherAlgorithm,
+    launcherKeyId: facts.launcherKeyId,
+    launcherSignedAt: facts.launcherSignedAt,
   };
 }
 
