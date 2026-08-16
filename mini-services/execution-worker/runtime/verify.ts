@@ -1,43 +1,50 @@
-// Forge — Phase 18W-B: Worker runtime verification module.
+// Forge — Phase 18X: Worker runtime verification module.
 //
 // This module is called by the poller when runtime verification is needed.
 // It does NOT use the control-plane's runtime-executor (which lives in the
-// main project and imports from @/lib/db). Instead it runs the in-substrate
-// orchestrator script (runtime/orchestrator.js) via runInSubstrate, reads
-// the results.json the orchestrator writes, and constructs a signed
-// ExecutionEvidenceEnvelope.
+// main project and imports from @/lib/db). Instead it:
 //
-// FLOW:
-//   1. Create a temp workspace at /tmp/forge-runtime-<executionId>.
-//   2. Clone the repository at the exact SHA (git clone <url> <ws>/repo &&
-//      git -C <ws>/repo checkout <sha>).
-//   3. Write plan.json to <ws>/plan.json (the orchestrator reads this).
-//   4. Copy the orchestrator script to <ws>/orchestrator.js.
-//   5. runInSubstrate({ binary: "node", args: ["/workspace/orchestrator.js"],
-//      cwd: workspace, timeoutMs, nonce, executionId, launcherKeyFile }).
-//      `node` is bind-mounted into the rootfs via /usr.
-//   6. Read <ws>/results.json (the orchestrator's output).
-//   7. Use the attestation returned by runInSubstrate as the envelope's
-//      substrateAttestation (NEVER null — fail-closed: if runInSubstrate
-//      throws, propagate the throw).
-//   8. Construct the ExecutionEvidenceEnvelope from results.json + attestation.
-//      Compute resultHash, envelopeHash, sign with the worker's Ed25519
-//      private key.
-//   9. Return the signed envelope.
+//   1. Resolves the GitHub credential and clones the repo at the exact SHA.
+//   2. Writes plan.json + copies the orchestrator script into the workspace.
+//   3. POSTs { capability, workload, repoPath } to the substrate supervisor
+//      (mini-services/substrate-supervisor, port 3004). The supervisor — a
+//      TRUSTED process that holds the launcher key IN MEMORY — runs the
+//      workload inside the substrate and returns the signed attestation.
+//   4. Reads results.json (the orchestrator's output).
+//   5. Constructs the ExecutionEvidenceEnvelope (signed with the WORKER's
+//      Ed25519 private key).
+//
+// PHASE 18X — LAUNCHER KEY ISOLATION:
+//   The worker NEVER has the launcher private key. It does NOT have:
+//     - The launcher key file path.
+//     - The launcher key file content.
+//     - Any env var pointing to the launcher key.
+//     - Any way to invoke the launcher directly.
+//   The worker ONLY has:
+//     - An ExecutionCapability (signed by the control plane) that authorizes
+//       the supervisor to run this specific workload.
+//     - The supervisor's URL (default http://localhost:3004).
+//   The supervisor verifies the capability, runs the substrate, and returns
+//   the signed attestation. The worker includes the attestation in its
+//   envelope and signs the envelope with its own key.
+//
+// FAIL-CLOSED: if the substrate cannot be established (supervisor down,
+// capability invalid, substrate setup failure), this function THROWS. It
+// NEVER returns an envelope with substrateAttestation: null.
 //
 // IMPORTANT: this module MUST NOT import from @/lib/db (the worker is a
-// standalone bun project with no Prisma client). It only imports:
+// standalone bun project with no Prisma client). It imports:
 //   - @/lib/runtime-execution-contract (signEvidenceEnvelope, computeEnvelopeHash,
 //     computeResultHash, verifyEvidenceEnvelope, types)
-//   - @/lib/substrate-namespace (runInSubstrate)
-//   - @/lib/substrate-attestation (types)
-// None of these have @/lib/db dependencies (verified by reading).
+//   - @/lib/substrate-attestation (types only)
+//   - @/lib/execution-capability (types only — for the request body shape)
+// None of these have @/lib/db dependencies.
 
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync, readFileSync, copyFileSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sign as cryptoSign, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import {
   computeEnvelopeHash,
@@ -46,8 +53,9 @@ import {
   captureEnvironmentFingerprint,
   type ExecutionEvidenceEnvelope,
 } from "@/lib/runtime-execution-contract";
-import { runInSubstrate } from "@/lib/substrate-namespace";
 import type { SandboxAttestation } from "@/lib/substrate-attestation";
+import type { ExecutionCapability } from "@/lib/execution-capability";
+import type { CommandResult } from "@/lib/runtime-executor";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -85,9 +93,15 @@ export interface OrchestratorPlan {
 
 /**
  * The job the poller hands to executeRuntimeVerificationInWorker.
+ *
+ * Phase 18X: the job no longer carries `launcherKeyFile`. Instead it carries:
+ *   - `capability`: the control-plane-signed ExecutionCapability that
+ *     authorizes the supervisor to run this workload.
+ *   - `supervisorUrl`: the URL of the substrate supervisor (default
+ *     http://localhost:3004).
  */
 export interface RuntimeVerificationJob {
-  /** Stable id for this execution (bound into the launcher signature). */
+  /** Stable id for this execution (informational — the real binding is in the capability). */
   executionId: string;
   /** Worker identity (bound into the envelope signature). */
   workerId: string;
@@ -103,10 +117,20 @@ export interface RuntimeVerificationJob {
   runtimePlanHash: string;
   /** The plan to write to /workspace/plan.json. */
   plan: OrchestratorPlan;
-  /** The nonce the control plane issued for this execution. */
+  /** The nonce bound into the launcher signature (informational — comes from the capability). */
   nonce: string;
-  /** Path to the launcher's Ed25519 private key (PEM). The launcher reads this. */
-  launcherKeyFile: string;
+  /**
+   * Phase 18X: The control-plane-signed ExecutionCapability. The supervisor
+   * verifies this before running the substrate. The capability carries the
+   * authoritative nonce + executionId (the worker cannot override them).
+   */
+  capability: ExecutionCapability;
+  /**
+   * Phase 18X: The URL of the substrate supervisor. Default
+   * http://localhost:3004. The worker POSTs { capability, workload, repoPath }
+   * here and receives { attestation, result }.
+   */
+  supervisorUrl?: string;
   /** Total substrate timeout for the whole pipeline. */
   totalTimeoutMs?: number;
   /** The worker's Ed25519 private key (PEM), used to sign the envelope. */
@@ -220,6 +244,92 @@ function gitCloneAtSha(repositoryUrl: string, targetPath: string, sha: string): 
 }
 
 // ---------------------------------------------------------------------------
+// Substrate supervisor client — POST /execute
+// ---------------------------------------------------------------------------
+
+interface SupervisorExecuteRequest {
+  capability: ExecutionCapability;
+  workload: {
+    binary: string;
+    args: string[];
+    cwd: string;
+    env?: Record<string, string>;
+    timeoutMs: number;
+  };
+  repoPath?: string;
+}
+
+interface SupervisorExecuteResponse {
+  attestation: SandboxAttestation;
+  result: CommandResult;
+}
+
+/**
+ * Call the substrate supervisor's /execute endpoint.
+ *
+ * The supervisor verifies the capability signature, runs the workload inside
+ * the substrate (with the launcher key it holds in memory), and returns the
+ * signed attestation + workload result.
+ *
+ * The supervisor NEVER returns the launcher key — only the signed attestation.
+ * If the supervisor is unreachable or returns a non-200 response, this
+ * function throws (fail-closed).
+ */
+async function callSupervisorExecute(
+  supervisorUrl: string,
+  reqBody: SupervisorExecuteRequest
+): Promise<SupervisorExecuteResponse> {
+  const url = `${supervisorUrl.replace(/\/+$/, "")}/execute`;
+  const bodyJson = JSON.stringify(reqBody);
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: bodyJson,
+    });
+  } catch (err) {
+    throw new Error(
+      `Failed to reach substrate supervisor at ${url}: ${err instanceof Error ? err.message : String(err)}. ` +
+        "Ensure the supervisor mini-service is running (bun run mini-services/substrate-supervisor/index.ts)."
+    );
+  }
+  if (!resp.ok) {
+    let detail = "";
+    try {
+      const errBody = await resp.json() as { error?: string; reasons?: string[] };
+      detail = errBody.error
+        ? `${errBody.error}${errBody.reasons ? `: ${errBody.reasons.join("; ")}` : ""}`
+        : JSON.stringify(errBody);
+    } catch {
+      try { detail = await resp.text(); } catch { /* ignore */ }
+    }
+    throw new Error(
+      `Substrate supervisor rejected the request (HTTP ${resp.status}): ${detail}`
+    );
+  }
+  let parsed: SupervisorExecuteResponse;
+  try {
+    parsed = (await resp.json()) as SupervisorExecuteResponse;
+  } catch (err) {
+    throw new Error(
+      `Substrate supervisor returned non-JSON response: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (!parsed.attestation) {
+    throw new Error(
+      "Substrate supervisor returned a response with no attestation — fail-closed (this is a CRITICAL invariant violation)."
+    );
+  }
+  if (!parsed.result) {
+    throw new Error(
+      "Substrate supervisor returned a response with no result — fail-closed."
+    );
+  }
+  return parsed;
+}
+
+// ---------------------------------------------------------------------------
 // Main entry — executeRuntimeVerificationInWorker
 // ---------------------------------------------------------------------------
 
@@ -227,9 +337,9 @@ function gitCloneAtSha(repositoryUrl: string, targetPath: string, sha: string): 
  * Execute runtime verification inside the substrate and return a signed
  * ExecutionEvidenceEnvelope.
  *
- * FAIL-CLOSED: if the substrate cannot be established (gcc missing, unshare
- * fails, launcher won't compile, facts file missing/empty), this function
- * THROWS. It NEVER returns an envelope with substrateAttestation: null.
+ * FAIL-CLOSED: if the substrate cannot be established (supervisor down,
+ * capability invalid, substrate setup failure), this function THROWS. It
+ * NEVER returns an envelope with substrateAttestation: null.
  *
  * If the workload itself fails (install fails, app doesn't start, health
  * check fails), the function returns an envelope with passed: false but the
@@ -241,10 +351,15 @@ export async function executeRuntimeVerificationInWorker(
   if (!job.executionId) throw new Error("executeRuntimeVerificationInWorker: executionId is required");
   if (!job.workerId) throw new Error("executeRuntimeVerificationInWorker: workerId is required");
   if (!job.nonce) throw new Error("executeRuntimeVerificationInWorker: nonce is required");
-  if (!job.launcherKeyFile) throw new Error("executeRuntimeVerificationInWorker: launcherKeyFile is required (Phase 18W)");
+  if (!job.capability) throw new Error("executeRuntimeVerificationInWorker: capability is required (Phase 18X — the supervisor verifies the capability before running the substrate)");
   if (!job.workerPrivateKeyPem) throw new Error("executeRuntimeVerificationInWorker: workerPrivateKeyPem is required");
   if (!job.repositoryUrl) throw new Error("executeRuntimeVerificationInWorker: repositoryUrl is required (no anonymous clone)");
   if (!job.repositoryHeadSha) throw new Error("executeRuntimeVerificationInWorker: repositoryHeadSha is required");
+
+  const supervisorUrl = (job.supervisorUrl ?? "http://localhost:3004").trim();
+  if (!supervisorUrl) {
+    throw new Error("executeRuntimeVerificationInWorker: supervisorUrl is empty (set SUBSTRATE_SUPERVISOR_URL or pass supervisorUrl in the job)");
+  }
 
   const workspace = `/tmp/forge-runtime-${job.executionId}`;
   mkdirSync(workspace, { recursive: true });
@@ -267,23 +382,30 @@ export async function executeRuntimeVerificationInWorker(
     }
     copyFileSync(orchestratorSrc, orchestratorPath);
 
-    // 4. Run the orchestrator INSIDE the substrate.
-    // The launcher bind-mounts `workspace` into rootfs/workspace. The orchestrator
-    // reads /workspace/plan.json (bind-mounted) and writes /workspace/results.json
-    // (also bind-mounted, RW).
+    // 4. POST the workload to the substrate supervisor.
+    // The supervisor — NOT the worker — runs the substrate. The launcher key
+    // is in the supervisor's memory, NEVER in the worker's.
     //
-    // FAIL-CLOSED: runInSubstrate throws if the substrate cannot be established
-    // (no gcc, unshare fails, launcher won't compile, facts file missing). We
-    // propagate the throw — NO null attestation.
+    // The nonce + executionId come from the capability (the worker cannot
+    // override them — they're cryptographically bound).
+    //
+    // FAIL-CLOSED: if the supervisor is down, rejects the capability, or
+    // runInSubstrate inside the supervisor throws — callSupervisorExecute
+    // throws and we propagate.
     const totalTimeoutMs = job.totalTimeoutMs ?? 1800000; // 30 min default
-    const { result, attestation } = await runInSubstrate({
-      binary: "node",
-      args: ["/workspace/orchestrator.js"],
-      cwd: workspace,
-      timeoutMs: totalTimeoutMs,
-      nonce: job.nonce,
-      executionId: job.executionId,
-      launcherKeyFile: job.launcherKeyFile,
+    console.log(
+      `[worker] Starting runtime verification via supervisor at ${supervisorUrl} ` +
+        `(executionId=${job.executionId}, nonce=${job.nonce.slice(0, 8)}..., sha=${job.repositoryHeadSha.slice(0, 7)})`
+    );
+    const { result, attestation } = await callSupervisorExecute(supervisorUrl, {
+      capability: job.capability,
+      workload: {
+        binary: "node",
+        args: ["/workspace/orchestrator.js"],
+        cwd: workspace,
+        timeoutMs: totalTimeoutMs,
+      },
+      repoPath,
     });
 
     // 5. Read results.json. The orchestrator MUST have written it.
@@ -410,7 +532,7 @@ function buildEnvelopeFromResults(
     startedAt: results.startedAt,
     completedAt: results.completedAt,
     logs: orchestratorStdout.slice(0, 50000),
-    // The REAL attestation from runInSubstrate — NEVER null.
+    // The REAL attestation from the supervisor — NEVER null.
     substrateAttestation: attestation,
   };
 
@@ -449,7 +571,3 @@ export function generateSubstrateNonce(): string {
   // directly.
   return randomUUID();
 }
-
-// Re-export cryptoSign for callers that want to verify the envelope signature
-// against a public key.
-export { cryptoSign };

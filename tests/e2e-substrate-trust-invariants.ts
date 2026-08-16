@@ -64,6 +64,7 @@ import {
   getProductionReadinessFailureReason,
   type ProductionReadinessEvidence,
 } from "@/lib/runtime-verification";
+import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -96,10 +97,13 @@ function record(name: string, passedFlag: boolean, details: string): void {
 
 const TEST_APP_DIR = "/tmp/forge-e2e-test-app";
 const CRASH_APP_DIR = "/tmp/forge-e2e-crash-app";
-const LAUNCHER_KEY_FILE = `/tmp/forge-e2e-launcher-key-${Date.now()}.pem`;
 
-const LAUNCHER_KEY = generateLauncherKeyPair();
-writeFileSync(LAUNCHER_KEY_FILE, LAUNCHER_KEY.privateKeyPem, { mode: 0o600 });
+// Phase 18X: the test starts a substrate supervisor (TRUSTED mini-service on
+// port 3004). The supervisor holds the launcher key IN MEMORY (file deleted
+// at startup). The worker module POSTs { capability, workload } to the
+// supervisor and receives { attestation }.
+let SUPERVISOR: TestSupervisor | null = null;
+let LAUNCHER_PUBLIC_KEY = "";
 
 const WORKER_KEY = generateWorkerKeyPair("e2e-test-worker");
 
@@ -200,13 +204,16 @@ function makePlan(port: number = 3000) {
 /**
  * Run executeRuntimeVerificationInWorker with the standard test config.
  * Returns the envelope + the values needed for verification.
+ * Phase 18X: the test signs an ExecutionCapability with the control-plane
+ * private key (held by the test harness — in production, the control plane
+ * signs it). The worker POSTs { capability, workload } to the supervisor
+ * and receives { attestation }.
  */
 async function runVerification(opts: {
   executionId?: string;
   nonce?: string;
   port?: number;
   crashing?: boolean;
-  launcherKeyFile?: string;
 } = {}): Promise<{ envelope: ExecutionEvidenceEnvelope; sha: string; executionId: string; nonce: string }> {
   const useCrashApp = opts.crashing === true;
   const sha = useCrashApp ? setupCrashingApp() : setupTestApp();
@@ -214,6 +221,15 @@ async function runVerification(opts: {
   const nonce = opts.nonce || generateSubstrateNonce();
   const port = opts.port || 3000;
   const plan = makePlan(port);
+  const capability = SUPERVISOR!.signCapability({
+    executionId,
+    nonce,
+    leaseId: "lease-1",
+    repositoryHeadSha: sha,
+    runtimePlanHash: "e2e-plan-hash",
+    architectureHash: null,
+    expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+  });
   const envelope = await executeRuntimeVerificationInWorker({
     executionId,
     workerId: "e2e-test-worker",
@@ -224,7 +240,8 @@ async function runVerification(opts: {
     runtimePlanHash: "e2e-plan-hash",
     plan,
     nonce,
-    launcherKeyFile: opts.launcherKeyFile || LAUNCHER_KEY_FILE,
+    capability,
+    supervisorUrl: SUPERVISOR!.url,
     workerPrivateKeyPem: WORKER_KEY.privateKeyPem,
     totalTimeoutMs: 120000,
   });
@@ -251,6 +268,17 @@ let test1Envelope: ExecutionEvidenceEnvelope | null = null;
 let test1ExecutionId = "";
 let test1Nonce = "";
 
+// ===========================================================================
+// Test fixture — start the substrate supervisor (Phase 18X)
+// ===========================================================================
+
+// Phase 18X: the supervisor is a TRUSTED mini-service that holds the launcher
+// key in memory. The worker module POSTs to it. The test starts ONE
+// supervisor for the whole suite.
+SUPERVISOR = await startTestSupervisor();
+LAUNCHER_PUBLIC_KEY = SUPERVISOR.launcherPublicKey;
+console.log(`[e2e-test] Supervisor started at ${SUPERVISOR.url} (launcher key file deleted: ${SUPERVISOR.launcherKeyFilePath})`);
+
 {
   const { envelope, executionId, nonce } = await runVerification();
   test1Envelope = envelope;
@@ -261,10 +289,10 @@ let test1Nonce = "";
   const attNonNull = att !== null && att !== undefined;
   const sigValid = verifyEvidenceEnvelope(envelope, WORKER_KEY.publicKeyPem);
   const launcherResult = attNonNull
-    ? verifyLauncherAttestation(att, LAUNCHER_KEY.publicKeyPem, nonce, executionId)
+    ? verifyLauncherAttestation(att, LAUNCHER_PUBLIC_KEY, nonce, executionId)
     : { valid: false, reasons: ["attestation is null"] };
   const trusted = attNonNull
-    ? isSubstrateTrusted(att, LAUNCHER_KEY.publicKeyPem, nonce, executionId)
+    ? isSubstrateTrusted(att, LAUNCHER_PUBLIC_KEY, nonce, executionId)
     : false;
   const passedBool = envelope.passed === true;
   const exitCode0 = attNonNull && att.workloadExitCode === 0;
@@ -303,13 +331,13 @@ let test1Nonce = "";
     };
     const result = verifyLauncherAttestation(
       tampered,
-      LAUNCHER_KEY.publicKeyPem,
+      LAUNCHER_PUBLIC_KEY,
       test1Nonce,
       test1ExecutionId
     );
     const trusted = isSubstrateTrusted(
       tampered,
-      LAUNCHER_KEY.publicKeyPem,
+      LAUNCHER_PUBLIC_KEY,
       test1Nonce,
       test1ExecutionId
     );
@@ -349,7 +377,7 @@ let test1Nonce = "";
     };
     const result = verifyLauncherAttestation(
       forged,
-      LAUNCHER_KEY.publicKeyPem,
+      LAUNCHER_PUBLIC_KEY,
       test1Nonce,
       test1ExecutionId
     );
@@ -380,7 +408,7 @@ let test1Nonce = "";
   } else {
     const result = verifyLauncherAttestation(
       test1Envelope.substrateAttestation,
-      LAUNCHER_KEY.publicKeyPem,
+      LAUNCHER_PUBLIC_KEY,
       "wrong-nonce-" + randomUUID(),
       test1ExecutionId
     );
@@ -411,7 +439,7 @@ let test1Nonce = "";
   } else {
     const result = verifyLauncherAttestation(
       test1Envelope.substrateAttestation,
-      LAUNCHER_KEY.publicKeyPem,
+      LAUNCHER_PUBLIC_KEY,
       test1Nonce,
       "wrong-exec-" + randomUUID()
     );
@@ -598,7 +626,7 @@ let test1Nonce = "";
   const attNonNull = att !== null && att !== undefined;
   const passedFalse = envelope.passed === false;
   const trusted = attNonNull
-    ? isSubstrateTrusted(att, LAUNCHER_KEY.publicKeyPem, nonce, executionId)
+    ? isSubstrateTrusted(att, LAUNCHER_PUBLIC_KEY, nonce, executionId)
     : false;
   const exitNonZero = attNonNull && att.workloadExitCode !== 0 && att.workloadExitCode !== null;
   const ok = attNonNull && passedFalse && trusted && exitNonZero;
@@ -720,6 +748,9 @@ for (const r of results) {
   }
 }
 console.log(`\n=== e2e-substrate-trust-invariants: ${passed} passed, ${failed} failed ===`);
+if (SUPERVISOR) {
+  await SUPERVISOR.stop();
+}
 if (failed > 0) {
   console.log("\n❌ E2E SUBSTRATE TRUST INVARIANTS NOT SATISFIED — control plane may accept forged attestations");
   process.exit(1);

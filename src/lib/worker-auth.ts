@@ -327,3 +327,25 @@ export function getWorkerToken(req: Request, expectedTokenType?: TokenType): Wor
 export function getControlPlanePublicKey(): string | null {
   return controlPlanePublicKeyPem;
 }
+
+/**
+ * Phase 18X-B: Get the control-plane PRIVATE key (PEM).
+ *
+ * This is the SAME Ed25519 key used to sign session/execution tokens in
+ * Phase 18P. Phase 18X-B uses it to sign ExecutionCapability objects that
+ * the substrate supervisor verifies before running a workload.
+ *
+ * Returns null when the key is unavailable — i.e., when this process is in
+ * verification-only mode (only FORGE_CONTROL_PLANE_PUBLIC_KEY was provisioned,
+ * which is the configuration workers use). Callers MUST handle null and
+ * fail-closed (do NOT sign capabilities without a key — an unsigned capability
+ * is rejected by the supervisor).
+ *
+ * SECURITY: this key NEVER leaves the control-plane process. Do NOT expose
+ * it via an HTTP endpoint, log it, or return it from any worker-facing API.
+ * Only control-plane signing paths (token issuance, capability issuance) may
+ * call this function.
+ */
+export function getControlPlanePrivateKey(): string | null {
+  return controlPlanePrivateKeyPem;
+}

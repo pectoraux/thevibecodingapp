@@ -86,9 +86,10 @@ function record(name: string, passedFlag: boolean, details: string): void {
 const HOSTILE_CWD = "/tmp/forge-hostile-cwd";
 
 // Phase 18W: launcher trust — generate a launcher keypair once for all tests.
+// Phase 18X: pass the PEM string to runInSubstrate (NOT a file path). The
+// test harness holds the key — that's fine, the TEST is trusted. In
+// production, ONLY the substrate supervisor holds the launcher key.
 const LAUNCHER_KEY = generateLauncherKeyPair();
-const LAUNCHER_KEY_FILE = `/tmp/forge-test-launcher-key-${Date.now()}.pem`;
-writeFileSync(LAUNCHER_KEY_FILE, LAUNCHER_KEY.privateKeyPem, { mode: 0o600 });
 
 function ensureHostileCwd(): void {
   mkdirSync(HOSTILE_CWD, { recursive: true });
@@ -153,10 +154,11 @@ async function runHostile(
     cwd: HOSTILE_CWD,
     timeoutMs: opts?.timeoutMs ?? 10000,
     includeProc: opts?.includeProc,
-    // Phase 18W: launcher trust — pass nonce/executionId/launcherKeyFile.
+    // Phase 18W: launcher trust — pass nonce/executionId.
+    // Phase 18X: pass the launcher key PEM (NOT a file path).
     nonce: randomUUID(),
     executionId: `hostile-${name}-${Date.now()}`,
-    launcherKeyFile: LAUNCHER_KEY_FILE,
+    launcherKeyPem: LAUNCHER_KEY.privateKeyPem,
   });
 }
 

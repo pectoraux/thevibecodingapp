@@ -735,6 +735,16 @@ model ExecutionJob {
   // launcher-signed attestation from a different execution.
   substrateNonce  String?
 
+  // Phase 18X-B: The signed ExecutionCapability issued for this job. The
+  // control plane signs this with its Ed25519 private key (the SAME key used
+  // for token signing — Phase 18P) at job-spec time and persists the JSON
+  // here. At submit-runtime-evidence time, the control plane audits that the
+  // attestation's nonce / executionId match the capability's values
+  // (defense-in-depth — the supervisor already verified the capability's
+  // signature before running the substrate). Binds executionId + nonce +
+  // leaseId + repoSha + planHash + archHash + expiresAt.
+  substrateCapability String?
+
   @@index([projectId])
   @@index([status])
   @@index([leaseExpiresAt])

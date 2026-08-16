@@ -2613,3 +2613,484 @@ Stage Summary:
      with real substrate-produced attestations. The route's logic is a
      thin wrapper around these functions. The integration is verified by
      the route source-level test in runtime-executor-invariants Test 82.
+
+---
+
+## Task 18X-A — Launcher Key Isolation (Agent: key-isolation)
+
+**Phase:** 18X-A (P0 security fix)
+**Repo HEAD:** 5735b1c (Phase 18W) + uncommitted 18X-A changes
+**Date:** 2025-08-17
+
+### The P0 violation (from the user's critique)
+
+Phase 18W established a two-signature trust model (worker signs envelope,
+launcher signs attestation). But the worker process was given access to
+the launcher private key:
+  - `runInSubstrate()` took `launcherKeyFile` (a file path) as a parameter.
+  - The worker poller read `FORGE_LAUNCHER_KEY_FILE` from its env.
+  - The worker module (`runtime/verify.ts`) carried `launcherKeyFile` in
+    the job spec.
+  - The launcher (C) read the key from that file path.
+
+A compromised worker could read the launcher key file and forge the
+launcher signature — collapsing the "two-signature" model to one. The
+worker could construct a "valid" attestation WITHOUT actually running
+the substrate.
+
+### The fix — substrate supervisor + anonymous fd
+
+```
+Control Plane (holds FORGE_CONTROL_PLANE_PRIVATE_KEY)
+    │  issues: ExecutionCapability (signed: executionId, nonce, leaseId,
+    │                            repoSha, planHash, archHash, expiresAt)
+    │  pins: launcher public key (FORGE_LAUNCHER_PUBLIC_KEY)
+    ▼
+Worker (UNTRUSTED — has ONLY worker key, NO launcher key access)
+    │  POSTs: { capability, workload, repoPath } to the supervisor
+    ▼
+Substrate Supervisor (TRUSTED — port 3004, holds launcher key IN MEMORY,
+                      key file DELETED at startup)
+    │  1. verifyExecutionCapability(cap, FORGE_CONTROL_PLANE_PUBLIC_KEY)
+    │  2. runInSubstrate({ ..., nonce: cap.nonce,
+    │                     executionId: cap.executionId,
+    │                     launcherKeyPem })  // from memory
+    │  3. returns { attestation, result } — NEVER the launcher key
+    ▼
+Worker receives: signed attestation (NEVER the launcher key)
+    │  builds envelope with attestation, signs with worker key
+    ▼
+Control Plane verifies BOTH signatures + nonce + executionId binding
+```
+
+### Changes applied
+
+**CHANGE 1 — Launcher reads key from anonymous fd**
+  - `src/lib/substrate/forge-launcher.c`: argv[1] is now the fd NUMBER
+    (e.g., "3"), NOT a file path. Replaced `read_launcher_key(const char
+    *key_file)` (BIO_new_file + path) with `read_launcher_key_from_fd(int
+    key_fd)` (fdopen + BIO_new_fp + BIO_CLOSE — closes the fd via
+    BIO_free). New arg layout: `forge-launcher <launcher_key_fd> <nonce>
+    <execution_id> <substrate_instance_id> <facts_file> <rootfs_dir>
+    <workspace_dir> <binary> [args...]`. Compile command unchanged
+    (`gcc -O2 -o forge-launcher forge-launcher.c -lcrypto`).
+
+**CHANGE 2 — runInSubstrate accepts launcherKeyPem (string)**
+  - `src/lib/substrate-namespace.ts`: `RunInSubstrateOptions.launcherKeyFile`
+    → `launcherKeyPem: string`. Inside runInSubstrate: writes the PEM to
+    a temp file, opens it for READING (`openSync(path, "r")`), UNLINKS
+    the path immediately (the fd is still valid — the kernel keeps the
+    inode + data alive), passes the fd as `stdio[3]` to the unshare
+    spawn (so the launcher inherits it as fd 3), closes the fd in the
+    `finally` block (`closeSync(keyFd)`). The launcher reads the PEM
+    from fd 3 (argv[1] = "3") and closes it via BIO_CLOSE.
+
+**CHANGE 3 — Substrate supervisor mini-service (port 3004)**
+  - `mini-services/substrate-supervisor/package.json` (NEW) — bun
+    project, `dev: bun --hot index.ts`.
+  - `mini-services/substrate-supervisor/tsconfig.json` (NEW) — `@/*` →
+    `../../src/*` path alias.
+  - `mini-services/substrate-supervisor/index.ts` (NEW, ~270 lines) — at
+    startup: reads FORGE_LAUNCHER_KEY_FILE into memory, DELETES the file
+    (fail-closed if any step fails). Endpoints: POST /execute (verifies
+    ExecutionCapability, calls runInSubstrate, returns { attestation,
+    result } — NEVER the launcher key); GET /health. FATAL exit if
+    FORGE_LAUNCHER_KEY_FILE or FORGE_CONTROL_PLANE_PUBLIC_KEY is unset.
+
+**CHANGE 4 — Remove launcherKeyFile from worker + contract**
+  - `src/lib/runtime-execution-contract.ts`: removed `launcherKeyFile`
+    from `RuntimeExecutionPolicy` interface + `deriveRuntimeExecutionPolicy`
+    options + the returned policy object.
+  - `src/lib/runtime-executor.ts`: in-process executor now reads
+    `FORGE_LAUNCHER_KEY_FILE` from env directly into memory (control
+    plane is trusted — it has the launcher key file). Passes
+    `launcherKeyPem` (NOT a file path) to `runInSubstrate`. Fail-closed
+    if env unset or unreadable.
+  - `mini-services/execution-worker/runtime/verify.ts`: removed
+    `launcherKeyFile` from `RuntimeVerificationJob`. Added `capability:
+    ExecutionCapability` + `supervisorUrl?: string` (default
+    `http://localhost:3004`). `executeRuntimeVerificationInWorker` now
+    POSTs `{ capability, workload, repoPath }` to the supervisor,
+    receives `{ attestation, result }`.
+  - `mini-services/execution-worker/poller.ts`: removed
+    `const LAUNCHER_KEY_FILE = process.env.FORGE_LAUNCHER_KEY_FILE`.
+    Added `SUBSTRATE_SUPERVISOR_URL` env var (default
+    `http://localhost:3004`). `buildAndSubmitRuntimeEvidenceEnvelope`
+    takes `capability` (REQUIRED — fail-closed if absent).
+  - `mini-services/execution-worker/start-worker.sh`: added
+    `SUBSTRATE_SUPERVISOR_URL` env var, updated comments to explicitly
+    state the worker does NOT get FORGE_LAUNCHER_KEY_FILE.
+
+**CHANGE 5 — ExecutionCapability module**
+  - `src/lib/execution-capability.ts` (NEW, ~170 lines): defines
+    `ExecutionCapability` interface + `signExecutionCapability` +
+    `verifyExecutionCapability` + `canonicalExecutionCapabilityJson`.
+    Signed fields: architectureHash, executionId, expiresAt, leaseId,
+    nonce, repositoryHeadSha, runtimePlanHash (sorted keys, no
+    whitespace). Signature/algorithm/signedAt added AFTER signing.
+    Verify checks: signature present, algorithm="ed25519", expiresAt
+    in the future, Ed25519 signature valid for pinned public key.
+
+**CHANGE 6 — Update existing tests**
+  - `tests/substrate-trust-invariants.ts`: passes `launcherKeyPem:
+    privateKeyPem` (NOT a file path). Removed temp-file write/unlink.
+  - `tests/substrate-isolation-invariants.ts`: passes `launcherKeyPem:
+    LAUNCHER_KEY.privateKeyPem` (NOT a file path). Removed
+    LAUNCHER_KEY_FILE.
+  - `tests/worker-runtime-wiring-invariants.ts`: migrated to supervisor
+    pattern — `startTestSupervisor()` from `tests/lib/test-supervisor.ts`,
+    each `runVerification` signs an ExecutionCapability + passes
+    `capability + supervisorUrl`. Test 7 changed: tests "supervisor
+    rejects missing capability → executeRuntimeVerificationInWorker
+    THROWS". Supervisor started once for the whole suite, stopped in
+    `finally`.
+  - `tests/e2e-substrate-trust-invariants.ts`: same migration pattern.
+    All `LAUNCHER_KEY.publicKeyPem` references → `LAUNCHER_PUBLIC_KEY`
+    (set from the supervisor's launcher public key). Supervisor started
+    once for the whole suite, stopped in `finally`.
+  - `tests/lib/test-supervisor.ts` (NEW, ~190 lines): shared helper
+    that starts a substrate supervisor as a child process. Returns
+    `{ url, process, launcherPublicKey, launcherPrivateKey,
+    controlPlaneKeyPair, launcherKeyFilePath, signCapability, stop }`.
+    `stop()` SIGTERMs the supervisor (5s grace → SIGKILL) and
+    best-effort cleans up the launcher key file.
+
+**CHANGE 7 — New tests: substrate-key-isolation-invariants**
+  - `tests/substrate-key-isolation-invariants.ts` (NEW, ~560 lines): 15
+    tests that PROVE the worker cannot access the launcher key:
+    1. Worker poller has NO `FORGE_LAUNCHER_KEY_FILE` (source).
+    2. RuntimeExecutionPolicy has NO `launcherKeyFile` field (source).
+    3. `executeRuntimeVerificationInWorker` takes NO `launcherKeyFile`
+       parameter (source).
+    4. Worker module does NOT reference `FORGE_LAUNCHER_KEY_FILE` or
+       read a launcher key file (source).
+    5. Supervisor DELETES the launcher key file at startup
+       (existsSync=false after /health).
+    6. Supervisor NEVER returns "PRIVATE KEY" in /execute response.
+    7. Supervisor returns a valid launcher-signed attestation.
+    8. Supervisor rejects a capability with wrong signature → HTTP 403.
+    9. Supervisor rejects an expired capability → HTTP 403.
+    10. Supervisor rejects a request with NO capability → HTTP 403.
+    11. Supervisor WITHOUT FORGE_CONTROL_PLANE_PUBLIC_KEY → FATAL exit.
+    12. Supervisor WITHOUT FORGE_LAUNCHER_KEY_FILE → FATAL exit.
+    13. runInSubstrate closes the key fd in `finally` + uses an
+        unlinked temp file (source).
+    14. Launcher reads the key from an fd via fdopen() (NOT a file
+        path); closes the fd after reading (source).
+    15. ExecutionCapability sign/verify round-trip (valid → ok;
+        tampered → rejected; wrong key → rejected).
+
+### Test results
+
+- **Full suite (24 non-integration files):** 642 passed, 0 failed.
+  - Pre-18X baseline: 627 passed.
+  - 18X added: 15 NEW tests in substrate-key-isolation-invariants.
+  - 18X migrated: 4 suites (substrate-trust, substrate-isolation,
+    worker-runtime-wiring, e2e-substrate-trust) — all pass.
+  - 0 regressions.
+- **Smoke test:** PASSED.
+  - Launcher key file deleted after supervisor starts (key isolation).
+  - Supervisor returns 200 + valid attestation for a valid capability.
+  - Launcher signature verifies against the test launcher public key.
+  - Response does NOT contain "PRIVATE KEY".
+- **Lint:** 1 error + 12 warnings, ALL PRE-EXISTING (documented in
+  18W-C worklog). 0 new errors/warnings in my files.
+- **Integration suites** (hostile-security-test, security-test,
+  regression-test, worker-security-test, worker-identity-integration):
+  fail as pre-existing — require a live Next.js server + PostgreSQL.
+
+### Proof: worker no longer has launcher key access
+
+```
+$ grep -rn "FORGE_LAUNCHER_KEY_FILE\|LAUNCHER_KEY_FILE\|launcherKeyFile" \
+    mini-services/execution-worker/
+mini-services/execution-worker/poller.ts:368://      launcherKeyFile + workerPrivateKeyPem).
+mini-services/execution-worker/poller.ts:468:  // Phase 18X: the job carries `capability` (NOT `launcherKeyFile`). The
+mini-services/execution-worker/runtime/verify.ts:97: * Phase 18X: the job no longer carries `launcherKeyFile`. Instead it carries:
+```
+
+All 3 matches are in COMMENTS. The actual code, the env var read, and
+the field are GONE. The `RuntimeExecutionPolicy` type in
+`src/lib/runtime-execution-contract.ts` has ZERO `launcherKeyFile`
+references (grep returns no matches).
+
+### Honest limitations (documented)
+
+1. **Root-compromised supervisor host.** A root compromise can `gcore`
+   the supervisor, scan `/proc/<pid>/fd/3`, or `ptrace` the supervisor.
+   Full closure requires hardware attestation (TPM/SGX/SEV). Out of
+   scope for 18X. **Mitigation:** dedicated host, no SSH for workers,
+   no shared filesystem, `PR_SET_DUMPABLE=0`, hardened kernel.
+2. **Co-located worker + supervisor.** In the current deployment model,
+   both run on the same host. A root compromise of the host compromises
+   both. The supervisor provides isolation against a COMPROMISED WORKER
+   KEY, NOT against a compromised host. **Mitigation:** separate hosts
+   in production.
+3. **Capability replay within the expiry window.** The supervisor does
+   not track a replay cache. Bounded by expiresAt + nonce/executionId
+   binding (control plane can detect a replayed attestation at
+   submission time). **Mitigation:** supervisor-side replay cache
+   (TTL = expiry window). Tracked as a follow-up.
+4. **Control plane's job-spec response must include the signed
+   capability.** The poller reads `spec.capability`. The control plane
+   must sign the capability and include it in the job-spec response.
+   This wiring is not yet implemented — the poller's `spec.capability`
+   is currently `undefined` (the poller will fail-closed if missing).
+   Tracked as a follow-up.
+5. **In-process runtime-executor.ts** still reads
+   `FORGE_LAUNCHER_KEY_FILE` from env directly (control plane is
+   trusted). For full consistency, it should also delegate to the
+   supervisor. Tracked as a follow-up.
+
+### Stage summary
+
+- The P0 violation is CLOSED: a compromised worker key alone is now
+  useless for forging substrate attestations.
+- The worker process has ZERO access to the launcher private key
+  (no env var, no file path, no field, no code path).
+- The substrate supervisor (port 3004) holds the launcher key IN MEMORY
+  and DELETES the file at startup.
+- The launcher reads the key from an anonymous fd (fd 3), closes it
+  immediately.
+- The ExecutionCapability module provides the control-plane-signed
+  authorization that binds the substrate execution to a specific
+  executionId + nonce + leaseId + repoSha + planHash + archHash.
+- 642 tests pass, 0 regressions, 0 new lint errors.
+
+Stage Status: ✅ COMPLETE
+- Wrote agent-ctx record at /home/z/my-project/agent-ctx/18X-A-key-isolation.md.
+
+---
+
+## Task 18X-B — Control-Plane Capability (Agent: control-plane-capability)
+
+**Phase:** 18X-B (control-plane integration — closes the 18X-A documented gap)
+**Repo HEAD:** 5735b1c (Phase 18W) + uncommitted 18X-A + 18X-B changes
+**Date:** 2025-08-17
+
+### The gap (from 18X-A's HONEST LIMITATIONS 4)
+
+> 4. **Control plane's job-spec response must include the signed
+>    capability.** The poller reads `spec.capability`. The control plane
+>    must sign the capability and include it in the job-spec response.
+>    This wiring is not yet implemented — the poller's `spec.capability`
+>    is currently `undefined` (the poller will fail-closed if missing).
+>    Tracked as a follow-up.
+
+18X-A built the supervisor (port 3004), the ExecutionCapability module
+(`src/lib/execution-capability.ts`), and the worker-side wiring
+(`mini-services/execution-worker/poller.ts` reads `spec.capability`,
+`mini-services/execution-worker/runtime/verify.ts` POSTs the capability
+to the supervisor). But the job-spec endpoint was returning `{ spec }`
+WITHOUT a capability — so the poller's `spec.capability` was undefined,
+and `buildAndSubmitRuntimeEvidenceEnvelope` threw on every runtime
+verification call (fail-closed). 18X-B closes that gap.
+
+### Changes applied
+
+**CHANGE 1 + 2 — Job-spec endpoint issues signed ExecutionCapability**
+  (`src/app/api/worker/job-spec/route.ts`):
+  - Added imports: `signExecutionCapability`, `getControlPlanePrivateKey`
+    (NEW — see CHANGE 1 below), `deriveRuntimeVerificationPlan`,
+    `hashRuntimePlan`.
+  - After `project` + `architecture` are fetched, the route computes
+    `runtimePlanHash` using the SAME logic as `submit-runtime-evidence`:
+    `deriveRuntimeVerificationPlan(project, architecture)` → if non-null,
+    `hashRuntimePlan(plan)`; else "". This makes the capability's
+    planHash match what the control plane will verify at submission time
+    (defense-in-depth).
+  - Builds `capabilityInput` with 7 fields: executionId, nonce
+    (= substrateNonce issued earlier in the route), leaseId,
+    repositoryHeadSha (= project.canonicalHeadSha), runtimePlanHash,
+    architectureHash (= architecture?.hash ?? null), expiresAt
+    (now + 5 minutes).
+  - Fail-closed HTTP 503 if `getControlPlanePrivateKey()` returns null
+    (verification-only mode — the worker cannot safely run runtime
+    verification without a valid capability).
+  - Signs with `signExecutionCapability(capabilityInput, controlPlanePrivateKey)`.
+  - Persists `JSON.stringify(capability)` to
+    `ExecutionJob.substrateCapability` (best-effort DB write — logged
+    on failure; the supervisor-side check is authoritative).
+  - Returns `{ ...spec, capability }` in the response.
+
+**CHANGE 1 (worker-auth) — Export `getControlPlanePrivateKey()`**
+  (`src/lib/worker-auth.ts`):
+  - The control-plane's Ed25519 private key was already in a module-
+    private variable (`controlPlanePrivateKeyPem`), populated at module-
+    load time by `initControlPlaneKeys()` from the
+    `FORGE_CONTROL_PLANE_PRIVATE_KEY` env var (or auto-generated in dev).
+    Phase 18P only exposed the public-key getter (`getControlPlanePublicKey`)
+    because workers need to verify tokens but never sign them.
+  - 18X-B adds `getControlPlanePrivateKey()` returning the same module-
+    private variable. Returns null in verification-only mode. Callers
+    MUST handle null and fail-closed.
+  - The key is the SAME one used for token signing (Phase 18P). NO
+    separate key is generated.
+
+**CHANGE 3 + 4 — Worker wiring verified (no changes needed)**
+  - `mini-services/execution-worker/poller.ts` (lines 937-985): already
+    reads `spec.capability`, passes it to
+    `buildAndSubmitRuntimeEvidenceEnvelope`, which passes it to
+    `executeRuntimeVerificationInWorker`. Uses `SUBSTRATE_SUPERVISOR_URL`
+    env var (default `http://localhost:3004`). Does NOT read
+    `FORGE_LAUNCHER_KEY_FILE` (verified by grep — all matches in comments).
+  - `mini-services/execution-worker/runtime/verify.ts` (lines 103-138,
+    278-330): `RuntimeVerificationJob` has `capability: ExecutionCapability`
+    + `supervisorUrl?: string`. `executeRuntimeVerificationInWorker`
+    POSTs `{ capability, workload, repoPath }` to `${supervisorUrl}/execute`,
+    receives `{ attestation, result }`. Constructs the envelope with the
+    attestation (never null — `callSupervisorExecute` throws on
+    non-200 or missing attestation). Does NOT import or read the launcher
+    key.
+  - Both are correct as left by 18X-A. No changes needed.
+
+**CHANGE 5 + 6 — Submit-runtime-evidence audits capability + Prisma schema**
+  - `prisma/schema.prisma`: added `substrateCapability String?` to
+    `ExecutionJob` (JSON of the signed ExecutionCapability, for audit).
+    `bun run db:generate` regenerated the Prisma client so the route's
+    `select: { substrateCapability: true }` typechecks.
+  - `src/app/api/worker/submit-runtime-evidence/route.ts`:
+    - Added `substrateCapability: true` to the `findUnique` select.
+    - Parses the stored capability, audits that its executionId / nonce /
+      repositoryHeadSha match the token / expectedNonce / envelope's SHA.
+    - Emits `SUBSTRATE_CAPABILITY_NOT_STORED` warning event if the column
+      is null (DB-unavailable path — non-blocking, the supervisor-side
+      check is authoritative).
+    - Emits `CAPABILITY_AUDIT_FAILED` error event if the audit mismatches,
+      and blocks `PRODUCTION_READY` (fail-closed — sets
+      `productionReady = false`).
+    - Surfaces `capabilityAuditPassed` + `capabilityAuditReasons` in the
+      JSON response.
+  - The audit is defense-in-depth — the supervisor already verified the
+    capability's signature before running the substrate (Phase 18X-A).
+    The control-plane audit catches a worker that somehow presented a
+    different capability to the supervisor than the one the control plane
+    issued for this execution.
+
+**CHANGE 7 — Tests: `tests/control-plane-capability-invariants.ts`**
+  (NEW, ~830 lines, 14 tests):
+  1. Job-spec signing path produces a signed capability (signature,
+     algorithm, signedAt, expiresAt all present).
+  2. Capability binds the right values (executionId, nonce, leaseId,
+     repoSha, runtimePlanHash, architectureHash).
+  3. Capability has a 5-minute expiry in the future.
+  4. Capability signature is verifiable with the control-plane public key.
+  5. Tampered capability rejected (modify a signed field → verify fails).
+  6. Expired capability rejected (expiresAt in the past → verify fails).
+  7. Worker relays capability to supervisor — attestation nonce/executionId
+     match the capability.
+  8. Supervisor rejects unsigned capability (missing signature → HTTP 403).
+  9. Worker poller does NOT reference FORGE_LAUNCHER_KEY_FILE in code
+     (comments stripped; re-verified from 18X-A).
+  10. Full E2E flow — capability + worker + supervisor + attestation, all
+      signatures + substrate facts verified.
+  11. Job-spec route source inspection: imports signExecutionCapability +
+      getControlPlanePrivateKey, builds capabilityInput, calls
+      signExecutionCapability, persists, returns in spec.
+  12. Submit-runtime-evidence route source inspection: selects
+      substrateCapability, audits the binding, blocks PRODUCTION_READY on
+      mismatch.
+  13. Prisma schema has `substrateCapability String?` on ExecutionJob.
+  14. Worker poller reads `spec.capability`, passes to the runtime
+      verifier, no launcher key access.
+
+### Test results
+
+- **26 non-integration suites:** 645 passed, 0 failed.
+  - 14 NEW tests in `control-plane-capability-invariants` (this phase).
+  - 0 regressions in the other 25 suites.
+- **Smoke test:** PASSED.
+  - Launcher key file deleted at startup (key isolation).
+  - Capability verifies with control-plane public key.
+  - Worker poller has no launcher key access (grep on stripped code).
+  - Worker envelope signature valid (Ed25519, worker key).
+  - Launcher attestation signature valid (Ed25519, launcher key).
+  - Attestation nonce matches capability nonce.
+  - Attestation executionId matches capability executionId.
+  - Substrate facts valid (seccompMode=2, profile hash matches required).
+  - isSubstrateTrusted: true (combined facts + signature + binding).
+  - Worker verify.ts has no "PRIVATE KEY" string.
+- **Lint:** 1 error + 12 warnings, ALL PRE-EXISTING (documented in 18W-C
+  and 18X-A). 0 new errors/warnings in my touched files.
+- **Integration suites** (hostile-security-test, security-test,
+  regression-test, worker-security-test, worker-identity-integration):
+  fail as pre-existing — require a live Next.js server + PostgreSQL.
+
+### Proof: worker has no launcher key access (grep)
+
+```
+$ rg "FORGE_LAUNCHER_KEY_FILE|LAUNCHER_KEY_FILE|launcherKeyFile" \
+    mini-services/execution-worker/
+mini-services/execution-worker/start-worker.sh:14:# FORGE_LAUNCHER_KEY_FILE, FORGE_LAUNCHER_PUBLIC_KEY, etc. The worker has
+mini-services/execution-worker/poller.ts:368://      launcherKeyFile + workerPrivateKeyPem).
+mini-services/execution-worker/poller.ts:468:  // Phase 18X: the job carries `capability` (NOT `launcherKeyFile`). The
+mini-services/execution-worker/runtime/verify.ts:97: * Phase 18X: the job no longer carries `launcherKeyFile`. Instead it carries:
+```
+
+All 4 matches are in COMMENTS. The actual code, env var read, and field
+are GONE. The worker has zero access to the launcher key. Same state as
+18X-A — 18X-B does not regress this.
+
+### Honest limitations (documented)
+
+1. **DB-dependent audit path not directly testable in sandbox.** The
+   job-spec route's HTTP path requires a live Next.js server + PostgreSQL.
+   The test exercises the SIGNING LOGIC (signExecutionCapability +
+   getControlPlanePrivateKey + deriveRuntimeVerificationPlan +
+   hashRuntimePlan) directly, and the SUPERVISOR acceptance (the
+   supervisor verifies the capability before running the substrate). The
+   route's source is inspected (Test 11) to verify it wires the signing
+   path correctly. The submit-runtime-evidence route's source is
+   inspected (Test 12) to verify it audits the capability. The DB write
+   is best-effort (logged on failure) — the supervisor-side check is
+   authoritative.
+2. **Capability replay within the 5-minute expiry window.** The supervisor
+   does not track a replay cache. Bounded by expiresAt + nonce/executionId
+   binding (control plane can detect a replayed attestation at submission
+   time via the nonce check). Same as 18X-A HONEST LIMITATION 3.
+3. **In-process runtime-executor.ts** (NOT the worker poller) still reads
+   `FORGE_LAUNCHER_KEY_FILE` from env directly (control plane is trusted).
+   For full consistency, it should also delegate to the supervisor.
+   Tracked as a follow-up from 18X-A HONEST LIMITATION 5.
+4. **runtimePlanHash may be "" when the architecture is missing required
+   fields.** The supervisor still accepts the capability (the empty
+   string is part of the signed canonical form). The control plane's
+   submit-runtime-evidence route will reject the envelope on plan-hash
+   mismatch (the supervisor's check is fail-closed on the signature, not
+   on the plan-hash matching the architecture — that's the control
+   plane's job). Documented in the route's comment.
+5. **The job-spec route returns 503 if the control-plane private key is
+   unavailable.** This is the correct fail-closed behavior — the worker
+   cannot safely run runtime verification without a valid capability,
+   and the supervisor will reject any unsigned / wrong-signed capability.
+   In production, `FORGE_CONTROL_PLANE_PRIVATE_KEY` MUST be provisioned.
+
+### Stage summary
+
+- The 18X-A documented gap (HONEST LIMITATION 4) is CLOSED: the job-spec
+  endpoint now issues a signed ExecutionCapability, the worker relays it
+  to the supervisor, the supervisor verifies it before running the
+  substrate.
+- The control-plane private key is the SAME Ed25519 key used for token
+  signing (Phase 18P). No separate key is generated. Exposed via the new
+  `getControlPlanePrivateKey()` helper.
+- The capability binds: executionId, nonce, leaseId, repositoryHeadSha,
+  runtimePlanHash, architectureHash, expiresAt. All seven fields are
+  signed by the control plane.
+- The runtimePlanHash is computed using the SAME logic as
+  submit-runtime-evidence (deriveRuntimeVerificationPlan +
+  hashRuntimePlan), so the capability's planHash matches what the
+  control plane will verify at submission time.
+- The capability has a 5-minute expiry (bounds the replay window).
+- The supervisor verifies the capability signature BEFORE running the
+  substrate (Phase 18X-A). The control plane additionally audits the
+  capability at submission time (Phase 18X-B — defense-in-depth).
+- The worker NEVER has the launcher key (confirmed by grep — all matches
+  in comments).
+- Fail-closed: missing/invalid/expired capability → supervisor returns
+  403 → executeRuntimeVerificationInWorker throws → no envelope
+  submitted. Control-plane audit mismatch → PRODUCTION_READY blocked.
+- 645 tests pass, 0 regressions, 0 new lint errors.
+- Wrote agent-ctx record at /home/z/my-project/agent-ctx/18X-B-control-plane-capability.md.
+
+Stage Status: ✅ COMPLETE

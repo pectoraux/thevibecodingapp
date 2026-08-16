@@ -51,7 +51,7 @@ export async function POST(req: Request) {
 
     const executionJob = await db.executionJob.findUnique({
       where: { executionId: token.executionId },
-      select: { id: true, projectId: true, workerId: true, leaseId: true, leaseExpiresAt: true, substrateNonce: true },
+      select: { id: true, projectId: true, workerId: true, leaseId: true, leaseExpiresAt: true, substrateNonce: true, substrateCapability: true },
     });
 
     if (!executionJob) {
@@ -277,6 +277,97 @@ export async function POST(req: Request) {
             expectedExecutionId
           )
         : false);
+
+    // =========================================================================
+    // Phase 18X-B: Audit the stored ExecutionCapability (defense-in-depth).
+    // =========================================================================
+    //
+    // The substrate supervisor verified the capability's signature BEFORE
+    // running the substrate (Phase 18X-A). At submission time, the control
+    // plane additionally audits that the capability the supervisor accepted
+    // matches the values the control plane attests to NOW:
+    //   - capability.executionId === token.executionId
+    //   - capability.nonce === expectedNonce (=== ExecutionJob.substrateNonce)
+    //   - capability.repositoryHeadSha === expectedSha (=== project.canonicalHeadSha)
+    //
+    // These are ALREADY verified independently above (envelope.executionId
+    // check, expectedNonce derivation, result.repositoryHeadSha !== expectedSha
+    // rejection). This audit is defense-in-depth — it catches a worker that
+    // somehow presented a different capability to the supervisor than the one
+    // the control plane issued for this execution. If the audit fails, we
+    // emit a CAPABILITY_AUDIT_FAILED event and block PRODUCTION_READY (but
+    // still accept the evidence as RUNTIME_VERIFIED — the supervisor's own
+    // signature check already passed; this audit is about control-plane
+    // bookkeeping, not substrate security).
+    //
+    // If the stored capability is missing (e.g., job-spec couldn't persist it
+    // because the DB was unavailable — the sandbox path), we emit a warning
+    // and continue. The supervisor-side check is the authoritative one.
+    let capabilityAuditOk = true;
+    const capabilityAuditReasons: string[] = [];
+    let storedCapability: any = null;
+    if (executionJob.substrateCapability) {
+      try {
+        storedCapability = JSON.parse(executionJob.substrateCapability);
+        if (storedCapability.executionId !== token.executionId) {
+          capabilityAuditOk = false;
+          capabilityAuditReasons.push(
+            `capability.executionId (${storedCapability.executionId}) !== token.executionId (${token.executionId})`
+          );
+        }
+        if (storedCapability.nonce && expectedNonce && storedCapability.nonce !== expectedNonce) {
+          capabilityAuditOk = false;
+          capabilityAuditReasons.push(
+            `capability.nonce (${storedCapability.nonce.slice(0, 8)}...) !== expectedNonce (${expectedNonce.slice(0, 8)}...)`
+          );
+        }
+        if (
+          storedCapability.repositoryHeadSha &&
+          result.repositoryHeadSha &&
+          storedCapability.repositoryHeadSha !== result.repositoryHeadSha
+        ) {
+          capabilityAuditOk = false;
+          capabilityAuditReasons.push(
+            `capability.repositoryHeadSha (${storedCapability.repositoryHeadSha.slice(0, 7)}) !== envelope.repositoryHeadSha (${result.repositoryHeadSha.slice(0, 7)})`
+          );
+        }
+      } catch (err: any) {
+        capabilityAuditOk = false;
+        capabilityAuditReasons.push(
+          `Failed to parse stored substrateCapability JSON: ${err?.message ?? String(err)}`
+        );
+      }
+    } else {
+      // No stored capability — emit a diagnostic event (non-blocking). The
+      // supervisor-side check is authoritative; this just means the control
+      // plane can't audit the binding after the fact.
+      await ensureBuildEvent({
+        projectId,
+        type: BuildEventType.TASK_FAILED,
+        level: "warning",
+        message: `SUBSTRATE_CAPABILITY_NOT_STORED — ExecutionJob.substrateCapability is null for ${token.executionId}. The supervisor verified the capability at runtime, but the control plane cannot audit the binding (defense-in-depth gap). PRODUCTION_READY is NOT blocked by this alone.`,
+        payload: JSON.stringify({
+          executionId: token.executionId,
+          workerId: token.workerId,
+          eventType: "SUBSTRATE_CAPABILITY_NOT_STORED",
+        }),
+      });
+    }
+    if (!capabilityAuditOk) {
+      await ensureBuildEvent({
+        projectId,
+        type: BuildEventType.TASK_FAILED,
+        level: "error",
+        message: `CAPABILITY_AUDIT_FAILED — the stored ExecutionCapability does not match the submission. Reasons: ${capabilityAuditReasons.join("; ")}. PRODUCTION_READY blocked (fail-closed).`,
+        payload: JSON.stringify({
+          executionId: token.executionId,
+          workerId: token.workerId,
+          eventType: "CAPABILITY_AUDIT_FAILED",
+          reasons: capabilityAuditReasons,
+        }),
+      });
+    }
+    const capabilityAuditPassed = capabilityAuditOk;
 
     // 3. If the launcher verification failed (and the attestation was
     //    present), log the specific failure reasons. The evidence is still
@@ -586,6 +677,29 @@ export async function POST(req: Request) {
 
       productionReady = canReachProductionReadyWithRuntime(prodEvidence);
 
+      // Phase 18X-B: The capability audit is defense-in-depth. If it failed,
+      // block PRODUCTION_READY even if the rest of the predicate passes.
+      // The supervisor-side capability check is authoritative for substrate
+      // security; this audit is control-plane bookkeeping — but a mismatch
+      // means something is wrong (worker presented a different capability
+      // than the one issued for this execution), so we fail-closed.
+      if (productionReady && !capabilityAuditPassed) {
+        productionReady = false;
+        await ensureBuildEvent({
+          projectId,
+          type: BuildEventType.HUMAN_REVIEW_REQUIRED,
+          level: "warn",
+          message: `RUNTIME_VERIFIED but NOT PRODUCTION_READY — capability audit failed: ${capabilityAuditReasons.join("; ")}`,
+          payload: JSON.stringify({
+            repositoryHeadSha: result.repositoryHeadSha,
+            eventType: "RUNTIME_VERIFIED_NOT_PRODUCTION_READY",
+            productionReadyEligible: false,
+            failureReason: `capability audit failed: ${capabilityAuditReasons.join("; ")}`,
+            evidence: prodEvidence,
+          }),
+        });
+      }
+
       if (productionReady) {
         // Phase 18A: ONLY emit PRODUCTION_READY when the complete predicate passes.
         await db.project.update({
@@ -648,6 +762,9 @@ export async function POST(req: Request) {
       substrateAttestationPresent: envelope.substrateAttestation !== null,
       substrateVerificationReasons: substrateVerification.reasons,
       launcherVerificationReasons: launcherVerification.reasons,
+      // Phase 18X-B: capability audit (defense-in-depth — see comment above).
+      capabilityAuditPassed,
+      capabilityAuditReasons,
     });
   } catch (e: any) {
     return NextResponse.json({ error: e.message ?? "Failed to submit runtime evidence" }, { status: 500 });

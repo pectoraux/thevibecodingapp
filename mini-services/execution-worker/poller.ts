@@ -377,10 +377,18 @@ async function triggerSchedulerTick(): Promise<void> {
 // There is NO path where this function submits an envelope with
 // `substrateAttestation: null`.
 
-// Phase 18W: the launcher's Ed25519 private key file. REQUIRED in production
-// (admin provisions it). For local/dev runs where the env var isn't set, the
-// function throws with a clear error message — no silent null attestation.
-const LAUNCHER_KEY_FILE = process.env.FORGE_LAUNCHER_KEY_FILE;
+// Phase 18X: the worker does NOT have the launcher private key. It talks
+// to the substrate supervisor (mini-services/substrate-supervisor, port
+// 3004) which holds the launcher key IN MEMORY (file deleted at startup).
+// The worker needs:
+//   - SUBSTRATE_SUPERVISOR_URL (default http://localhost:3004) — where to
+//     POST { capability, workload, repoPath }.
+//   - The control plane's signed ExecutionCapability (carrying nonce,
+//     executionId, leaseId, repoSha, planHash, archHash, expiresAt).
+// The worker NEVER sees the launcher key file path, content, or any env
+// var pointing to it.
+const SUBSTRATE_SUPERVISOR_URL =
+  process.env.SUBSTRATE_SUPERVISOR_URL || "http://localhost:3004";
 
 async function buildAndSubmitRuntimeEvidenceEnvelope(params: {
   executionId: string;
@@ -395,6 +403,10 @@ async function buildAndSubmitRuntimeEvidenceEnvelope(params: {
    *  generates one (in production, the control plane issues this via the
    *  job-spec response — Phase 18W-C will verify it at submission time). */
   substrateNonce?: string;
+  /** Phase 18X: The control-plane-signed ExecutionCapability. The supervisor
+   *  verifies this before running the substrate. The capability carries the
+   *  authoritative nonce + executionId. */
+  capability?: import("@/lib/execution-capability").ExecutionCapability;
 }): Promise<any> {
   if (!workerPrivateKeyPem) {
     throw new Error(
@@ -402,11 +414,18 @@ async function buildAndSubmitRuntimeEvidenceEnvelope(params: {
       "Worker registration did not establish a keypair. Refusing to submit unsigned evidence."
     );
   }
-  if (!LAUNCHER_KEY_FILE) {
+  if (!params.capability) {
     throw new Error(
-      "[worker] FORGE_LAUNCHER_KEY_FILE is not set. The launcher cannot sign the " +
-      "substrate attestation without its Ed25519 private key. Refusing to submit " +
-      "evidence with a null attestation (fail-closed)."
+      "[worker] No ExecutionCapability provided. The substrate supervisor " +
+      "requires a control-plane-signed capability to run the substrate " +
+      "(Phase 18X — the worker cannot ask the supervisor to run arbitrary workloads)."
+    );
+  }
+  if (!SUBSTRATE_SUPERVISOR_URL) {
+    throw new Error(
+      "[worker] SUBSTRATE_SUPERVISOR_URL is not set. The worker needs the " +
+      "substrate supervisor URL to POST the workload (Phase 18X — the worker " +
+      "does NOT hold the launcher key; it delegates to the supervisor)."
     );
   }
 
@@ -446,6 +465,9 @@ async function buildAndSubmitRuntimeEvidenceEnvelope(params: {
   }
 
   // 4. Build the RuntimeVerificationJob.
+  // Phase 18X: the job carries `capability` (NOT `launcherKeyFile`). The
+  // supervisor verifies the capability, then runs the substrate with the
+  // launcher key it holds in memory.
   const job: RuntimeVerificationJob = {
     executionId: params.executionId,
     workerId: WORKER_ID,
@@ -456,7 +478,8 @@ async function buildAndSubmitRuntimeEvidenceEnvelope(params: {
     runtimePlanHash: params.runtimePlanHash,
     plan: params.plan,
     nonce,
-    launcherKeyFile: LAUNCHER_KEY_FILE,
+    capability: params.capability,
+    supervisorUrl: SUBSTRATE_SUPERVISOR_URL,
     workerPrivateKeyPem,
   };
 
@@ -928,6 +951,15 @@ async function maybeRunRuntimeVerification(
     } catch {}
   }
 
+  // Phase 18X: Build the ExecutionCapability the supervisor will verify.
+  // The control plane signs this with its private key (the worker cannot
+  // forge it). In production, the control plane issues the capability via
+  // the job-spec response (spec.capability). If absent, the poller fails-
+  // closed — it cannot run runtime verification without a capability.
+  const capability = spec.capability as
+    | import("@/lib/execution-capability").ExecutionCapability
+    | undefined;
+
   try {
     await buildAndSubmitRuntimeEvidenceEnvelope({
       executionId: spec.executionId,
@@ -939,6 +971,7 @@ async function maybeRunRuntimeVerification(
       architectureHash,
       plan: orchPlan,
       substrateNonce,
+      capability,
     });
   } catch (err: any) {
     // FAIL-CLOSED for runtime verification: the task itself already succeeded

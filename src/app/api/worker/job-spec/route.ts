@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { db } from "@/lib/db";
-import { getWorkerToken } from "@/lib/worker-auth";
+import { getWorkerToken, getControlPlanePrivateKey } from "@/lib/worker-auth";
+import { signExecutionCapability, type ExecutionCapability } from "@/lib/execution-capability";
+import { deriveRuntimeVerificationPlan, hashRuntimePlan } from "@/lib/runtime-verification";
 
 // POST /api/worker/job-spec
 //
@@ -107,6 +109,127 @@ export async function POST(req: Request) {
     const project = await db.project.findUnique({
       where: { id: job.projectId },
     });
+
+    // =========================================================================
+    // Phase 18X-B: Issue a SIGNED ExecutionCapability.
+    // =========================================================================
+    //
+    // The substrate supervisor (mini-services/substrate-supervisor, port 3004)
+    // is a TRUSTED process that holds the launcher private key IN MEMORY (file
+    // deleted at startup). It refuses to run a workload unless the worker
+    // presents a control-plane-signed ExecutionCapability binding:
+    //   - executionId      — the execution row this workload belongs to.
+    //   - nonce            — the substrate launcher nonce (anti-replay).
+    //   - leaseId          — the lease this execution runs under.
+    //   - repositoryHeadSha — the exact git SHA the substrate MUST run.
+    //   - runtimePlanHash  — the plan hash the substrate MUST use.
+    //   - architectureHash — the architecture hash (may be null).
+    //   - expiresAt        — ISO timestamp; capability invalid after this.
+    //
+    // The supervisor verifies the capability signature with
+    // FORGE_CONTROL_PLANE_PUBLIC_KEY (Phase 18X-A). A worker cannot forge it
+    // (no control-plane private key). A worker cannot override the nonce /
+    // executionId / repoSha at the supervisor — those come from the capability.
+    //
+    // The runtimePlanHash is computed using the SAME logic the control plane
+    // uses at submission time (Phase 18A — deriveRuntimeVerificationPlan +
+    // hashRuntimePlan). This makes the capability's plan hash match what the
+    // control plane will verify at submit-runtime-evidence time. If the
+    // architecture isn't available or the plan can't be derived, the
+    // runtimePlanHash is set to "" (empty) and the supervisor's verifier
+    // (verifyExecutionCapability) will still accept the capability (the empty
+    // string is part of the signed canonical form) — but the control plane's
+    // submit-runtime-evidence route will reject the envelope on plan-hash
+    // mismatch (the supervisor's check is fail-closed on the signature, not
+    // on the plan-hash matching the architecture; that's the control plane's
+    // job). Documented as a defense-in-depth gap: a worker that somehow got
+    // the launcher to run with a wrong plan hash would still fail at the
+    // control plane's plan-hash check at submission time.
+    //
+    // The capability expiry is 5 minutes — long enough for the worker to
+    // clone the repo and POST to the supervisor, short enough to bound the
+    // replay window (the supervisor doesn't keep a replay cache yet — see
+    // 18X-A HONEST LIMITATIONS).
+    //
+    // FAIL-CLOSED: if the control-plane private key is unavailable (e.g., the
+    // process is in verification-only mode), we return a 503 — the worker
+    // cannot safely run runtime verification without a valid capability, and
+    // the supervisor will reject any unsigned / wrong-signed capability.
+    const controlPlanePrivateKey = getControlPlanePrivateKey();
+    if (!controlPlanePrivateKey) {
+      return NextResponse.json({
+        error: "Control-plane private key unavailable — cannot issue ExecutionCapability (FORGE_CONTROL_PLANE_PRIVATE_KEY not set). Runtime verification is blocked (fail-closed).",
+      }, { status: 503 });
+    }
+
+    // Compute runtimePlanHash using the SAME logic as submit-runtime-evidence
+    // (Phase 18A). The capability's plan hash MUST match the control plane's
+    // authoritative value — otherwise the worker would relay a capability the
+    // supervisor accepts but the control plane later rejects (a confusing
+    // half-success).
+    const runtimePlanHash = (() => {
+      if (!project) return "";
+      const plan = deriveRuntimeVerificationPlan(
+        {
+          canonicalHeadSha: project.canonicalHeadSha,
+          githubRepo: project.githubRepo,
+          githubDefaultBranch: project.githubDefaultBranch,
+        },
+        architecture
+          ? {
+              contractJson: architecture.contractJson,
+              apiContracts: architecture.apiContracts,
+              integrations: architecture.integrations,
+              testingStrategy: architecture.testingStrategy,
+              deploymentModel: architecture.deploymentModel,
+              hash: architecture.hash,
+              frozen: architecture.frozen,
+            }
+          : null
+      );
+      if (!plan) return "";
+      return hashRuntimePlan(plan);
+    })();
+
+    const capabilityInput = {
+      executionId: job.executionId,
+      nonce: substrateNonce,
+      leaseId: job.leaseId ?? "",
+      repositoryHeadSha: project?.canonicalHeadSha ?? "",
+      runtimePlanHash,
+      architectureHash: architecture?.hash ?? null,
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(), // 5-minute expiry
+    };
+
+    let capability: ExecutionCapability;
+    try {
+      capability = signExecutionCapability(capabilityInput, controlPlanePrivateKey);
+    } catch (err: any) {
+      return NextResponse.json({
+        error: `Failed to sign ExecutionCapability: ${err?.message ?? String(err)}`,
+      }, { status: 500 });
+    }
+
+    // Persist the signed capability on the ExecutionJob row so the control
+    // plane can audit (at submit-runtime-evidence time) that the capability
+    // used for THIS execution matches the one issued at job-spec time. The
+    // nonce in the capability MUST match the attestation's nonce — this is
+    // the audit-time check (defense-in-depth).
+    try {
+      await db.executionJob.update({
+        where: { executionId: token.executionId },
+        data: { substrateCapability: JSON.stringify(capability) } as any,
+      });
+    } catch (err: any) {
+      // DB write failed (e.g., DB unavailable in sandbox). The capability is
+      // returned in the response so the worker can use it. Phase 18X-B
+      // audit at submit-runtime-evidence will fail if the control plane can't
+      // fetch the stored capability — but the supervisor-side check still
+      // protects the substrate.
+      console.warn(
+        `[job-spec] Failed to persist substrateCapability for ${token.executionId}: ${err.message}. Returning capability in response only.`
+      );
+    }
 
     // Build the ExecutionSpec — contains everything the worker needs to
     // execute the task, EXCEPT plaintext secrets.
@@ -215,6 +338,15 @@ export async function POST(req: Request) {
       // worker passes this to the launcher; the control plane verifies it
       // matches at runtime evidence submission time (Phase 18W-C).
       substrateNonce,
+
+      // Phase 18X-B: The SIGNED ExecutionCapability that authorizes the
+      // substrate supervisor to run this workload. The worker relays this
+      // to the supervisor (POST /execute { capability, workload, repoPath }).
+      // The supervisor verifies the signature with
+      // FORGE_CONTROL_PLANE_PUBLIC_KEY before running the substrate.
+      // The worker CANNOT forge this — it doesn't have the control-plane
+      // private key.
+      capability,
     };
 
     return NextResponse.json({ spec });

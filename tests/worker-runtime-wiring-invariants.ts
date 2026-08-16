@@ -28,7 +28,7 @@
 // Run with: bun run tests/worker-runtime-wiring-invariants.ts
 
 import { execFileSync } from "node:child_process";
-import { writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 
@@ -37,8 +37,6 @@ import {
   verifySubstrateAttestation,
   verifyLauncherAttestation,
   isSubstrateTrusted,
-  isSubstrateVerified,
-  generateLauncherKeyPair,
   REQUIRED_SECCOMP_PROFILE_HASH,
   type SandboxAttestation,
 } from "@/lib/substrate-attestation";
@@ -47,6 +45,7 @@ import {
   verifyEvidenceEnvelope,
   type ExecutionEvidenceEnvelope,
 } from "@/lib/runtime-execution-contract";
+import { startTestSupervisor, type TestSupervisor } from "./lib/test-supervisor.js";
 
 // ===========================================================================
 // Test infrastructure
@@ -78,10 +77,14 @@ function record(name: string, passedFlag: boolean, details: string): void {
 // ===========================================================================
 
 const TEST_APP_DIR = "/tmp/forge-wiring-test-app";
-const LAUNCHER_KEY_FILE = `/tmp/forge-wiring-launcher-key-${Date.now()}.pem`;
 
-const LAUNCHER_KEY = generateLauncherKeyPair();
-writeFileSync(LAUNCHER_KEY_FILE, LAUNCHER_KEY.privateKeyPem, { mode: 0o600 });
+// Phase 18X: the test starts a substrate supervisor (TRUSTED mini-service on
+// port 3004). The supervisor holds the launcher key IN MEMORY (file deleted
+// at startup). The worker module (executeRuntimeVerificationInWorker) POSTs
+// { capability, workload } to the supervisor and receives { attestation }.
+// The worker NEVER has the launcher key — only the supervisor does.
+let SUPERVISOR: TestSupervisor | null = null;
+let LAUNCHER_PUBLIC_KEY = "";
 
 const WORKER_KEY = generateWorkerKeyPair("wiring-test-worker");
 
@@ -165,19 +168,35 @@ function makePlan(port: number = 3000) {
 
 /**
  * Run executeRuntimeVerificationInWorker with the standard test config.
+ * Phase 18X: the test signs an ExecutionCapability with the control-plane
+ * private key (held by the test harness — in production, the control plane
+ * signs it). The worker POSTs { capability, workload } to the supervisor
+ * and receives { attestation }.
  */
 async function runVerification(opts: {
   executionId?: string;
   nonce?: string;
   port?: number;
   portOverride?: number; // mismatch: app listens on different port than plan
-  launcherKeyFile?: string;
+  /** If true, the capability is omitted — supervisor should reject. */
+  omitCapability?: boolean;
 }): Promise<{ envelope: ExecutionEvidenceEnvelope; sha: string; executionId: string; nonce: string }> {
   const sha = setupTestApp(opts.portOverride);
   const executionId = opts.executionId || randomUUID();
   const nonce = opts.nonce || generateSubstrateNonce();
   const port = opts.port || 3000;
   const plan = makePlan(port);
+  const capability = opts.omitCapability
+    ? undefined
+    : SUPERVISOR!.signCapability({
+        executionId,
+        nonce,
+        leaseId: "lease-1",
+        repositoryHeadSha: sha,
+        runtimePlanHash: "test-plan-hash",
+        architectureHash: null,
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      });
   const envelope = await executeRuntimeVerificationInWorker({
     executionId,
     workerId: "wiring-test-worker",
@@ -188,12 +207,26 @@ async function runVerification(opts: {
     runtimePlanHash: "test-plan-hash",
     plan,
     nonce,
-    launcherKeyFile: opts.launcherKeyFile || LAUNCHER_KEY_FILE,
+    capability,
+    supervisorUrl: SUPERVISOR!.url,
     workerPrivateKeyPem: WORKER_KEY.privateKeyPem,
     totalTimeoutMs: 120000,
   });
   return { envelope, sha, executionId, nonce };
 }
+
+// ===========================================================================
+// Test fixture — start the substrate supervisor (Phase 18X)
+// ===========================================================================
+
+// Phase 18X: the supervisor is a TRUSTED mini-service that holds the launcher
+// key in memory. The worker module POSTs to it. The test starts ONE
+// supervisor for the whole suite (the supervisor is stateless across
+// /execute calls — each call gets a fresh substrate).
+
+SUPERVISOR = await startTestSupervisor();
+LAUNCHER_PUBLIC_KEY = SUPERVISOR.launcherPublicKey;
+console.log(`[wiring-test] Supervisor started at ${SUPERVISOR.url} (launcher key file deleted: ${SUPERVISOR.launcherKeyFilePath})`);
 
 // ===========================================================================
 // TEST 1 — orchestrator runs inside the substrate (real HTTP server)
@@ -207,14 +240,17 @@ async function runVerification(opts: {
   const att = envelope.substrateAttestation;
   const attNonNull = att !== null && att !== undefined;
   const factsValid = attNonNull ? verifySubstrateAttestation(att).valid : false;
+  const launcherResult = attNonNull ? verifyLauncherAttestation(att, LAUNCHER_PUBLIC_KEY, nonce, executionId).valid : false;
   const healthPassed = envelope.healthChecks.length > 0 && envelope.healthChecks[0].passed;
   const passedBool = envelope.passed;
-  const ok = attNonNull && factsValid && healthPassed && passedBool;
+  const ok = attNonNull && factsValid && launcherResult && healthPassed && passedBool;
   const details = !attNonNull
     ? "substrateAttestation is null"
     : !factsValid
       ? `facts invalid: ${verifySubstrateAttestation(att).reasons.slice(0, 2).join("; ")}`
-      : `healthPassed=${healthPassed} envelopePassed=${passedBool} attestation.substrateType=${att.substrateType}`;
+      : !launcherResult
+        ? `launcher signature invalid`
+        : `healthPassed=${healthPassed} envelopePassed=${passedBool} attestation.substrateType=${att.substrateType}`;
   record(
     "Test 1: orchestrator runs inside the substrate (real HTTP server, real health check, real attestation)",
     ok,
@@ -233,7 +269,7 @@ async function runVerification(opts: {
   const { envelope, executionId, nonce } = await runVerification({});
   const att = envelope.substrateAttestation;
   const factsResult = verifySubstrateAttestation(att);
-  const launcherResult = verifyLauncherAttestation(att, LAUNCHER_KEY.publicKeyPem, nonce, executionId);
+  const launcherResult = verifyLauncherAttestation(att, LAUNCHER_PUBLIC_KEY, nonce, executionId);
   const nsValid =
     att &&
     att.userNamespaceInode &&
@@ -294,12 +330,12 @@ async function runVerification(opts: {
   const execMatch = att && att.executionId === executionId;
   const nonceMatch = att && att.nonce === nonce;
   // Verify the launcher verifier enforces this binding.
-  const launcherOk = verifyLauncherAttestation(att, LAUNCHER_KEY.publicKeyPem, nonce, executionId).valid;
+  const launcherOk = verifyLauncherAttestation(att, LAUNCHER_PUBLIC_KEY, nonce, executionId).valid;
   // Negative: wrong executionId should be rejected.
-  const wrongExec = verifyLauncherAttestation(att, LAUNCHER_KEY.publicKeyPem, nonce, "wrong-exec-" + randomUUID());
+  const wrongExec = verifyLauncherAttestation(att, LAUNCHER_PUBLIC_KEY, nonce, "wrong-exec-" + randomUUID());
   const wrongExecRejected = !wrongExec.valid;
   // Negative: wrong nonce should be rejected.
-  const wrongNonce = verifyLauncherAttestation(att, LAUNCHER_KEY.publicKeyPem, "wrong-nonce-" + randomUUID(), executionId);
+  const wrongNonce = verifyLauncherAttestation(att, LAUNCHER_PUBLIC_KEY, "wrong-nonce-" + randomUUID(), executionId);
   const wrongNonceRejected = !wrongNonce.valid;
   const ok = !!execMatch && !!nonceMatch && launcherOk && wrongExecRejected && wrongNonceRejected;
   const details = `execMatch=${execMatch} nonceMatch=${nonceMatch} launcherOk=${launcherOk} wrongExecRejected=${wrongExecRejected} wrongNonceRejected=${wrongNonceRejected}`;
@@ -369,21 +405,20 @@ async function runVerification(opts: {
 }
 
 // ===========================================================================
-// TEST 7 — no null attestation path: substrate failure throws
+// TEST 7 — no null attestation path: supervisor rejects missing capability
 // ===========================================================================
-// If the launcher key file is missing/invalid, the substrate cannot sign —
-// executeRuntimeVerificationInWorker must THROW, not return a null
-// attestation. Test by pointing launcherKeyFile to a non-existent path.
+// Phase 18X: the supervisor verifies the ExecutionCapability before running
+// the substrate. If the worker POSTs without a capability, the supervisor
+// rejects with HTTP 403, and executeRuntimeVerificationInWorker THROWS —
+// it NEVER returns an envelope with substrateAttestation=null. Test by
+// omitting the capability.
 
 {
   let threw = false;
   let threwWithMessage = "";
   let returnedNullAtt = false;
   try {
-    const result = await runVerification({
-      launcherKeyFile: "/tmp/nonexistent-launcher-key-" + randomUUID() + ".pem",
-    });
-    // If it returned, check if the attestation is null (fail-closed violation).
+    const result = await runVerification({ omitCapability: true });
     if (result.envelope.substrateAttestation === null) {
       returnedNullAtt = true;
     }
@@ -398,7 +433,7 @@ async function runVerification(opts: {
       ? "RETURNED envelope with substrateAttestation=null — CRITICAL invariant violation"
       : "returned envelope (did not throw)";
   record(
-    "Test 7: no null-attestation path — substrate failure (missing launcher key) THROWS, never returns null attestation",
+    "Test 7: no null-attestation path — supervisor rejects missing capability, executeRuntimeVerificationInWorker THROWS",
     ok,
     details
   );
@@ -415,6 +450,15 @@ async function runVerification(opts: {
   const executionId = randomUUID();
   const nonce = generateSubstrateNonce();
   const plan = makePlan(3000);
+  const capability = SUPERVISOR!.signCapability({
+    executionId,
+    nonce,
+    leaseId: "lease-1",
+    repositoryHeadSha: sha,
+    runtimePlanHash: "test-plan-hash",
+    architectureHash: null,
+    expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+  });
   const envelope = await executeRuntimeVerificationInWorker({
     executionId,
     workerId: "wiring-test-worker",
@@ -425,7 +469,8 @@ async function runVerification(opts: {
     runtimePlanHash: "test-plan-hash",
     plan,
     nonce,
-    launcherKeyFile: LAUNCHER_KEY_FILE,
+    capability,
+    supervisorUrl: SUPERVISOR!.url,
     workerPrivateKeyPem: WORKER_KEY.privateKeyPem,
     totalTimeoutMs: 120000,
   });
@@ -440,7 +485,7 @@ async function runVerification(opts: {
 
   // The attestation must be non-null and trusted.
   const attNonNull = envelope.substrateAttestation !== null;
-  const trusted = attNonNull && isSubstrateTrusted(envelope.substrateAttestation, LAUNCHER_KEY.publicKeyPem, nonce, executionId);
+  const trusted = attNonNull && isSubstrateTrusted(envelope.substrateAttestation, LAUNCHER_PUBLIC_KEY, nonce, executionId);
 
   // The envelope signature must verify.
   const sigValid = verifyEvidenceEnvelope(envelope, WORKER_KEY.publicKeyPem);
@@ -467,6 +512,9 @@ for (const r of results) {
   }
 }
 console.log(`\n=== worker-runtime-wiring-invariants: ${passed} passed, ${failed} failed ===`);
+if (SUPERVISOR) {
+  await SUPERVISOR.stop();
+}
 if (failed > 0) {
   console.log("\n❌ WORKER RUNTIME WIRING INVARIANTS NOT SATISFIED — null attestation stub may still be present");
   process.exit(1);

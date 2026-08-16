@@ -32,7 +32,7 @@
 //
 // Run with: bun run tests/substrate-trust-invariants.ts
 
-import { writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { randomUUID, createHash, sign as cryptoSign, generateKeyPairSync } from "node:crypto";
 
 import { runInSubstrate } from "@/lib/substrate-namespace";
@@ -49,6 +49,19 @@ import {
   computeSeccompProfileHash,
   type SandboxAttestation,
 } from "@/lib/substrate-attestation";
+
+// ===========================================================================
+// Phase 18X — Launcher Key Isolation
+// ===========================================================================
+// These tests call runInSubstrate DIRECTLY (with launcherKeyPem in-memory).
+// The TEST harness holds the launcher key — that's fine, the TEST is trusted.
+// In production, ONLY the substrate supervisor (a TRUSTED mini-service) holds
+// the launcher key; the worker has it NEVER.
+//
+// runInSubstrate now accepts `launcherKeyPem` (string), creates an unlinked
+// temp file (anonymous fd), passes the fd to the launcher as stdio[3]. The
+// launcher reads the PEM from fd 3 and closes it. The fd is closed in
+// runInSubstrate's finally block.
 
 // ===========================================================================
 // Test infrastructure
@@ -100,22 +113,19 @@ async function makeTestLauncherSignedAttestation(
   const { privateKeyPem, publicKeyPem } = generateLauncherKeyPair();
   const nonce = randomUUID();
   const executionId = randomUUID();
-  const keyFile = `/tmp/forge-trust-launcher-key-${Date.now()}-${Math.random().toString(36).slice(2)}.pem`;
-  writeFileSync(keyFile, privateKeyPem, { mode: 0o600 });
-  try {
-    const { attestation } = await runInSubstrate({
-      binary,
-      args,
-      cwd: HOSTILE_CWD,
-      timeoutMs: 15000,
-      nonce,
-      executionId,
-      launcherKeyFile: keyFile,
-    });
-    return { attestation, launcherPublicKeyPem: publicKeyPem, nonce, executionId };
-  } finally {
-    try { rmSync(keyFile, { force: true }); } catch { /* best-effort */ }
-  }
+  // Phase 18X: pass the launcher key PEM directly (NOT a file path).
+  // runInSubstrate creates an unlinked temp file internally and passes the
+  // fd to the launcher. The test harness holds the key — that's fine.
+  const { attestation } = await runInSubstrate({
+    binary,
+    args,
+    cwd: HOSTILE_CWD,
+    timeoutMs: 15000,
+    nonce,
+    executionId,
+    launcherKeyPem: privateKeyPem,
+  });
+  return { attestation, launcherPublicKeyPem: publicKeyPem, nonce, executionId };
 }
 
 // ===========================================================================

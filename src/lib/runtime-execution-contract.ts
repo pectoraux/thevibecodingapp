@@ -362,14 +362,6 @@ export interface RuntimeExecutionPolicy {
    * Binds the substrate attestation to a specific execution.
    */
   executionId: string;
-
-  /**
-   * Phase 18W: Path to the launcher's Ed25519 private key (PEM). The launcher
-   * uses this to sign canonicalFactsJson. The key is SEPARATE from the worker
-   * key and provisioned by admin. If empty, the substrate cannot establish a
-   * launcher-trusted attestation (fail-closed — PRODUCTION_READY blocked).
-   */
-  launcherKeyFile: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -413,14 +405,6 @@ export function deriveRuntimeExecutionPolicy(
      * fail the checkout step (fail-closed).
      */
     repositoryUrl?: string;
-    /**
-     * Phase 18W: Path to the launcher's Ed25519 private key (PEM). The
-     * launcher uses this to sign canonicalFactsJson. REQUIRED for
-     * launcher-trusted substrate attestation. If omitted, the policy's
-     * launcherKeyFile is empty and the substrate will fail-closed
-     * (no launcher-trusted attestation).
-     */
-    launcherKeyFile?: string;
   }
 ): RuntimeExecutionPolicy {
   const sandbox = createSandboxModel(options.executionId, options.sandboxRoot);
@@ -474,7 +458,6 @@ export function deriveRuntimeExecutionPolicy(
     architectureHash: options.architectureHash,
     // Phase 18W: launcher trust fields.
     executionId: options.executionId,
-    launcherKeyFile: options.launcherKeyFile ?? "",
   };
 }
 

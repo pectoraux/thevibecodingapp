@@ -496,6 +496,32 @@ export async function executeRuntimeVerification(
   // unshare unavailable, facts file missing) — fail-closed.
   let substrateAttestation: SandboxAttestation | null = null;
 
+  // Phase 18X: The control plane reads the launcher key PEM into memory from
+  // FORGE_LAUNCHER_KEY_FILE (the control plane IS trusted — it has the
+  // launcher key file). This is the IN-PROCESS executor path (different from
+  // the worker poller path, which uses the substrate supervisor mini-service).
+  // The key is read into memory once per executeRuntimeVerification call;
+  // the file itself is NOT deleted (the supervisor mini-service owns deletion).
+  const launcherKeyFile = process.env.FORGE_LAUNCHER_KEY_FILE ?? "";
+  let launcherKeyPem = "";
+  if (launcherKeyFile) {
+    try {
+      launcherKeyPem = readFileSync(launcherKeyFile, "utf-8");
+    } catch (err) {
+      // File missing or unreadable — fail-closed: all runInSubstrate calls
+      // will throw (launcherKeyPem is empty), substrateAttestation stays null,
+      // production gate blocks.
+      console.warn(
+        `[runtime-executor] Failed to read launcher key from ${launcherKeyFile}: ${err instanceof Error ? err.message : String(err)}. ` +
+          "Substrate attestation will be unavailable — production gate will block."
+      );
+    }
+  } else {
+    console.warn(
+      "[runtime-executor] FORGE_LAUNCHER_KEY_FILE not set — substrate attestation will be unavailable, production gate will block."
+    );
+  }
+
   try {
     // 1. Create workspace
     workspace.create();
@@ -592,10 +618,12 @@ export async function executeRuntimeVerification(
         cwd: workspace.getPaths().repo,
         env: policy.commands.install.env,
         timeoutMs: policy.commands.install.timeoutMs,
-        // Phase 18W: launcher trust — bind nonce/executionId/launcherKeyFile.
+        // Phase 18W: launcher trust — bind nonce/executionId.
+        // Phase 18X: pass the launcher key PEM (NOT a file path) so the
+        // launcher reads it from an anonymous fd.
         nonce: randomUUID(),
         executionId: policy.executionId,
-        launcherKeyFile: policy.launcherKeyFile,
+        launcherKeyPem,
       });
       if (!substrateAttestation) substrateAttestation = installRun.attestation;
       installResult = installRun.result;
@@ -638,10 +666,11 @@ export async function executeRuntimeVerification(
         cwd: workspace.getPaths().repo,
         env: policy.commands.build.env,
         timeoutMs: policy.commands.build.timeoutMs,
-        // Phase 18W: launcher trust — bind nonce/executionId/launcherKeyFile.
+        // Phase 18W: launcher trust — bind nonce/executionId.
+        // Phase 18X: pass the launcher key PEM (NOT a file path).
         nonce: randomUUID(),
         executionId: policy.executionId,
-        launcherKeyFile: policy.launcherKeyFile,
+        launcherKeyPem,
       });
       if (!substrateAttestation) substrateAttestation = buildRun.attestation;
       buildResult = buildRun.result;

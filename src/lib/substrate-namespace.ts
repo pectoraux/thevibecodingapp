@@ -50,6 +50,9 @@ import {
   mkdtempSync,
   writeFileSync,
   statSync,
+  openSync,
+  closeSync,
+  unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -434,12 +437,17 @@ export interface RunInSubstrateOptions {
    */
   executionId: string;
   /**
-   * Phase 18W: Path to the launcher's Ed25519 private key (PEM). The launcher
-   * reads this BEFORE chroot and uses it to sign canonicalFactsJson. The key
-   * is SEPARATE from the worker key and provisioned by admin. REQUIRED —
-   * without it, the launcher cannot sign, and the attestation is untrusted.
+   * Phase 18X: The launcher's Ed25519 PRIVATE key as a PEM STRING (NOT a file
+   * path). The caller (substrate supervisor — a TRUSTED process) holds the
+   * key in memory (the file was deleted at supervisor startup). 
+   * runInSubstrate creates an unlinked temp file, writes the PEM to it,
+   * passes the fd to the launcher as stdio[3], and closes the fd when the
+   * launcher exits. The launcher reads the PEM from fd 3 and closes the fd.
+   *
+   * The worker process NEVER sees the PEM — it only has the public key (for
+   * envelope verification, which it doesn't do) and the signed attestation.
    */
-  launcherKeyFile: string;
+  launcherKeyPem: string;
 }
 
 export interface SubstrateRunResult {
@@ -480,7 +488,10 @@ export async function runInSubstrate(
   if (!opts.cwd) throw new Error("runInSubstrate: cwd is required");
   if (!opts.nonce) throw new Error("runInSubstrate: nonce is required (Phase 18W launcher trust)");
   if (!opts.executionId) throw new Error("runInSubstrate: executionId is required (Phase 18W launcher trust)");
-  if (!opts.launcherKeyFile) throw new Error("runInSubstrate: launcherKeyFile is required (Phase 18W launcher trust)");
+  if (!opts.launcherKeyPem) throw new Error("runInSubstrate: launcherKeyPem is required (Phase 18X launcher key isolation — pass the PEM string, NOT a file path)");
+  if (opts.launcherKeyPem.includes("PRIVATE KEY") === false) {
+    throw new Error("runInSubstrate: launcherKeyPem does not look like a PEM private key (missing 'PRIVATE KEY' marker)");
+  }
 
   const launcherBinary = compileLauncher();
   const hostInodes = getHostNamespaceInodes();
@@ -502,6 +513,43 @@ export async function runInSubstrate(
   // vs "launcher wrote but parse failed".
   writeFileSync(factsFile, "");
 
+  // Phase 18X: Create an UNLINKED temp file for the launcher key PEM.
+  //
+  // The PEM is written to a temp file, the file is opened for READING (which
+  // gives us a fresh fd positioned at the start), and the file is IMMEDIATELY
+  // unlinked — the name is gone from the directory but the fd is still
+  // valid. The kernel keeps the inode + data alive until all fds are closed.
+  // The launcher reads the PEM from this fd (passed as stdio[3] = fd 3),
+  // then closes the fd. We also close the fd in the supervisor's finally
+  // block.
+  //
+  // This means the launcher key PEM is NEVER on disk in a named form
+  // accessible to the worker process. The worker doesn't have the
+  // supervisor's PID, and even if it did, ptrace is blocked by seccomp for
+  // the workload (and the supervisor itself isn't sandboxed). A
+  // root-compromised supervisor host can still scan /proc/<pid>/fd/3 to
+  // extract the key — see HONEST LIMITATIONS in the worklog.
+  let keyFd: number | null = null;
+  let keyPath = "";
+  try {
+    keyPath = join(tempBase, `forge-launcher-key-${randomUUID()}.pem`);
+    // Write the PEM with mode 0600 (owner read/write only).
+    writeFileSync(keyPath, opts.launcherKeyPem, { mode: 0o600 });
+    // Open for READING — fresh fd, position at start, ready for the launcher.
+    keyFd = openSync(keyPath, "r");
+    // UNLINK IMMEDIATELY — the name is gone, but the fd is still valid.
+    // The key content is in the kernel's page cache, accessible only via
+    // this fd.
+    try { unlinkSync(keyPath); } catch { /* best-effort */ }
+    keyPath = ""; // already unlinked — don't try again in the catch below.
+  } catch (err) {
+    if (keyFd !== null) { try { closeSync(keyFd); } catch { /* best-effort */ } }
+    if (keyPath) { try { unlinkSync(keyPath); } catch { /* best-effort */ } }
+    throw new Error(
+      `runInSubstrate: failed to create anonymous fd for launcher key: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
   let child: ChildProcess | null = null;
   let timedOut = false;
   let stdout = "";
@@ -513,14 +561,15 @@ export async function runInSubstrate(
     buildRootfs(rootfsDir, opts.cwd, { includeProc: opts.includeProc });
 
     // 3. Spawn unshare with the launcher.
-    // Phase 18W: new arg layout — launcher takes <launcher_key_file> <nonce>
+    // Phase 18X: new arg layout — launcher takes <launcher_key_fd> <nonce>
     // <execution_id> <substrate_instance_id> <facts_file> <rootfs_dir>
-    // <workspace_dir> <binary> [args...].
+    // <workspace_dir> <binary> [args...]. The key fd is passed as stdio[3]
+    // (the child's fd 3), so argv[1] is the literal string "3".
     const unshareArgs: string[] = [
       "-U", "-r", "-p", "-f", "-n", "-m",
       "--propagation=private",
       launcherBinary,
-      opts.launcherKeyFile,
+      "3", // argv[1] = launcher_key_fd (the child's fd 3, see stdio below)
       opts.nonce,
       opts.executionId,
       substrateInstanceId,
@@ -538,10 +587,14 @@ export async function runInSubstrate(
       delete sanitizedEnv.SUBSTRATE_INCLUDE_PROC;
     }
 
+    // stdio layout: [stdin=ignore, stdout=pipe, stderr=pipe, fd3=keyFd].
+    // Node.js spawn accepts an integer fd as a stdio entry — the child
+    // inherits the fd as its fd 3. The launcher reads the PEM from fd 3
+    // (argv[1] = "3") and closes it.
     child = spawn("unshare", unshareArgs, {
       cwd: opts.cwd,
       env: sanitizedEnv,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe", keyFd],
       shell: false, // NEVER use shell — prevents command injection.
       detached: true, // Own process group — we can kill -<pgid>.
     });
@@ -622,10 +675,19 @@ export async function runInSubstrate(
 
     return { result, attestation };
   } finally {
-    // 8. Always cleanup rootfs dir + temp dir.
+    // 8. Always cleanup rootfs dir + temp dir + key fd.
     // No umount needed — bind-mounts lived in the launcher's mount namespace
     // and died with it. From the host's perspective, rootfsDir only ever
     // contained empty subdirs + empty dev-file placeholders.
+    //
+    // Phase 18X: CLOSE the key fd. The launcher already closed its copy (via
+    // BIO_CLOSE in read_launcher_key_from_fd). The supervisor's copy is
+    // closed here. After this, no fd table anywhere references the unlinked
+    // inode — the kernel frees the key material from the page cache.
+    if (keyFd !== null) {
+      try { closeSync(keyFd); } catch { /* best-effort */ }
+      keyFd = null;
+    }
     cleanupRootfs(rootfsDir);
     try {
       rmSync(tempDir, { recursive: true, force: true });
