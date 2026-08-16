@@ -32,7 +32,26 @@ export async function POST(req: Request) {
     // Phase 18G: Worker registers its Ed25519 public key at registration time.
     // This key is used to verify evidence signatures. It is NEVER accepted
     // from the runtime-evidence submission body — only from the DB.
+    //
+    // Phase 18H: The public key is IMMUTABLE after initial registration.
+    // A worker CANNOT overwrite its own key via re-registration. This prevents
+    // a compromised worker credential from replacing the trust anchor.
+    // Key rotation requires a separate authorized protocol (old key signature
+    // or admin authorization) — see /api/worker/rotate-key.
     const publicKeyPem = body.publicKeyPem as string | undefined;
+
+    // Check if worker already exists with a key.
+    const existing = await db.workerRegistry.findUnique({
+      where: { workerId },
+      select: { publicKeyPem: true },
+    });
+
+    if (existing && existing.publicKeyPem && publicKeyPem) {
+      // Worker exists AND has a key AND is trying to set a new one → REJECT.
+      return NextResponse.json({
+        error: "REJECTED: Worker already has a registered signing key. Key rotation requires /api/worker/rotate-key with authorization from the current key or an admin.",
+      }, { status: 403 });
+    }
 
     const worker = await db.workerRegistry.upsert({
       where: { workerId },
@@ -44,7 +63,7 @@ export async function POST(req: Request) {
         maxConcurrency: body.maxConcurrency || 1,
         status: "READY",
         lastHeartbeat: new Date(),
-        publicKeyPem: publicKeyPem || null,
+        publicKeyPem: publicKeyPem || null, // Only set on first create.
       },
       update: {
         workerVersion: body.workerVersion,
@@ -53,8 +72,7 @@ export async function POST(req: Request) {
         maxConcurrency: body.maxConcurrency || 1,
         status: "READY",
         lastHeartbeat: new Date(),
-        // Phase 18G: Update public key if provided (allows key rotation).
-        ...(publicKeyPem ? { publicKeyPem } : {}),
+        // Phase 18H: publicKeyPem is NEVER updated here. Immutable after create.
       },
     });
 

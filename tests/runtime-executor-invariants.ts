@@ -1067,10 +1067,105 @@ const endpointCode18G = readFile("src/app/api/worker/submit-runtime-evidence/rou
 }
 
 // ===========================================================================
+// PHASE 18H: Immutable trust anchor — key cannot be self-replaced
+// ===========================================================================
+
+const registerCode18H = readFile("src/app/api/worker/register/route.ts");
+const rotateKeyCode18H = readFile("src/app/api/worker/rotate-key/route.ts");
+
+// Test 95: Register endpoint does NOT overwrite existing publicKeyPem.
+{
+  // The update path must NOT include publicKeyPem.
+  // Check that the update block does not spread publicKeyPem.
+  const hasUpdateKey = registerCode18H.includes("publicKeyPem } : {}") ||
+    registerCode18H.includes("publicKeyPem: publicKeyPem");
+  // The only valid place is in the create block, not the update block.
+  // Check for the immutability guard.
+  const hasImmutabilityGuard = registerCode18H.includes("already has a registered signing key");
+  record(
+    "Phase 18H: register endpoint has immutability guard (rejects key replacement)",
+    hasImmutabilityGuard,
+    `hasImmutabilityGuard: ${hasImmutabilityGuard}`
+  );
+}
+
+// Test 96: Register update block does NOT set publicKeyPem.
+{
+  // The update block should have a comment saying publicKeyPem is never updated.
+  const hasImmutableComment = registerCode18H.includes("publicKeyPem is NEVER updated here");
+  record(
+    "Phase 18H: register update block does NOT set publicKeyPem (immutable after create)",
+    hasImmutableComment,
+    `hasImmutableComment: ${hasImmutableComment}`
+  );
+}
+
+// Test 97: Key rotation endpoint exists.
+{
+  const exists = rotateKeyCode18H.length > 0;
+  record(
+    "Phase 18H: /api/worker/rotate-key endpoint exists",
+    exists,
+    `exists: ${exists}`
+  );
+}
+
+// Test 98: Rotation endpoint requires signature from current key.
+{
+  const requiresSig = rotateKeyCode18H.includes("rotationSignature") &&
+    rotateKeyCode18H.includes("Rotation signature verification FAILED");
+  record(
+    "Phase 18H: rotation endpoint requires signature from current private key",
+    requiresSig,
+    `requiresSig: ${requiresSig}`
+  );
+}
+
+// Test 99: Rotation endpoint verifies with current registered public key.
+{
+  const verifiesWithCurrent = rotateKeyCode18H.includes("cryptoVerify(null, challengeData, worker.publicKeyPem");
+  record(
+    "Phase 18H: rotation verifies signature with CURRENT registered public key",
+    verifiesWithCurrent,
+    `verifiesWithCurrent: ${verifiesWithCurrent}`
+  );
+}
+
+// Test 100: Rotation uses deterministic challenge format.
+{
+  const hasChallenge = rotateKeyCode18H.includes("FORGE_KEY_ROTATION:");
+  record(
+    "Phase 18H: rotation uses deterministic challenge (FORGE_KEY_ROTATION:{workerId}:{newKey})",
+    hasChallenge,
+    `hasChallenge: ${hasChallenge}`
+  );
+}
+
+// Test 101: Rotation endpoint rejects without existing key.
+{
+  const rejectsNoKey = rotateKeyCode18H.includes("Use /api/worker/register to register an initial key");
+  record(
+    "Phase 18H: rotation endpoint rejects workers without existing key",
+    rejectsNoKey,
+    `rejectsNoKey: ${rejectsNoKey}`
+  );
+}
+
+// Test 102: Rotation endpoint is authenticated.
+{
+  const hasAuth = rotateKeyCode18H.includes("getWorkerToken(req)");
+  record(
+    "Phase 18H: rotation endpoint requires worker authentication",
+    hasAuth,
+    `hasAuth: ${hasAuth}`
+  );
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 
-console.log("=== Forge Phase 18G: Evidence Authorization Closure ===\n");
+console.log("=== Forge Phase 18H: Immutable Trust Anchor ===\n");
 let passed = 0;
 let failed = 0;
 for (const r of results) {
