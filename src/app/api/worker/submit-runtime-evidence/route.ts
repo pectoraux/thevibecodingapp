@@ -23,6 +23,10 @@ import {
   isSubstrateTrusted,
   type SubstrateVerificationResult,
 } from "@/lib/substrate-attestation";
+import {
+  verifyArtifactManifest,
+  type ManifestVerificationResult,
+} from "@/lib/artifact-manifest";
 
 // POST /api/worker/submit-runtime-evidence
 //
@@ -387,6 +391,67 @@ export async function POST(req: Request) {
       });
     }
 
+    // =========================================================================
+    // Phase 18Z-A: ARTIFACT MANIFEST VERIFICATION.
+    // =========================================================================
+    //
+    // The launcher (inside the substrate, with the SAME Ed25519 key that
+    // signs the attestation) builds + signs the ArtifactManifest. The
+    // manifest binds ALL execution artifacts (install.log, build.log,
+    // runtime-stdout, runtime-stderr, health traces, the substrate
+    // attestation itself, ...) via SHA-256 content hashes.
+    //
+    // The control plane verifies the manifest signature with the SAME pinned
+    // launcher public key used for the attestation. A compromised worker
+    // cannot forge the manifest signature (it doesn't have the launcher key).
+    //
+    // The manifest is ALSO bound into the envelope hash (Phase 18Z-A added
+    // `artifactManifest` to computeResultHash + computeEnvelopeHash), so the
+    // worker's Ed25519 signature covers it. The control plane verifies BOTH:
+    //   - worker signature on the envelope (which covers the manifest)
+    //   - launcher signature on the manifest hash
+    //
+    // Fail-closed: null/missing manifest → artifactManifestVerified = false
+    // → PRODUCTION_READY blocked. Forge never trusts "build.log exists" — it
+    // trusts `sha256(build.log) === <signed manifest hash>`.
+    let manifestVerification: ManifestVerificationResult;
+    if (!launcherPublicKeyPem) {
+      // No pinned launcher key → can't verify the manifest. Fail-closed.
+      manifestVerification = {
+        valid: false,
+        reasons: [
+          "Artifact manifest UNVERIFIABLE — FORGE_LAUNCHER_PUBLIC_KEY env var not set. PRODUCTION_READY blocked (fail-closed).",
+        ],
+      };
+    } else {
+      manifestVerification = verifyArtifactManifest(
+        envelope.artifactManifest ?? null,
+        launcherPublicKeyPem,
+        token.executionId
+      );
+    }
+    const artifactManifestVerified = manifestVerification.valid;
+
+    // If the manifest verification failed, emit a build event with the
+    // specific failure reasons. The evidence is still ACCEPTED as
+    // RUNTIME_VERIFIED — but PRODUCTION_READY is blocked.
+    if (!artifactManifestVerified) {
+      await ensureBuildEvent({
+        projectId,
+        type: BuildEventType.TASK_FAILED,
+        level: "error",
+        message: `ARTIFACT_MANIFEST_REJECTED — launcher manifest verification failed: ${manifestVerification.reasons.join("; ")}`,
+        payload: JSON.stringify({
+          executionId: token.executionId,
+          workerId: token.workerId,
+          eventType: "ARTIFACT_MANIFEST_REJECTED",
+          reasons: manifestVerification.reasons,
+          manifestPresent: envelope.artifactManifest !== null,
+          manifestEntries: envelope.artifactManifest?.entries?.length ?? 0,
+        }),
+      });
+    }
+
     // Phase 18G: DERIVE the RuntimeVerificationResult from the signed envelope.
     // There is no separate unsigned result. The envelope IS the evidence.
     const result: RuntimeVerificationResult = {
@@ -672,6 +737,11 @@ export async function POST(req: Request) {
         // is blocked unless the attestation is FULLY trusted.
         executionEnvironmentSandboxed: substrateTrusted,
         substrateAttestationVerified: substrateTrusted,
+        // Phase 18Z-A: the artifact manifest must be verified (launcher
+        // signature valid + manifestHash matches content + required artifact
+        // types present + executionId bound). Fail-closed: null/missing
+        // manifest → false → PRODUCTION_READY blocked.
+        artifactManifestVerified,
         repositoryHeadVerified: headVerified,
       };
 
@@ -765,6 +835,14 @@ export async function POST(req: Request) {
       // Phase 18X-B: capability audit (defense-in-depth — see comment above).
       capabilityAuditPassed,
       capabilityAuditReasons,
+      // Phase 18Z-A: artifact manifest verification. The manifest binds all
+      // execution artifacts via SHA-256 + launcher signature. Fail-closed:
+      // null/missing manifest → artifactManifestVerified = false →
+      // PRODUCTION_READY blocked.
+      artifactManifestVerified,
+      artifactManifestPresent: envelope.artifactManifest !== null,
+      artifactManifestEntries: envelope.artifactManifest?.entries?.length ?? 0,
+      artifactManifestReasons: manifestVerification.reasons,
     });
   } catch (e: any) {
     return NextResponse.json({ error: e.message ?? "Failed to submit runtime evidence" }, { status: 500 });

@@ -83,6 +83,7 @@ import {
   type ExecutionEvidenceEnvelope,
 } from "@/lib/runtime-execution-contract";
 import type { SandboxAttestation } from "@/lib/substrate-attestation";
+import type { ArtifactManifest } from "@/lib/artifact-manifest";
 import type { ExecutionCapability } from "@/lib/execution-capability";
 import type { CommandResult } from "@/lib/runtime-executor";
 
@@ -269,6 +270,9 @@ interface SupervisorExecuteResponse {
   result: CommandResult;
   /** Phase 18Y: the orchestrator's results.json (if the orchestrator wrote it). */
   results?: unknown | null;
+  /** Phase 18Z-A: the launcher-signed artifact manifest (null if the launcher
+   * didn't write one — fail-closed → production blocked). */
+  manifest?: ArtifactManifest | null;
 }
 
 /**
@@ -387,7 +391,7 @@ export async function executeRuntimeVerificationInWorker(
     `[worker] Starting runtime verification via supervisor at ${supervisorUrl} ` +
       `(executionId=${job.executionId}, nonce=${job.nonce.slice(0, 8)}..., sha=${job.repositoryHeadSha.slice(0, 7)})`
   );
-  const { result, attestation, results: supervisorResults } = await callSupervisorExecute(supervisorUrl, {
+  const { result, attestation, results: supervisorResults, manifest: supervisorManifest } = await callSupervisorExecute(supervisorUrl, {
     capability: job.capability,
   });
 
@@ -423,19 +427,20 @@ export async function executeRuntimeVerificationInWorker(
   }
 
   // Construct the envelope.
-  const envelope = buildEnvelopeFromResults(job, results, attestation, result.stdout);
+  const envelope = buildEnvelopeFromResults(job, results, attestation, result.stdout, supervisorManifest ?? null);
   return envelope;
 }
 
 // ---------------------------------------------------------------------------
-// Build the envelope from results + attestation
+// Build the envelope from results + attestation + manifest
 // ---------------------------------------------------------------------------
 
 function buildEnvelopeFromResults(
   job: RuntimeVerificationJob,
   results: OrchestratorResults,
   attestation: SandboxAttestation,
-  orchestratorStdout: string
+  orchestratorStdout: string,
+  manifest: ArtifactManifest | null
 ): ExecutionEvidenceEnvelope {
   // Map orchestrator results → envelope contract fields.
   const dependencyInstallResult = results.installResult
@@ -514,6 +519,10 @@ function buildEnvelopeFromResults(
     logs: orchestratorStdout.slice(0, 50000),
     // The REAL attestation from the supervisor — NEVER null.
     substrateAttestation: attestation,
+    // Phase 18Z-A: the launcher-signed artifact manifest. Bound into the
+    // envelope hash (so the worker's Ed25519 signature covers it). Null if
+    // the launcher didn't write a manifest → production blocked (fail-closed).
+    artifactManifest: manifest,
   };
 
   // Compute canonical hashes.

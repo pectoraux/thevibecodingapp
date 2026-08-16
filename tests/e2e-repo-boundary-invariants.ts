@@ -881,6 +881,7 @@ let test1Nonce = "";
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: false, // ← NOT sandboxed
     substrateAttestationVerified: false,  // ← NO verified attestation
+    artifactManifestVerified: true,       // Phase 18Z-A (true here — this test isolates the substrate flag)
     repositoryHeadVerified: true,
   };
   const canReach = canReachProductionReadyWithRuntime(evidence);

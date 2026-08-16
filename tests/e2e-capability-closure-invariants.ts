@@ -917,6 +917,7 @@ let test1Sha = "";
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: false,
     substrateAttestationVerified: false,
+    artifactManifestVerified: true, // Phase 18Z-A
     repositoryHeadVerified: true,
   };
   const canReach = canReachProductionReadyWithRuntime(evidence);

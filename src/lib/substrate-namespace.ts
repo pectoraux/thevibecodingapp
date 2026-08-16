@@ -65,6 +65,7 @@ import {
   computeSeccompProfileHash,
   type SandboxAttestation,
 } from "@/lib/substrate-attestation";
+import type { ArtifactManifest } from "@/lib/artifact-manifest";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -439,7 +440,7 @@ export interface RunInSubstrateOptions {
   /**
    * Phase 18X: The launcher's Ed25519 PRIVATE key as a PEM STRING (NOT a file
    * path). The caller (substrate supervisor — a TRUSTED process) holds the
-   * key in memory (the file was deleted at supervisor startup). 
+   * key in memory (the file was deleted at supervisor startup).
    * runInSubstrate creates an unlinked temp file, writes the PEM to it,
    * passes the fd to the launcher as stdio[3], and closes the fd when the
    * launcher exits. The launcher reads the PEM from fd 3 and closes the fd.
@@ -448,11 +449,31 @@ export interface RunInSubstrateOptions {
    * envelope verification, which it doesn't do) and the signed attestation.
    */
   launcherKeyPem: string;
+  /**
+   * Phase 18Z-A: The worker ID, bound into the artifact manifest's hash +
+   * signature. The launcher writes this to /workspace/manifest.json.
+   * Optional (defaults to empty string) — direct callers (e.g., hostile
+   * tests) may omit it. The supervisor passes the real value from the
+   * capability.
+   */
+  workerId?: string;
+  /**
+   * Phase 18Z-A: The repository SHA, bound into the artifact manifest's hash
+   * + signature. Optional (defaults to empty string) — direct callers may
+   * omit it. The supervisor passes cap.repositoryHeadSha.
+   */
+  repositorySha?: string;
 }
 
 export interface SubstrateRunResult {
   result: CommandResult;
   attestation: SandboxAttestation;
+  /**
+   * Phase 18Z-A: The launcher-signed artifact manifest. Read from
+   * <workspace>/manifest.json after the substrate exits. Null if the
+   * launcher didn't write a manifest (fail-closed — production blocked).
+   */
+  manifest: ArtifactManifest | null;
 }
 
 const TERMINATION_GRACE_MS = 5000;
@@ -565,6 +586,11 @@ export async function runInSubstrate(
     // <execution_id> <substrate_instance_id> <facts_file> <rootfs_dir>
     // <workspace_dir> <binary> [args...]. The key fd is passed as stdio[3]
     // (the child's fd 3), so argv[1] is the literal string "3".
+    //
+    // Phase 18Z-A: argv layout extended — <launcher_key_fd> <nonce>
+    // <execution_id> <substrate_instance_id> <worker_id> <repository_sha>
+    // <facts_file> <rootfs_dir> <workspace_dir> <binary> [args...].
+    // worker_id + repository_sha are bound into the artifact manifest.
     const unshareArgs: string[] = [
       "-U", "-r", "-p", "-f", "-n", "-m",
       "--propagation=private",
@@ -573,6 +599,8 @@ export async function runInSubstrate(
       opts.nonce,
       opts.executionId,
       substrateInstanceId,
+      opts.workerId ?? "",       // Phase 18Z-A: argv[5]
+      opts.repositorySha ?? "",  // Phase 18Z-A: argv[6]
       factsFile,
       rootfsDir,
       opts.cwd, // workspace_dir — bind-mounted into rootfs/workspace (RW)
@@ -673,7 +701,25 @@ export async function runInSubstrate(
     // 7. Verify the substrate actually entered new namespaces (fail-closed).
     assertSubstrateIsolated(attestation, hostInodes);
 
-    return { result, attestation };
+    // 8. Phase 18Z-A: Read <workspace>/manifest.json (written by the launcher
+    //    after the workload exits). The manifest is the launcher-signed
+    //    content-addressed index over all execution artifacts. If missing or
+    //    invalid, manifest = null → production blocked (fail-closed).
+    const manifestPath = join(opts.cwd, "manifest.json");
+    let manifest: ArtifactManifest | null = null;
+    try {
+      const manifestRaw = readFileSync(manifestPath, "utf-8");
+      manifest = JSON.parse(manifestRaw) as ArtifactManifest;
+    } catch {
+      // Missing or invalid manifest — fail-closed. The verifier
+      // (verifyArtifactManifest) treats null as invalid → production blocked.
+      // Don't throw here — the attestation is still valid (the substrate ran).
+      // The manifest being null just blocks PRODUCTION_READY, not the whole
+      // execution.
+      manifest = null;
+    }
+
+    return { result, attestation, manifest };
   } finally {
     // 8. Always cleanup rootfs dir + temp dir + key fd.
     // No umount needed — bind-mounts lived in the launcher's mount namespace

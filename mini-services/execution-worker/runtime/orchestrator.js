@@ -1,5 +1,5 @@
 /*
- * Forge — Phase 18W-B: In-substrate runtime verification orchestrator.
+ * Forge — Phase 18W-B / 18Z-A: In-substrate runtime verification orchestrator.
  *
  * This is a SELF-CONTAINED Node.js script that runs INSIDE the substrate (the
  * launcher exec's it after chroot+seccomp). It uses ONLY Node.js built-in
@@ -25,6 +25,27 @@
  * FAIL-CLOSED: if install fails, skip build/start. If start fails, skip
  * health/journeys. Always write results.json and tear down the app.
  *
+ * PHASE 18Z-A — ARTIFACT CAPTURE:
+ * The orchestrator ALSO writes per-stage log files to /workspace/logs/.
+ * The launcher (forge-launcher.c) walks /workspace/logs/ after the
+ * orchestrator exits, hashes each file, and builds the ArtifactManifest.
+ * The manifest is then signed by the launcher (with the same Ed25519 key
+ * that signs the substrate attestation) and written to /workspace/manifest.json.
+ *
+ * Log files written (the launcher expects these to be present for the
+ * manifest to satisfy REQUIRED_ARTIFACT_TYPES):
+ *   /workspace/logs/source-materialization.txt   (git ls-tree HEAD output)
+ *   /workspace/logs/install.log                   (install stdout + stderr)
+ *   /workspace/logs/build.log                     (build stdout + stderr)
+ *   /workspace/logs/startup.log                   (app startup output)
+ *   /workspace/logs/health-trace-N.json           (per health check)
+ *   /workspace/logs/api-journey-N.json            (per API journey)
+ *   /workspace/logs/runtime-stdout.log            (app's full stdout)
+ *   /workspace/logs/runtime-stderr.log            (app's full stderr)
+ *   /workspace/logs/crash-output.log              (if the app crashed)
+ *   /workspace/logs/dependency-lockfile.json      (package-lock.json content, if present)
+ *   /workspace/logs/test-results.json             (test output, if any)
+ *
  * The launcher (forge-launcher.c) observes this script's stdout/stderr and
  * signs the substrate attestation with its Ed25519 key. The attestation binds
  * the workload (this script) to the substrate facts.
@@ -32,14 +53,16 @@
 
 'use strict';
 
-const { spawnSync, spawn } = require('child_process');
+const { spawnSync, spawn, execFileSync } = require('child_process');
 const net = require('net');
 const http = require('http');
 const fs = require('fs');
+const path = require('path');
 
 const PLAN_PATH = '/workspace/plan.json';
 const RESULTS_PATH = '/workspace/results.json';
 const REPO_DIR = '/workspace/repo';
+const LOGS_DIR = '/workspace/logs';
 const GRACE_MS = 5000;
 
 // ---------------------------------------------------------------------------
@@ -48,6 +71,64 @@ const GRACE_MS = 5000;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+/**
+ * Phase 18Z-A: write a log file to /workspace/logs/<name>. Best-effort —
+ * errors are swallowed (the orchestrator must not crash if logging fails).
+ * Creates the logs dir if it doesn't exist.
+ */
+function writeLogFile(name, content) {
+  try {
+    if (!fs.existsSync(LOGS_DIR)) {
+      fs.mkdirSync(LOGS_DIR, { recursive: true });
+    }
+    fs.writeFileSync(path.join(LOGS_DIR, name), content);
+  } catch (err) {
+    process.stderr.write('orchestrator: FAILED to write log file ' + name + ': ' + (err && err.message || err) + '\n');
+  }
+}
+
+/**
+ * Phase 18Z-A: write the source-materialization artifact. Records
+ * `git ls-tree HEAD` output (the file list at the checked-out SHA). The
+ * launcher hashes this file for the source-materialization manifest entry.
+ */
+function writeSourceMaterialization() {
+  try {
+    const out = spawnSync('git', ['-C', REPO_DIR, 'ls-tree', '-r', 'HEAD'], {
+      encoding: 'utf-8',
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 10000,
+    });
+    const tree = out.status === 0 ? (out.stdout || '') : ('git ls-tree failed: ' + (out.stderr || ''));
+    writeLogFile('source-materialization.txt', tree);
+  } catch (err) {
+    writeLogFile('source-materialization.txt', 'git ls-tree threw: ' + (err && err.message || err));
+  }
+}
+
+/**
+ * Phase 18Z-A: write the dependency-lockfile artifact. Reads the lockfile
+ * from the repo (if present) and writes it to logs/dependency-lockfile.json.
+ * Best-effort — if no lockfile is present, writes a small placeholder.
+ */
+function writeDependencyLockfile() {
+  const candidates = [
+    'package-lock.json', 'bun.lockb', 'bun.lock', 'yarn.lock',
+    'pnpm-lock.yaml', 'poetry.lock', 'Cargo.lock', 'go.sum',
+  ];
+  for (const c of candidates) {
+    try {
+      const p = path.join(REPO_DIR, c);
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p);
+        writeLogFile('dependency-lockfile.json', content);
+        return;
+      }
+    } catch { /* try next */ }
+  }
+  writeLogFile('dependency-lockfile.json', JSON.stringify({ note: 'no lockfile found in repo', candidates }));
 }
 
 function writeResults(results) {
@@ -352,12 +433,20 @@ async function main() {
     // implicit loopback.
   }
 
+  // Phase 18Z-A: write the source-materialization + dependency-lockfile
+  // artifacts FIRST (before install runs). These record the EXACT state of
+  // the repo that's about to be built. If install corrupts the repo (e.g.,
+  // postinstall scripts), the manifest still records the pre-install state.
+  writeSourceMaterialization();
+  writeDependencyLockfile();
+
   // Sanitized env for install/build (NO secrets — substrate env was already
   // sanitized by runInSubstrate; we just merge in the plan-supplied env).
   const sanitizedEnv = Object.assign({}, process.env, { HOME: '/workspace' });
 
   // 3. Install.
   const installResult = runSyncStage(plan.install, sanitizedEnv);
+  writeLogFile('install.log', '$ ' + (plan.install.binary + ' ' + (plan.install.args || []).join(' ')) + '\n' + (installResult.stdout || '') + '\n' + (installResult.stderr || '') + '\nexitCode=' + installResult.exitCode + '\n');
   if (!installResult.success) {
     const completedAt = nowIso();
     writeResults({
@@ -378,6 +467,7 @@ async function main() {
 
   // 4. Build.
   const buildResult = runSyncStage(plan.build, sanitizedEnv);
+  writeLogFile('build.log', '$ ' + (plan.build.binary + ' ' + (plan.build.args || []).join(' ')) + '\n' + (buildResult.stdout || '') + '\n' + (buildResult.stderr || '') + '\nexitCode=' + buildResult.exitCode + '\n');
   if (!buildResult.success) {
     const completedAt = nowIso();
     writeResults({
@@ -444,6 +534,10 @@ async function main() {
       output: (childInfo.stdout + '\n' + childInfo.stderr).slice(0, 50000),
       error: portResult.error,
     };
+    writeLogFile('startup.log', 'STARTUP FAILED: ' + portResult.error + '\n' + (childInfo.stdout || '') + '\n' + (childInfo.stderr || ''));
+    writeLogFile('runtime-stdout.log', childInfo.stdout || '');
+    writeLogFile('runtime-stderr.log', childInfo.stderr || '');
+    writeLogFile('crash-output.log', 'startup failed — app did not bind port ' + plan.port + ' within ' + (plan.startupTimeoutMs || 30000) + 'ms\n' + (childInfo.stderr || ''));
     writeResults({
       installResult,
       buildResult,
@@ -468,15 +562,33 @@ async function main() {
     exitCode: null,
     output: (childInfo.stdout + '\n' + childInfo.stderr).slice(0, 50000),
   };
+  writeLogFile('startup.log', 'STARTUP OK (port=' + plan.port + ', pid=' + (childInfo.child.pid || '?') + ', waited ' + portResult.durationMs + 'ms)\n' + (childInfo.stdout || '') + '\n' + (childInfo.stderr || ''));
 
   // 7. Run health checks.
   const healthChecks = await runHealthChecks(plan.port, plan.healthChecks || []);
+  healthChecks.forEach((hc, i) => {
+    writeLogFile('health-trace-' + i + '.json', JSON.stringify(hc, null, 2));
+  });
 
   // 8. Run API journeys.
   const apiJourneys = await runApiJourneys(plan.port, plan.apiJourneys || []);
+  apiJourneys.forEach((j, i) => {
+    writeLogFile('api-journey-' + i + '.json', JSON.stringify(j, null, 2));
+  });
 
   // 9. Stop the app.
   const teardownResult = await stopApp(childInfo);
+
+  // Phase 18Z-A: write the app's full stdout/stderr (captured by the
+  // orchestrator via spawn) as runtime-stdout.log + runtime-stderr.log.
+  // If the app crashed (non-zero exit + stderr), also write crash-output.log.
+  writeLogFile('runtime-stdout.log', childInfo.stdout || '');
+  writeLogFile('runtime-stderr.log', childInfo.stderr || '');
+  const appExitCode = childInfo.child.exitCode;
+  const appSignal = childInfo.child.signalCode;
+  if ((appExitCode !== null && appExitCode !== 0) || appSignal) {
+    writeLogFile('crash-output.log', 'APP CRASHED: exitCode=' + appExitCode + ' signal=' + (appSignal || '(none)') + '\n--- stderr ---\n' + (childInfo.stderr || '') + '\n');
+  }
 
   // 10. Determine pass/fail.
   const completedAt = nowIso();

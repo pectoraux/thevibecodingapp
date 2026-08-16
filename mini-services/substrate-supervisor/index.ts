@@ -128,7 +128,7 @@
 //     helper, or an env-var-based credential (GIT_ASKPASS) — see TODO in
 //     the clone section.
 
-import { readFileSync, unlinkSync, existsSync, mkdirSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
+import { readFileSync, unlinkSync, existsSync, mkdirSync, writeFileSync, copyFileSync, rmSync, readdirSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -142,6 +142,8 @@ import {
 } from "@/lib/execution-capability";
 import type { SandboxAttestation } from "@/lib/substrate-attestation";
 import type { CommandResult } from "@/lib/runtime-executor";
+import type { ArtifactManifest } from "@/lib/artifact-manifest";
+import { ArtifactStore } from "@/lib/artifact-store";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -156,6 +158,17 @@ const CONTROL_PLANE_URL = (process.env.FORGE_CONTROL_PLANE_URL ?? "http://localh
 // Per-execution workspaces live under this dir. Deterministic path
 // /tmp/forge-executions/<executionId>/ — auditable + isolated.
 const EXECUTIONS_ROOT = "/tmp/forge-executions";
+
+// Phase 18Z-A: Content-addressed artifact store root. The supervisor persists
+// every artifact the launcher recorded in the manifest (build logs, runtime
+// stdout/stderr, health traces, the signed attestation itself, ...) keyed by
+// SHA-256. Consumers retrieve artifacts by sha256 (the content-addressed key),
+// NOT by storageRef (which is just the logical path the launcher signed).
+const ARTIFACT_STORE_ROOT =
+  process.env.FORGE_ARTIFACT_STORE_ROOT ?? "/tmp/forge-artifacts";
+
+// Constructed once at startup (the dir is created in the constructor).
+const artifactStore = new ArtifactStore(ARTIFACT_STORE_ROOT);
 
 // The orchestrator.js script lives next to the supervisor's parent
 // project. We resolve it relative to the project root (process.cwd()).
@@ -230,6 +243,8 @@ interface ExecuteResponseBody {
   attestation: SandboxAttestation;
   result: CommandResult;
   results?: unknown;
+  /** Phase 18Z-A: the launcher-signed artifact manifest. */
+  manifest: ArtifactManifest | null;
 }
 
 interface ErrorResponseBody {
@@ -583,8 +598,12 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       // 10. Run the substrate. The nonce + executionId come from the
       //     capability (NOT from the request body) — they're bound into the
       //     launcher signature, so the worker CANNOT override them.
+      //
+      //     Phase 18Z-A: pass workerId (from the capability — the worker
+      //     identity is bound into the manifest) + repositorySha
+      //     (cap.repositoryHeadSha — the exact SHA the manifest covers).
       // =====================================================================
-      let substrateResult: { result: CommandResult; attestation: SandboxAttestation };
+      let substrateResult: { result: CommandResult; attestation: SandboxAttestation; manifest: ArtifactManifest | null };
       try {
         substrateResult = await runInSubstrate({
           binary: derived!.binary,
@@ -595,6 +614,9 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
           nonce: cap.nonce,
           executionId: cap.executionId,
           launcherKeyPem,
+          // Phase 18Z-A: bound into the artifact manifest.
+          workerId: (body as { workerId?: string }).workerId ?? "unknown",
+          repositorySha: cap.repositoryHeadSha,
         });
       } catch (err) {
         sendJson(res, 500, {
@@ -603,7 +625,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         return;
       }
 
-      const { result, attestation } = substrateResult;
+      const { result, attestation, manifest } = substrateResult;
 
       // =====================================================================
       // 11. Read results.json from the workspace (if the orchestrator wrote
@@ -620,14 +642,75 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       }
 
       // =====================================================================
-      // 12. Return the attestation + result + results. The launcher key is
-      //     NEVER in the response.
+      // 11.5 (Phase 18Z-A): Persist artifacts to the content-addressed store.
+      //
+      // The manifest's storageRef values point at LOGICAL paths within the
+      // workspace (e.g., "logs/install.log", "attestation.json"). The
+      // supervisor reads each artifact from <workspace>/<storageRef>, stores
+      // it in the ArtifactStore keyed by sha256 (the content-addressed key),
+      // and verifies the stored content's hash matches the manifest's
+      // declared sha256 (fail-closed on mismatch).
+      //
+      // The manifest's storageRef is NOT modified — it stays as the launcher
+      // signed it (mutating it would break the signature). Consumers retrieve
+      // artifacts by sha256 from the store, NOT by storageRef.
+      //
+      // Best-effort: if an artifact can't be read or its hash doesn't match,
+      // we emit a warning but don't fail the request (the manifest verifier
+      // on the control plane will catch the mismatch — fail-closed there).
+      // =====================================================================
+      if (manifest && Array.isArray(manifest.entries)) {
+        for (const entry of manifest.entries) {
+          // Defense-in-depth: reject path traversal in the storageRef before
+          // reading from the workspace. (verifyArtifactManifest also checks
+          // this, but we check here too so a malicious manifest can't read
+          // files outside the workspace.)
+          if (
+            !entry.path ||
+            entry.path.startsWith("/") ||
+            entry.path.includes("..") ||
+            entry.path.includes("\\")
+          ) {
+            console.warn(
+              `[substrate-supervisor] Path traversal in manifest entry ${entry.artifactId}: ${entry.path} — skipping persist`
+            );
+            continue;
+          }
+          const artifactPath = join(workspace, entry.path);
+          try {
+            if (!existsSync(artifactPath)) {
+              console.warn(
+                `[substrate-supervisor] Artifact ${entry.artifactId} (${entry.path}) not found in workspace — skipping persist`
+              );
+              continue;
+            }
+            const content = readFileSync(artifactPath);
+            // Store with declared sha256 — the store verifies the content
+            // hash matches (throws on mismatch → fail-closed).
+            try {
+              artifactStore.store(content, entry.sha256);
+            } catch (storeErr) {
+              console.warn(
+                `[substrate-supervisor] Artifact ${entry.artifactId} (${entry.path}) store failed: ${storeErr instanceof Error ? storeErr.message : String(storeErr)} — hash mismatch indicates tampering (fail-closed at verification)`
+              );
+            }
+          } catch (readErr) {
+            console.warn(
+              `[substrate-supervisor] Artifact ${entry.artifactId} (${entry.path}) read failed: ${readErr instanceof Error ? readErr.message : String(readErr)}`
+            );
+          }
+        }
+      }
+
+      // =====================================================================
+      // 12. Return the attestation + result + results + manifest. The
+      //     launcher key is NEVER in the response.
       // =====================================================================
       // NOTE: we KEEP the workspace for audit (under
       // /tmp/forge-executions/<executionId>/). Failed executions can be
       // inspected post-mortem. A separate GC process should clean up old
       // workspaces (out of scope for 18Z-PRE).
-      const responseBody: ExecuteResponseBody = { attestation, result, results };
+      const responseBody: ExecuteResponseBody = { attestation, result, results, manifest };
       sendJson(res, 200, responseBody);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

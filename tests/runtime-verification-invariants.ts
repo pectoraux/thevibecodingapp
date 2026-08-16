@@ -202,6 +202,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, architectureFrozen: false };
@@ -219,6 +220,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, runtimeVerificationPassed: false };
@@ -236,6 +238,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, staticReadinessPassed: false };
@@ -253,6 +256,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, runtimeEvidencePersisted: false };
@@ -270,6 +274,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, executionEnvironmentSandboxed: false };
@@ -287,6 +292,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, repositoryHeadVerified: false };
@@ -304,6 +310,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     staticReadinessPassed: false, runtimeVerificationPassed: false,
     runtimeEvidencePersisted: false, executionEnvironmentSandboxed: false,
     substrateAttestationVerified: false,
+    artifactManifestVerified: true,
     repositoryHeadVerified: false,
   };
   const reason = getProductionReadinessFailureReason(allFalse);
@@ -330,6 +337,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   const reason = getProductionReadinessFailureReason(allTrue);
@@ -1345,6 +1353,7 @@ const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/ro
     runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   record(
@@ -1363,6 +1372,7 @@ const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/ro
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: false, // UNSANDBOXED
     substrateAttestationVerified: false,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   record(
@@ -1381,6 +1391,7 @@ const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/ro
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: false, // SHA NOT VERIFIED
   };
   record(
@@ -1399,6 +1410,7 @@ const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/ro
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true,
     repositoryHeadVerified: true,
   };
   record(

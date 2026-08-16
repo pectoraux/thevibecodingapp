@@ -321,6 +321,17 @@ export interface ProductionReadinessEvidence {
    * evidence records).
    */
   substrateAttestationVerified: boolean;
+  /**
+   * Phase 18Z-A: True iff the artifact manifest was present AND passed
+   * `verifyArtifactManifest` (manifestHash matches content, launcher
+   * signature valid, required artifact types present, no path traversal,
+   * no duplicate ids, size limits respected, executionId bound).
+   *
+   * Fail-closed: null/missing manifest => false => PRODUCTION_READY blocked.
+   * Forge never trusts "build.log exists" — it trusts
+   * `sha256(build.log) === <signed manifest hash>`.
+   */
+  artifactManifestVerified: boolean;
   repositoryHeadVerified: boolean;
 }
 
@@ -349,6 +360,7 @@ export function canReachProductionReadyWithRuntime(
     evidence.runtimeEvidencePersisted &&
     evidence.executionEnvironmentSandboxed &&
     evidence.substrateAttestationVerified &&
+    evidence.artifactManifestVerified &&
     evidence.repositoryHeadVerified
   );
 }
@@ -370,6 +382,7 @@ export function getProductionReadinessFailureReason(
   if (!evidence.runtimeEvidencePersisted) reasons.push("runtimeEvidence=NOT_PERSISTED");
   if (!evidence.executionEnvironmentSandboxed) reasons.push("environment=UNSANDBOXED");
   if (!evidence.substrateAttestationVerified) reasons.push("substrateAttestation=NOT_VERIFIED (no verified isolation boundary — PRODUCTION_READY blocked, fail-closed)");
+  if (!evidence.artifactManifestVerified) reasons.push("artifactManifest=NOT_VERIFIED (no signed content-addressed manifest — PRODUCTION_READY blocked, fail-closed)");
   if (!evidence.repositoryHeadVerified) reasons.push("repositoryHead=UNVERIFIED");
 
   return reasons.length > 0 ? reasons.join(", ") : null;

@@ -936,6 +936,7 @@ let test1Capability: ExecutionCapability | null = null;
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
+    artifactManifestVerified: true, // Phase 18Z-A
     repositoryHeadVerified: true,
   };
   const withoutTrust: ProductionReadinessEvidence = {

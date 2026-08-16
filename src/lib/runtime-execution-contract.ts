@@ -32,6 +32,7 @@
 
 import { createHash } from "node:crypto";
 import type { SandboxAttestation } from "@/lib/substrate-attestation";
+import type { ArtifactManifest } from "@/lib/artifact-manifest";
 
 /**
  * Recursive canonical serialization for stable hashing/signing.
@@ -567,6 +568,22 @@ export interface ExecutionEvidenceEnvelope {
   // Fail-closed: no attestation = no production.
   substrateAttestation: SandboxAttestation | null;
 
+  /**
+   * Phase 18Z-A: Content-addressed artifact manifest. Binds ALL execution
+   * artifacts (install.log, build.log, runtime-stdout, runtime-stderr, health
+   * traces, the substrate attestation itself, ...) via SHA-256 content hashes.
+   *
+   * The manifest is signed by the LAUNCHER (inside the substrate, with the
+   * launcher key — the SAME key that signs the attestation). It is bound into
+   * the result hash AND the envelope hash, so the worker's Ed25519 signature
+   * covers it.
+   *
+   * Fail-closed: null manifest => artifactManifestVerified is false =>
+   * PRODUCTION_READY blocked. Forge never trusts "build.log exists" — it
+   * trusts `sha256(build.log) === <signed manifest hash>`.
+   */
+  artifactManifest: ArtifactManifest | null;
+
   // Derived hashes (computed from the above, included in envelope)
   resultHash: string;
   envelopeHash: string;
@@ -621,6 +638,7 @@ export function computeResultHash(result: Omit<ExecutionEvidenceEnvelope, "resul
   // Extract only the result fields (exclude metadata that goes into envelopeHash).
   const resultFields = {
     apiJourneys: result.apiJourneys,
+    artifactManifest: result.artifactManifest, // Phase 18Z-A
     backgroundJobChecks: result.backgroundJobChecks,
     browserJourneys: result.browserJourneys,
     buildResult: result.buildResult,
@@ -647,6 +665,7 @@ export function computeEnvelopeHash(
 ): string {
   const envelopeFields = {
     architectureHash: envelope.architectureHash,
+    artifactManifest: envelope.artifactManifest, // Phase 18Z-A
     completedAt: envelope.completedAt,
     dependencyInstallResult: envelope.dependencyInstallResult,
     environmentFingerprint: envelope.environmentFingerprint,
