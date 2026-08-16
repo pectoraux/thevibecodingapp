@@ -1751,3 +1751,45 @@ Stage Summary:
 - POLICY LAYER: server-authoritative SHA, no defaults, required/optional checks, no PRODUCTION_READY from runtime alone, evidence bound to canonical state.
 - TESTS: 283 passed, 0 failed from clean clone.
 - NEXT: Phase 18B can implement the actual isolated runtime executor (executeRuntimeVerification in poller.ts) — the pipeline that clones at exact SHA, installs, builds, starts, verifies, tears down.
+
+---
+Task ID: 18C
+Agent: orchestrator (main, Z.ai Code)
+Task: Phase 18C — Runtime execution contract + executor. The major engineering block: Forge can now actually run applications and produce trustworthy evidence.
+
+Work Log:
+- Synced local to remote (reset to eaacc17 after divergence).
+- Created src/lib/runtime-execution-contract.ts (execution contract):
+  * SandboxModel: per-execution workspace, destroyed after execution, no caches.
+  * RuntimeCommand: structured data (binary + args[], cwd, timeoutMs, env) — no strings.
+  * ProcessLifecycle: startupTimeoutMs, terminationGraceMs, killChildProcesses.
+  * ProcessEvidence: processStartedAt, processStoppedAt, exitCode, signal, forcedTermination, pid.
+  * NetworkPolicy: hermetic (default) vs integration, allowedHosts, recordOutbound.
+  * EnvironmentFingerprintFull: os, arch, nodeVersion, packageManager, containerImageHash, environmentVariablesHash (hash of NAMES, not values — never secrets).
+  * EvidenceEvent: continuous per-stage capture (workspace-create through workspace-destroy).
+  * RuntimeExecutionPolicy: the full contract binding plan + sandbox + commands + lifecycle + network + fingerprint.
+  * deriveRuntimeExecutionPolicy(): converts plan into structured policy.
+  * captureEnvironmentFingerprint(): captures environment without secrets.
+- Created src/lib/runtime-executor.ts (the actual executor):
+  * EvidenceCollector: continuous per-stage event recording.
+  * WorkspaceManager: create/destroy/verifyEmpty (always cleans up, even on failure).
+  * runCommand(): spawn with array args, timeout, stdout/stderr capture, exit code, signal.
+  * ProcessSupervisor: start/waitForReady(port)/terminate(graceMs) with SIGTERM→grace→SIGKILL and process group cleanup (detached).
+  * runHealthCheck(): HTTP fetch against started application.
+  * runApiJourney(): multi-step HTTP sequence with assertions.
+  * executeRuntimeVerification(): main pipeline orchestrator.
+- Pipeline: workspace create → repository checkout → dependency install → build → application start → wait for ready (port poll) → health checks → API journeys → application stop (SIGTERM→grace→SIGKILL) → workspace destroy (finally block) → return RuntimeVerificationResult.
+- Added tests/runtime-executor-invariants.ts (55 checks covering all contract types, executor classes, pipeline stages, isolation guarantees, command model, lifecycle, network policy, fingerprint, evidence capture).
+- CLEAN-CLONE VERIFICATION:
+  * Clean clone HEAD = 2a8a6ea (matches local + remote).
+  * Verified Phase 18C code: runtime-execution-contract.ts (YES), runtime-executor.ts (YES), executeRuntimeVerification (1), SandboxModel (6), NetworkPolicy (3), EvidenceCollector (4), ProcessSupervisor (3).
+  * Ran full test suite from clean clone: 358 passed, 0 failed.
+- Committed as 2a8a6ea. Pushed to origin main (eaacc17..2a8a6ea).
+- SHA: local == remote == clean clone == 2a8a6ea4a39a5e5e786077523cb175a455f4fbde.
+
+Stage Summary:
+- CANONICAL: GitHub main = 2a8a6ea, Local = 2a8a6ea, Clean clone = 2a8a6ea (ALL MATCH).
+- RUNTIME EXECUTOR: implemented — can clone, install, build, start, verify, tear down.
+- EXECUTION CONTRACT: sandbox isolation, commands as data, process lifecycle (SIGTERM→grace→SIGKILL), network policy (hermetic default), environment fingerprint (no secrets), continuous evidence capture.
+- TESTS: 358 passed, 0 failed from clean clone.
+- MILESTONE: Forge crosses the threshold from "can prove a system should work" to "can independently run a system and prove whether it works."
