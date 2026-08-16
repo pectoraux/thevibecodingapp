@@ -20,6 +20,7 @@ import {
   getWorkspacePaths,
   signEvidence,
   verifyEvidenceSignature,
+  generateWorkerKeyPair,
   createReplayabilityIdentity,
   isReplayCompatible,
   type SandboxModel,
@@ -667,51 +668,55 @@ const executorModule = readFile("src/lib/runtime-executor.ts");
   );
 }
 
-// Test 60: Evidence signing produces a signature.
+// Test 60: Evidence signing produces a signature (asymmetric Ed25519).
 {
+  const keyPair = generateWorkerKeyPair("worker-1");
   const result = {
     repositoryHeadSha: "abc123",
     passed: true,
     failureReason: null,
     environmentFingerprint: { environmentVariablesHash: "hash123" },
   };
-  const sig = signEvidence(result, "planHash", "archHash", "workerSecret", "worker-1", "exec-1");
+  const sig = signEvidence(result, "planHash", "archHash", keyPair.privateKeyPem, "worker-1", "exec-1");
   record(
-    "Phase 18D: signEvidence produces an EvidenceSignature",
-    sig.signature.length > 0 && sig.workerId === "worker-1" && sig.executionId === "exec-1",
-    `signature length: ${sig.signature.length}, workerId: ${sig.workerId}`
+    "Phase 18E: signEvidence produces an EvidenceSignature (Ed25519 asymmetric)",
+    sig.signature.length > 0 && sig.algorithm === "ed25519" && sig.workerId === "worker-1",
+    `signature length: ${sig.signature.length}, algorithm: ${sig.algorithm}`
   );
 }
 
-// Test 61: Evidence signature is verifiable.
+// Test 61: Evidence signature is verifiable with correct public key.
 {
+  const keyPair = generateWorkerKeyPair("worker-1");
   const result = {
     repositoryHeadSha: "abc123",
     passed: true,
     failureReason: null,
     environmentFingerprint: { environmentVariablesHash: "hash123" },
   };
-  const sig = signEvidence(result, "planHash", "archHash", "workerSecret", "worker-1", "exec-1");
-  const verified = verifyEvidenceSignature(result, "planHash", "archHash", sig, "workerSecret");
+  const sig = signEvidence(result, "planHash", "archHash", keyPair.privateKeyPem, "worker-1", "exec-1");
+  const verified = verifyEvidenceSignature(result, "planHash", "archHash", sig, keyPair.publicKeyPem);
   record(
-    "Phase 18D: verifyEvidenceSignature returns true for correct signature",
+    "Phase 18E: verifyEvidenceSignature returns true for correct public key",
     verified,
     `verified: ${verified}`
   );
 }
 
-// Test 62: Evidence signature fails with wrong secret.
+// Test 62: Evidence signature fails with wrong public key (different worker).
 {
+  const worker1Keys = generateWorkerKeyPair("worker-1");
+  const worker2Keys = generateWorkerKeyPair("worker-2");
   const result = {
     repositoryHeadSha: "abc123",
     passed: true,
     failureReason: null,
     environmentFingerprint: { environmentVariablesHash: "hash123" },
   };
-  const sig = signEvidence(result, "planHash", "archHash", "correctSecret", "worker-1", "exec-1");
-  const verified = verifyEvidenceSignature(result, "planHash", "archHash", sig, "wrongSecret");
+  const sig = signEvidence(result, "planHash", "archHash", worker1Keys.privateKeyPem, "worker-1", "exec-1");
+  const verified = verifyEvidenceSignature(result, "planHash", "archHash", sig, worker2Keys.publicKeyPem);
   record(
-    "Phase 18D: verifyEvidenceSignature returns false for wrong secret",
+    "Phase 18E: verifyEvidenceSignature returns false with different worker's public key",
     !verified,
     `verified: ${verified}`
   );
@@ -719,18 +724,18 @@ const executorModule = readFile("src/lib/runtime-executor.ts");
 
 // Test 63: Evidence signature fails with tampered result.
 {
+  const keyPair = generateWorkerKeyPair("worker-1");
   const originalResult = {
     repositoryHeadSha: "abc123",
     passed: true,
     failureReason: null,
     environmentFingerprint: { environmentVariablesHash: "hash123" },
   };
-  const sig = signEvidence(originalResult, "planHash", "archHash", "secret", "worker-1", "exec-1");
-  // Tamper with the result.
+  const sig = signEvidence(originalResult, "planHash", "archHash", keyPair.privateKeyPem, "worker-1", "exec-1");
   const tamperedResult = { ...originalResult, passed: false };
-  const verified = verifyEvidenceSignature(tamperedResult, "planHash", "archHash", sig, "secret");
+  const verified = verifyEvidenceSignature(tamperedResult, "planHash", "archHash", sig, keyPair.publicKeyPem);
   record(
-    "Phase 18D: verifyEvidenceSignature returns false for tampered result (passed: true→false)",
+    "Phase 18E: verifyEvidenceSignature returns false for tampered result (passed: true→false)",
     !verified,
     `verified: ${verified}`
   );

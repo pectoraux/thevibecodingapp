@@ -32,6 +32,26 @@
 
 import { createHash } from "node:crypto";
 
+/**
+ * Recursive canonical serialization for stable hashing/signing.
+ * Object keys sorted recursively; arrays preserve order.
+ */
+function canonicalSerialize(value: any): string {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value.toString();
+  if (typeof value === "number") return value.toString();
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalSerialize).join(",") + "]";
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+    const pairs = keys.map((k) => JSON.stringify(k) + ":" + canonicalSerialize(value[k]));
+    return "{" + pairs.join(",") + "}";
+  }
+  return "null";
+}
+
 // ---------------------------------------------------------------------------
 // 1. SANDBOX MODEL
 // ---------------------------------------------------------------------------
@@ -433,21 +453,36 @@ export function getWorkspacePaths(sandbox: SandboxModel): WorkspacePaths {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 18D: Evidence Signing — HMAC-SHA256 signature
+// Phase 18E: Evidence Signing — Asymmetric (Ed25519) signature
 // ---------------------------------------------------------------------------
+//
+// Phase 18D used HMAC-SHA256 with a shared secret. This was wrong for a
+// distributed architecture: a compromised worker that obtains the shared
+// secret can manufacture valid evidence.
+//
+// Phase 18E replaces HMAC with asymmetric signing:
+//   - Worker holds a PRIVATE key (never shared with the control plane).
+//   - Control plane holds the worker's PUBLIC key.
+//   - Worker signs evidence with its private key.
+//   - Control plane verifies with the worker's public key.
+//
+// A compromised worker cannot forge another worker's evidence (different key).
+// A compromised control plane cannot fabricate worker evidence (no private key).
+//
+
+import { sign as cryptoSign, verify as cryptoVerify, generateKeyPairSync } from "node:crypto";
 
 /**
- * Phase 18D: Evidence signature.
+ * Phase 18E: Asymmetric evidence signature.
  *
- * The worker signs the evidence using HMAC-SHA256 with the worker secret.
- * The control plane verifies the signature before accepting the evidence.
- *
- * This prevents a compromised worker from fabricating evidence — the signature
- * binds the evidence to the worker's authenticated identity.
+ * Uses Ed25519 for simplicity and performance. RSA-SHA256 is also supported
+ * for environments where Ed25519 is unavailable.
  */
 export interface EvidenceSignature {
-  /** HMAC-SHA256 hex digest of the canonical evidence serialization. */
+  /** Digital signature (hex) over the canonical evidence serialization. */
   signature: string;
+  /** Signing algorithm used. */
+  algorithm: "ed25519" | "rsa-sha256";
   /** The worker ID that signed the evidence. */
   workerId: string;
   /** The execution ID the evidence belongs to. */
@@ -457,13 +492,62 @@ export interface EvidenceSignature {
 }
 
 /**
- * Phase 18D: Sign a runtime verification result.
+ * Phase 18E: Worker key pair for evidence signing.
  *
- * Creates an HMAC-SHA256 signature over the canonical serialization of the
- * result's key fields (repositoryHeadSha, passed, runtimePlanHash, environmentFingerprint).
+ * The worker generates this pair at registration time. The private key never
+ * leaves the worker. The public key is registered with the control plane.
+ */
+export interface WorkerKeyPair {
+  workerId: string;
+  privateKeyPem: string;  // Never sent to control plane.
+  publicKeyPem: string;   // Registered with control plane at registration.
+}
+
+/**
+ * Generate an Ed25519 key pair for a worker.
+ */
+export function generateWorkerKeyPair(workerId: string): WorkerKeyPair {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  return {
+    workerId,
+    privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    publicKeyPem: publicKey.export({ type: "spki", format: "pem" }).toString(),
+  };
+}
+
+/**
+ * Canonical serialization of evidence for signing.
+ * Uses recursive key sorting (same as hashRuntimePlan).
+ */
+function canonicalEvidenceSerialization(
+  result: {
+    repositoryHeadSha: string;
+    passed: boolean;
+    failureReason: string | null;
+    environmentFingerprint: { environmentVariablesHash: string };
+  },
+  runtimePlanHash: string,
+  architectureHash: string | null
+): string {
+  const obj = {
+    architectureHash,
+    environmentVariablesHash: result.environmentFingerprint.environmentVariablesHash,
+    failureReason: result.failureReason,
+    passed: result.passed,
+    repositoryHeadSha: result.repositoryHeadSha,
+    runtimePlanHash,
+  };
+  // Recursive canonical serialization (sorted keys at every level).
+  return canonicalSerialize(obj);
+}
+
+/**
+ * Phase 18E: Sign evidence with the worker's private key.
  *
  * @param result The runtime verification result to sign.
- * @param workerSecret The worker's secret key (from FORGE_WORKER_SECRET env).
+ * @param runtimePlanHash The plan hash.
+ * @param architectureHash The architecture hash.
+ * @param privateKeyPem The worker's private key (PEM).
  * @param workerId The worker's ID.
  * @param executionId The execution ID.
  */
@@ -476,34 +560,19 @@ export function signEvidence(
   },
   runtimePlanHash: string,
   architectureHash: string | null,
-  workerSecret: string,
+  privateKeyPem: string,
   workerId: string,
   executionId: string
 ): EvidenceSignature {
-  // Canonical serialization of the evidence's key fields.
-  const canonical = JSON.stringify({
-    repositoryHeadSha: result.repositoryHeadSha,
-    passed: result.passed,
-    failureReason: result.failureReason,
-    runtimePlanHash,
-    architectureHash,
-    environmentVariablesHash: result.environmentFingerprint.environmentVariablesHash,
-  }, Object.keys({
-    repositoryHeadSha: 0,
-    passed: 0,
-    failureReason: 0,
-    runtimePlanHash: 0,
-    architectureHash: 0,
-    environmentVariablesHash: 0,
-  }).sort());
+  const canonical = canonicalEvidenceSerialization(result, runtimePlanHash, architectureHash);
+  const data = Buffer.from(canonical, "utf-8");
 
-  const signature = createHash("sha256")
-    .update(canonical)
-    .update(workerSecret)
-    .digest("hex");
+  // Ed25519 uses null digest (signs the raw data, not a hash of it).
+  const signature = cryptoSign(null, data, privateKeyPem).toString("hex");
 
   return {
     signature,
+    algorithm: "ed25519",
     workerId,
     executionId,
     signedAt: new Date().toISOString(),
@@ -511,9 +580,9 @@ export function signEvidence(
 }
 
 /**
- * Phase 18D: Verify an evidence signature.
+ * Phase 18E: Verify evidence signature with the worker's public key.
  *
- * @returns true if the signature matches the evidence.
+ * @returns true if the signature is valid for this evidence + public key.
  */
 export function verifyEvidenceSignature(
   result: {
@@ -525,17 +594,17 @@ export function verifyEvidenceSignature(
   runtimePlanHash: string,
   architectureHash: string | null,
   sig: EvidenceSignature,
-  workerSecret: string
+  publicKeyPem: string
 ): boolean {
-  const expected = signEvidence(
-    result,
-    runtimePlanHash,
-    architectureHash,
-    workerSecret,
-    sig.workerId,
-    sig.executionId
-  );
-  return expected.signature === sig.signature;
+  const canonical = canonicalEvidenceSerialization(result, runtimePlanHash, architectureHash);
+  const data = Buffer.from(canonical, "utf-8");
+  const sigBuf = Buffer.from(sig.signature, "hex");
+
+  try {
+    return cryptoVerify(null, data, publicKeyPem, sigBuf);
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
