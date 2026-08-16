@@ -228,20 +228,32 @@ async function register(): Promise<void> {
   // Phase 18L: Load or generate DURABLE Ed25519 keypair (survives restart).
   loadOrGenerateWorkerKeypair();
 
-  // Phase 18R: Sign enrollment or re-registration challenge with Ed25519 private key.
+  // Phase 18T: Sign enrollment or re-registration challenge with Ed25519 private key.
   // For FIRST registration: sign "FORGE_ENROLLMENT:{workerId}:{enrollmentSecret}"
-  // For RE-registration (restart): sign "FORGE_REREGISTER:{workerId}"
+  // For RE-registration (restart): fetch server-issued challenge, sign it.
   const enrollmentSecret = process.env.FORGE_WORKER_ENROLLMENT_SECRET;
   let enrollmentSignature: string | undefined;
+  let reregisterChallenge: string | undefined;
+  let reregisterNonce: string | undefined;
+
   if (workerPrivateKeyPem) {
     if (enrollmentSecret) {
       // First registration — sign enrollment challenge.
       const challenge = `FORGE_ENROLLMENT:${WORKER_ID}:${enrollmentSecret}`;
       enrollmentSignature = cryptoSign(null, Buffer.from(challenge, "utf-8"), workerPrivateKeyPem).toString("hex");
     } else {
-      // Re-registration (restart) — sign re-registration challenge.
-      const challenge = `FORGE_REREGISTER:${WORKER_ID}`;
-      enrollmentSignature = cryptoSign(null, Buffer.from(challenge, "utf-8"), workerPrivateKeyPem).toString("hex");
+      // Phase 18T: Re-registration (restart) — fetch server-issued challenge.
+      try {
+        const challengeRes = await apiCall("/api/worker/challenge", "POST", {}, createRegToken());
+        reregisterChallenge = challengeRes.challenge;
+        reregisterNonce = challengeRes.nonce;
+        enrollmentSignature = cryptoSign(null, Buffer.from(reregisterChallenge, "utf-8"), workerPrivateKeyPem).toString("hex");
+      } catch (err: any) {
+        console.error(`[worker] Failed to get re-registration challenge: ${err.message}`);
+        // If challenge endpoint fails, try first-registration path (may be initial setup).
+        const fallbackChallenge = `FORGE_ENROLLMENT:${WORKER_ID}:${""}`;
+        enrollmentSignature = cryptoSign(null, Buffer.from(fallbackChallenge, "utf-8"), workerPrivateKeyPem).toString("hex");
+      }
     }
   }
 
@@ -249,8 +261,10 @@ async function register(): Promise<void> {
     workerVersion: WORKER_VERSION, protocolVersion: PROTOCOL_VERSION,
     capabilities: ["node", "git", "test", "build"], maxConcurrency: 1,
     publicKeyPem: workerPublicKeyPem,
-    enrollmentSecret, // Undefined on re-registration (restart).
-    enrollmentSignature, // Ed25519 signature proving key possession.
+    enrollmentSecret,
+    enrollmentSignature,
+    reregisterChallenge,
+    reregisterNonce,
   }, createRegToken());
   sessionToken = result.sessionToken;
   console.log(`[worker] Registered (with Ed25519 public key + enrollment proof)`);

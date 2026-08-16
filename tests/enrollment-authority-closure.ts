@@ -75,8 +75,8 @@ const poller = readFile("mini-services/execution-worker/poller.ts");
 
 // Test 8: Worker signs FORGE_REREGISTER on restart.
 {
-  const signsReregister = poller.includes("FORGE_REREGISTER:");
-  record("Worker signs FORGE_REREGISTER on restart (no enrollment secret)", signsReregister, `signsReregister: ${signsReregister}`);
+  const signsReregister = poller.includes("/api/worker/challenge") || poller.includes("reregisterChallenge");
+  record("Worker fetches server challenge for re-registration (anti-replay)", signsReregister, `signsReregister: ${signsReregister}`);
 }
 
 // Test 9: Worker signs FORGE_ENROLLMENT on first registration.
