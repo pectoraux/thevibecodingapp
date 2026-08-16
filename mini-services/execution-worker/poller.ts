@@ -19,12 +19,29 @@ import { getVerificationCommands, runDeterministicGuardian, runLlmReviewer, runS
 // --- Configuration ---
 const CONTROL_PLANE_URL = process.env.FORGE_CONTROL_PLANE_URL || "http://localhost:3000";
 const WORKER_SECRET = process.env.FORGE_WORKER_SECRET;
-const WORKER_ID = process.env.FORGE_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
 const WORKER_VERSION = "phase16d";
 const PROTOCOL_VERSION = "v1";
 const POLL_INTERVAL_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 60000;
 const EXEC_ROOT = "/tmp/forge-exec";
+
+// Phase 18M: Worker identity must be STABLE across restarts.
+// In production (NODE_ENV=production), FORGE_WORKER_ID is REQUIRED.
+// No random fallback — a random ID means a new identity on every restart,
+// which breaks the Ed25519 trust model.
+const isProduction = process.env.NODE_ENV === "production";
+
+let WORKER_ID: string;
+if (process.env.FORGE_WORKER_ID) {
+  WORKER_ID = process.env.FORGE_WORKER_ID;
+} else if (isProduction) {
+  console.error("[worker] FATAL: FORGE_WORKER_ID is required in production. A random worker ID is not durable and breaks the Ed25519 trust model.");
+  process.exit(1);
+} else {
+  // Development only — random ID is acceptable for local dev/testing.
+  WORKER_ID = `worker-${randomUUID().slice(0, 8)}`;
+  console.warn(`[worker] WARNING: FORGE_WORKER_ID not set — using ephemeral ID '${WORKER_ID}'. This is NOT safe for production. Key persistence will not survive restart with a different ID.`);
+}
 
 if (!WORKER_SECRET) {
   console.error("[worker] FATAL: FORGE_WORKER_SECRET not set");
@@ -55,36 +72,68 @@ function createRegToken(): string {
   return `Bearer ${Buffer.from(JSON.stringify({ ...payload, signature: signToken(payload) })).toString("base64")}`;
 }
 
-// Phase 18L: Worker Ed25519 keypair for evidence signing — DURABLE across restarts.
+// Phase 18M: Worker Ed25519 keypair for evidence signing — DURABLE across restarts.
 // The key is persisted to disk so the worker identity survives process restarts.
 // Without this, every restart generates a new key, but the control plane treats
 // the key as immutable — the worker would be permanently locked out after restart.
+//
+// Phase 18M hardening:
+//   - Production requires FORGE_WORKER_KEY_DIR (not /tmp fallback).
+//   - Corrupted key file is FATAL (not silent regeneration).
+//   - Existing key file permissions are validated (must be 0o600).
 import { generateKeyPairSync } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 
 let workerPrivateKeyPem: string | null = null;
 let workerPublicKeyPem: string | null = null;
 
-// Deterministic key file path based on worker ID.
+// Phase 18M: In production, FORGE_WORKER_KEY_DIR is REQUIRED.
+// /tmp is not durable storage — it can be cleared on reboot/redeploy.
 const WORKER_KEY_DIR = process.env.FORGE_WORKER_KEY_DIR || "/tmp/forge-worker-keys";
+if (isProduction && !process.env.FORGE_WORKER_KEY_DIR) {
+  console.error("[worker] FATAL: FORGE_WORKER_KEY_DIR is required in production. /tmp is not durable storage for cryptographic identity.");
+  process.exit(1);
+}
+
+// Deterministic key file path based on worker ID.
 const WORKER_KEY_PATH = `${WORKER_KEY_DIR}/${WORKER_ID}.pem`;
 
 function loadOrGenerateWorkerKeypair(): void {
-  // Phase 18L: Try to load existing key from disk first.
+  // Phase 18M: Try to load existing key from disk first.
   if (existsSync(WORKER_KEY_PATH)) {
+    // Phase 18M: Validate file permissions before loading.
+    const stat = statSync(WORKER_KEY_PATH);
+    const mode = stat.mode & 0o777; // Mask to standard permission bits.
+    if (mode !== 0o600) {
+      console.error(`[worker] FATAL: Key file ${WORKER_KEY_PATH} has insecure permissions (${mode.toString(8)}). Expected 0o600 (owner read/write only).`);
+      console.error("[worker] Refusing to load insecure key file. Fix permissions or remove the file and use /api/worker/rotate-key to establish a new identity.");
+      process.exit(1);
+    }
+
     try {
       const keyData = JSON.parse(readFileSync(WORKER_KEY_PATH, "utf-8"));
+      if (!keyData.privateKeyPem || !keyData.publicKeyPem) {
+        throw new Error("Key file is missing required fields (privateKeyPem or publicKeyPem)");
+      }
       workerPrivateKeyPem = keyData.privateKeyPem;
       workerPublicKeyPem = keyData.publicKeyPem;
       console.log(`[worker] Loaded existing Ed25519 keypair from ${WORKER_KEY_PATH}`);
       return;
     } catch (err: any) {
-      console.warn(`[worker] Failed to load keypair from ${WORKER_KEY_PATH}: ${err.message} — generating new key`);
+      // Phase 18M: Corrupted key file is FATAL, not silent regeneration.
+      // Regenerating would create a new identity that the control plane
+      // doesn't recognize (it has the old key). The worker should fail
+      // and require manual intervention or key rotation.
+      console.error(`[worker] FATAL: Failed to load keypair from ${WORKER_KEY_PATH}: ${err.message}`);
+      console.error("[worker] Corrupted key file detected. This is an identity-integrity error.");
+      console.error("[worker] To recover: fix the key file, or use /api/worker/rotate-key to establish a new identity through the rotation protocol.");
+      console.error("[worker] Refusing to generate a new identity silently — this would break the trust anchor.");
+      process.exit(1);
     }
   }
 
-  // No existing key (or load failed) — generate a new one and persist it.
+  // No existing key — generate a new one and persist it.
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   workerPrivateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   workerPublicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
@@ -98,8 +147,13 @@ function loadOrGenerateWorkerKeypair(): void {
     }, null, 2), { mode: 0o600 }); // Owner read/write only.
     console.log(`[worker] Generated and persisted new Ed25519 keypair to ${WORKER_KEY_PATH}`);
   } catch (err: any) {
-    console.error(`[worker] WARNING: Failed to persist keypair to ${WORKER_KEY_PATH}: ${err.message}`);
-    console.error(`[worker] Key will be ephemeral — worker identity will NOT survive restart.`);
+    console.error(`[worker] FATAL: Failed to persist keypair to ${WORKER_KEY_PATH}: ${err.message}`);
+    console.error("[worker] Worker identity will NOT survive restart. Refusing to start with ephemeral identity.");
+    if (isProduction) {
+      process.exit(1);
+    } else {
+      console.warn("[worker] (development mode — continuing with ephemeral key)");
+    }
   }
 }
 
