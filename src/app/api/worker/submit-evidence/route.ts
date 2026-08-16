@@ -5,6 +5,7 @@ import { recordEvidence } from "@/lib/evidence";
 import { ensureBuildEvent } from "@/lib/events";
 import { BuildEventType, TaskStatus } from "@/lib/types";
 import { canCompleteTask, getFailureReason, type TaskEvidence as TaskEvidenceObj, type ProjectMode } from "@/lib/completion-policy";
+import { verify as cryptoVerify, createHash } from "node:crypto";
 
 // POST /api/worker/submit-evidence
 //
@@ -108,6 +109,59 @@ export async function POST(req: Request) {
     // Accept execution evidence from the body — but NOT identity values.
     const body = await req.json();
     const { commitSha, pushedToRemote, testResults, guardianResult, reviewResult, filesChanged, implementationLog } = body;
+
+    // Phase 18N: Verify Ed25519 task evidence signature.
+    // The worker signs the evidence hash with its registered private key.
+    // The control plane verifies with the worker's registered public key.
+    const evidenceSignature = body.evidenceSignature as string | undefined;
+    const evidenceHash = body.evidenceHash as string | undefined;
+
+    if (evidenceSignature && evidenceHash) {
+      // Resolve the worker's public key from WorkerRegistry.
+      const workerReg = await db.workerRegistry.findUnique({
+        where: { workerId: token.workerId },
+        select: { publicKeyPem: true },
+      });
+
+      if (!workerReg || !workerReg.publicKeyPem) {
+        return NextResponse.json({
+          error: "REJECTED: Worker has no registered Ed25519 public key. Cannot verify evidence signature.",
+        }, { status: 403 });
+      }
+
+      // Recompute the evidence hash from the evidence fields (not including the signature itself).
+      const evidenceFields = { commitSha, pushedToRemote, testResults, guardianResult, reviewResult, filesChanged, implementationLog };
+      const canonical = JSON.stringify(evidenceFields, Object.keys(evidenceFields).sort());
+      const expectedHash = createHash("sha256").update(canonical).digest("hex");
+
+      if (expectedHash !== evidenceHash) {
+        return NextResponse.json({
+          error: "REJECTED: Evidence hash mismatch. The signed hash does not match the submitted evidence.",
+        }, { status: 403 });
+      }
+
+      // Verify the Ed25519 signature.
+      const sigBuf = Buffer.from(evidenceSignature, "hex");
+      const hashBuf = Buffer.from(evidenceHash, "utf-8");
+      let sigValid = false;
+      try {
+        sigValid = cryptoVerify(null, hashBuf, workerReg.publicKeyPem, sigBuf);
+      } catch {
+        sigValid = false;
+      }
+
+      if (!sigValid) {
+        return NextResponse.json({
+          error: "REJECTED: Evidence signature verification FAILED. The evidence must be signed by the worker's Ed25519 private key.",
+        }, { status: 403 });
+      }
+    } else if (process.env.NODE_ENV === "production") {
+      // Phase 18N: In production, signed evidence is REQUIRED.
+      return NextResponse.json({
+        error: "REJECTED: Evidence signature required in production. The worker must sign evidence with its Ed25519 private key.",
+      }, { status: 403 });
+    }
+    // In development, unsigned evidence is still accepted for backward compatibility.
 
     // P15B: Remote verification uses DERIVED expected values, not worker-supplied.
     let remoteCommitVerified = false;

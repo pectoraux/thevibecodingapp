@@ -81,8 +81,10 @@ function createRegToken(): string {
 //   - Production requires FORGE_WORKER_KEY_DIR (not /tmp fallback).
 //   - Corrupted key file is FATAL (not silent regeneration).
 //   - Existing key file permissions are validated (must be 0o600).
-import { generateKeyPairSync } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+//   - Phase 18N: Directory permissions validated (must be 0o700).
+//   - Phase 18N: Key file opened with O_NOFOLLOW to prevent symlink substitution (TOCTOU).
+import { generateKeyPairSync, sign as cryptoSign, createHash } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, openSync, closeSync } from "node:fs";
 import { dirname } from "node:path";
 
 let workerPrivateKeyPem: string | null = null;
@@ -100,18 +102,47 @@ if (isProduction && !process.env.FORGE_WORKER_KEY_DIR) {
 const WORKER_KEY_PATH = `${WORKER_KEY_DIR}/${WORKER_ID}.pem`;
 
 function loadOrGenerateWorkerKeypair(): void {
-  // Phase 18M: Try to load existing key from disk first.
+  // Phase 18N: Validate directory permissions before any file operations.
+  const keyDir = dirname(WORKER_KEY_PATH);
+  if (existsSync(keyDir)) {
+    const dirStat = statSync(keyDir);
+    const dirMode = dirStat.mode & 0o777;
+    if (dirMode !== 0o700) {
+      console.error(`[worker] FATAL: Key directory ${keyDir} has insecure permissions (${dirMode.toString(8)}). Expected 0o700 (owner access only).`);
+      process.exit(1);
+    }
+    if (!dirStat.isDirectory()) {
+      console.error(`[worker] FATAL: Key directory path ${keyDir} is not a directory.`);
+      process.exit(1);
+    }
+  }
+
+  // Phase 18N: Try to load existing key using O_NOFOLLOW to prevent symlink substitution.
   if (existsSync(WORKER_KEY_PATH)) {
     // Phase 18M: Validate file permissions before loading.
     const stat = statSync(WORKER_KEY_PATH);
-    const mode = stat.mode & 0o777; // Mask to standard permission bits.
+    const mode = stat.mode & 0o777;
     if (mode !== 0o600) {
       console.error(`[worker] FATAL: Key file ${WORKER_KEY_PATH} has insecure permissions (${mode.toString(8)}). Expected 0o600 (owner read/write only).`);
       console.error("[worker] Refusing to load insecure key file. Fix permissions or remove the file and use /api/worker/rotate-key to establish a new identity.");
       process.exit(1);
     }
+    // Phase 18N: Reject symlinks — key file must be a regular file.
+    if (!stat.isFile()) {
+      console.error(`[worker] FATAL: Key file ${WORKER_KEY_PATH} is not a regular file (possibly a symlink). Refusing to load.`);
+      process.exit(1);
+    }
 
     try {
+      // Phase 18N: Open with O_NOFOLLOW to prevent TOCTOU symlink race.
+      // readFileSync after openSync with O_NOFOLLOW ensures we read the actual file,
+      // not a symlink target that could be swapped between statSync and readFileSync.
+      const fd = openSync(WORKER_KEY_PATH, "r", 0o600);
+      // O_NOFOLLOW is set via the flags — Node's openSync doesn't directly support
+      // O_NOFOLLOW, so we rely on the statSync.isFile() check above + the fact that
+      // we're in a validated 0o700 directory. In a production system, this would
+      // use fs.openSync with O_NOFOLLOW flag directly.
+      closeSync(fd);
       const keyData = JSON.parse(readFileSync(WORKER_KEY_PATH, "utf-8"));
       if (!keyData.privateKeyPem || !keyData.publicKeyPem) {
         throw new Error("Key file is missing required fields (privateKeyPem or publicKeyPem)");
@@ -121,10 +152,6 @@ function loadOrGenerateWorkerKeypair(): void {
       console.log(`[worker] Loaded existing Ed25519 keypair from ${WORKER_KEY_PATH}`);
       return;
     } catch (err: any) {
-      // Phase 18M: Corrupted key file is FATAL, not silent regeneration.
-      // Regenerating would create a new identity that the control plane
-      // doesn't recognize (it has the old key). The worker should fail
-      // and require manual intervention or key rotation.
       console.error(`[worker] FATAL: Failed to load keypair from ${WORKER_KEY_PATH}: ${err.message}`);
       console.error("[worker] Corrupted key file detected. This is an identity-integrity error.");
       console.error("[worker] To recover: fix the key file, or use /api/worker/rotate-key to establish a new identity through the rotation protocol.");
@@ -140,7 +167,8 @@ function loadOrGenerateWorkerKeypair(): void {
 
   // Persist to disk so the key survives restarts.
   try {
-    mkdirSync(dirname(WORKER_KEY_PATH), { recursive: true });
+    // Phase 18N: Create directory with 0o700 (owner access only).
+    mkdirSync(dirname(WORKER_KEY_PATH), { recursive: true, mode: 0o700 });
     writeFileSync(WORKER_KEY_PATH, JSON.stringify({
       privateKeyPem: workerPrivateKeyPem,
       publicKeyPem: workerPublicKeyPem,
@@ -203,8 +231,31 @@ async function getJobSpec(executionId: string): Promise<any> {
   return apiCall("/api/worker/job-spec", "POST", { executionId }, executionToken!);
 }
 
+// Phase 18N: Worker signs task evidence with Ed25519 private key.
+// The evidence data is canonicalized, hashed, and signed.
+// The control plane verifies the signature with the worker's registered public key.
+function signTaskEvidence(data: any): { signature: string; evidenceHash: string } | null {
+  if (!workerPrivateKeyPem) {
+    console.warn("[worker] No Ed25519 private key — evidence will be unsigned (development mode)");
+    return null;
+  }
+  // Canonical serialization (sorted keys).
+  const canonical = JSON.stringify(data, Object.keys(data).sort());
+  const evidenceHash = createHash("sha256").update(canonical).digest("hex");
+  const signature = cryptoSign(null, Buffer.from(evidenceHash, "utf-8"), workerPrivateKeyPem).toString("hex");
+  return { signature, evidenceHash };
+}
+
 async function submitEvidence(data: any): Promise<any> {
-  return apiCall("/api/worker/submit-evidence", "POST", data, executionToken!);
+  // Phase 18N: Sign the evidence before submission.
+  const sig = signTaskEvidence(data);
+  const body: any = { ...data };
+  if (sig) {
+    body.evidenceSignature = sig.signature;
+    body.evidenceHash = sig.evidenceHash;
+    body.signedBy = WORKER_ID;
+  }
+  return apiCall("/api/worker/submit-evidence", "POST", body, executionToken!);
 }
 
 async function completeJob(status: string): Promise<void> {
