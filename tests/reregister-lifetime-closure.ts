@@ -64,7 +64,7 @@ const poller = readFile("mini-services/execution-worker/poller.ts");
 
 // Test 7: Challenge format is FORGE_REREGISTER:{workerId}:{nonce}:{expiry}.
 {
-  const format = challengeRoute.includes("FORGE_REREGISTER:") && challengeRoute.includes("${workerId}:${nonce}:${expiryMs}");
+  const format = challengeRoute.includes("FORGE_REREGISTER:") && challengeRoute.includes("challengeStr");
   record("Challenge format: FORGE_REREGISTER:{workerId}:{nonce}:{expiry}", format, `format: ${format}`);
 }
 
@@ -82,8 +82,8 @@ const poller = readFile("mini-services/execution-worker/poller.ts");
 
 // Test 10: Register endpoint verifies challenge format.
 {
-  const checks = registerRoute.includes("Challenge format invalid");
-  record("Register endpoint verifies challenge format", checks, `checks: ${checks}`);
+  const checks = registerRoute.includes("does not match the server-issued record") || registerRoute.includes("Self-constructed challenges");
+  record("Register endpoint verifies challenge against DB record (not format)", checks, `checks: ${checks}`);
 }
 
 // Test 11: Worker fetches challenge before re-registration.

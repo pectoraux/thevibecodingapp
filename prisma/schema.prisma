@@ -668,6 +668,28 @@ model WorkerEnrollment {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 18U: Worker Re-registration Challenge — persisted, single-use.
+//
+// /api/worker/challenge creates a PENDING challenge record.
+// /api/worker/register atomically consumes it (PENDING → CONSUMED).
+// A challenge can authenticate exactly one re-registration, then is unusable.
+// ---------------------------------------------------------------------------
+
+model WorkerChallenge {
+  id          String   @id @default(cuid())
+  workerId    String
+  nonce       String   @unique
+  challenge   String   // Full: FORGE_REREGISTER:{workerId}:{nonce}:{expiryMs}
+  expiresAt   DateTime
+  status      String   @default("PENDING") // PENDING | CONSUMED | EXPIRED
+  consumedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([workerId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
 // Phase 7: ExecutionJob — individual task execution (separate from BuildJob)
 // ---------------------------------------------------------------------------
 

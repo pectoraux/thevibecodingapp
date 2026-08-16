@@ -5,18 +5,16 @@ import { randomUUID } from "node:crypto";
 
 // POST /api/worker/challenge
 //
-// Phase 18T: Server-issued one-time challenge for re-registration.
+// Phase 18U: Server-issued, PERSISTED, single-use challenge for re-registration.
 //
-// An ACTIVE worker that needs to re-register (after restart) must:
-//   1. Call this endpoint to get a server-issued challenge.
-//   2. Sign the challenge with its Ed25519 private key.
-//   3. Submit the signed challenge to /api/worker/register.
+// Creates a WorkerChallenge record in the database with:
+//   - unique nonce
+//   - full challenge string
+//   - 60-second expiry
+//   - status = PENDING
 //
-// The challenge includes a nonce and expiry, preventing replay.
-// The challenge is valid for 60 seconds.
-//
-// This endpoint accepts a REGISTRATION token (HMAC bootstrap) since the
-// worker doesn't have a session/execution token during re-registration.
+// The challenge is consumed atomically by /api/worker/register (PENDING → CONSUMED).
+// A challenge can authenticate exactly one re-registration.
 export async function POST(req: Request) {
   try {
     const token = getWorkerToken(req, "REGISTRATION");
@@ -34,7 +32,7 @@ export async function POST(req: Request) {
 
     if (!enrollment || enrollment.status !== "ACTIVE") {
       return NextResponse.json({
-        error: "REJECTED: Challenge endpoint requires ACTIVE enrollment. Use /api/worker/register for first registration.",
+        error: "REJECTED: Challenge endpoint requires ACTIVE enrollment.",
       }, { status: 403 });
     }
 
@@ -49,17 +47,29 @@ export async function POST(req: Request) {
       }, { status: 403 });
     }
 
-    // Generate server-issued challenge: FORGE_REREGISTER:{workerId}:{nonce}:{expiry}
+    // Generate server-issued challenge.
     const nonce = randomUUID();
     const expiryMs = Date.now() + 60000; // 60 seconds
-    const challenge = `FORGE_REREGISTER:${workerId}:${nonce}:${expiryMs}`;
+    const challengeStr = `FORGE_REREGISTER:${workerId}:${nonce}:${expiryMs}`;
+    const expiresAt = new Date(expiryMs);
+
+    // Phase 18U: PERSIST the challenge in the database.
+    // The register endpoint will look up this exact record by nonce.
+    await db.workerChallenge.create({
+      data: {
+        workerId,
+        nonce,
+        challenge: challengeStr,
+        expiresAt,
+        status: "PENDING",
+      },
+    });
 
     return NextResponse.json({
       ok: true,
-      challenge,
+      challenge: challengeStr,
       nonce,
-      expiresAt: new Date(expiryMs).toISOString(),
-      message: "Sign this challenge with your Ed25519 private key and submit it to /api/worker/register as enrollmentSignature. Include reregisterChallenge and reregisterNonce in the body.",
+      expiresAt: expiresAt.toISOString(),
     });
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 });

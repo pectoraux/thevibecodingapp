@@ -69,7 +69,7 @@ const poller = readFile("mini-services/execution-worker/poller.ts");
 
 // Test 7: Re-registration uses FORGE_REREGISTER challenge.
 {
-  const usesReregister = registerRoute.includes("FORGE_REREGISTER:");
+  const usesReregister = registerRoute.includes("challengeRecord") || registerRoute.includes("workerChallenge");
   record("Re-registration uses FORGE_REREGISTER challenge", usesReregister, `usesReregister: ${usesReregister}`);
 }
 

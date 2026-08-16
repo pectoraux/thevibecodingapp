@@ -102,45 +102,58 @@ export async function POST(req: Request) {
         }, { status: 403 });
       }
 
-      // Phase 18T: Server-issued one-time challenge (anti-replay).
-      // The worker must obtain a challenge from /api/worker/challenge first,
-      // then sign it. The challenge includes a nonce and expiry.
+      // Phase 18U: Server-issued, PERSISTED, single-use challenge (anti-replay).
+      // The worker must obtain a challenge from /api/worker/challenge, which
+      // creates a WorkerChallenge record in the DB. The register endpoint
+      // looks up that record by nonce, verifies exact match, and atomically
+      // consumes it (PENDING → CONSUMED).
       const challenge = body.reregisterChallenge as string | undefined;
       const challengeNonce = body.reregisterNonce as string | undefined;
 
       if (!challenge || !challengeNonce) {
         return NextResponse.json({
-          error: "REJECTED: Re-registration requires a server-issued challenge. POST /api/worker/challenge first, then include reregisterChallenge, reregisterNonce, and the signed challenge in enrollmentSignature.",
+          error: "REJECTED: Re-registration requires a server-issued challenge. POST /api/worker/challenge first.",
         }, { status: 403 });
       }
 
-      // Verify the challenge is well-formed: FORGE_REREGISTER:{workerId}:{nonce}:{expiry}
-      const expectedChallengePrefix = `FORGE_REREGISTER:${workerId}:${challengeNonce}:`;
-      if (!challenge.startsWith(expectedChallengePrefix)) {
+      // Phase 18U: Look up the challenge record from the database.
+      const challengeRecord = await db.workerChallenge.findUnique({
+        where: { nonce: challengeNonce },
+      });
+
+      if (!challengeRecord) {
         return NextResponse.json({
-          error: "REJECTED: Challenge format invalid. Expected FORGE_REREGISTER:{workerId}:{nonce}:{expiry}.",
+          error: "REJECTED: Challenge not found. The nonce does not match any server-issued challenge.",
         }, { status: 403 });
       }
 
-      // Extract and verify expiry from challenge.
-      const parts = challenge.split(":");
-      if (parts.length !== 4) {
-        return NextResponse.json({ error: "REJECTED: Malformed challenge." }, { status: 403 });
+      if (challengeRecord.workerId !== workerId) {
+        return NextResponse.json({
+          error: "REJECTED: Challenge was issued for a different workerId.",
+        }, { status: 403 });
       }
-      const expiryMs = parseInt(parts[3], 10);
-      if (isNaN(expiryMs) || Date.now() > expiryMs) {
+
+      if (challengeRecord.status !== "PENDING") {
+        return NextResponse.json({
+          error: `REJECTED: Challenge status is ${challengeRecord.status}, not PENDING. Challenge is single-use.`,
+        }, { status: 403 });
+      }
+
+      if (challengeRecord.expiresAt < new Date()) {
         return NextResponse.json({
           error: "REJECTED: Challenge has expired. Request a new challenge from /api/worker/challenge.",
         }, { status: 403 });
       }
 
-      // Atomically consume the nonce (prevents replay).
-      // We use a compare-and-set on the WorkerRegistry's lastHeartbeat field
-      // to detect if another registration is in progress.
-      // In a production system, this would use a dedicated challenge table
-      // with atomic consumption. For now, we verify the signature and
-      // update the worker status.
-      const challengeData = Buffer.from(challenge, "utf-8");
+      // Phase 18U: Verify the challenge string EXACTLY matches the stored record.
+      if (challenge !== challengeRecord.challenge) {
+        return NextResponse.json({
+          error: "REJECTED: Challenge string does not match the server-issued record. Self-constructed challenges are not accepted.",
+        }, { status: 403 });
+      }
+
+      // Verify the Ed25519 signature over the stored challenge.
+      const challengeData = Buffer.from(challengeRecord.challenge, "utf-8");
       const sigBuf = Buffer.from(enrollmentSignature, "hex");
 
       let sigValid = false;
@@ -152,8 +165,24 @@ export async function POST(req: Request) {
 
       if (!sigValid) {
         return NextResponse.json({
-          error: "REJECTED: Re-registration signature verification FAILED. Sign the server-issued challenge with your Ed25519 private key.",
+          error: "REJECTED: Re-registration signature verification FAILED.",
         }, { status: 403 });
+      }
+
+      // Phase 18U: ATOMIC compare-and-set PENDING → CONSUMED.
+      // Only one concurrent request can succeed; the other gets 0 affected rows.
+      const consumeResult = await db.workerChallenge.updateMany({
+        where: { nonce: challengeNonce, status: "PENDING" },
+        data: {
+          status: "CONSUMED",
+          consumedAt: new Date(),
+        },
+      });
+
+      if (consumeResult.count === 0) {
+        return NextResponse.json({
+          error: "REJECTED: Challenge was already consumed by another request. Challenge is single-use.",
+        }, { status: 409 });
       }
 
       // Update worker registry (re-registration after restart).
