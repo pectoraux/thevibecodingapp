@@ -5271,3 +5271,270 @@ warnings in any 18Z-A file.
 - Fail-closed: null/missing manifest → PRODUCTION_READY blocked.
 
 Stage Status: ✅ COMPLETE
+
+---
+
+## Phase 18Z-B: Adversarial E2E tests for artifact integrity (full suite + commit + push)
+
+**Task ID:** 18Z-B
+**Agent:** artifact-adversarial-commit
+**Repo HEAD before:** `ffe56be` (Phase 18Z-PRE) + uncommitted 18Z-A changes
+**Repo HEAD after:** `c79154f6944fec8164c5fe5f9694aeb2bcf1e9c1`
+**Status:** ✅ COMPLETE
+
+### Goal
+
+18Z-A delivered the artifact manifest core. The user's acceptance criteria
+for 18Z-B: write the DEFINITIVE adversarial E2E test suite that actually
+exercises the real manifest verification logic, covers all 10 user-
+specified attack vectors, runs the full existing test suite, fixes lint,
+commits + pushes, and verifies via clean clone.
+
+### File created
+
+1. **`tests/e2e-artifact-integrity-invariants.ts`** — 16-test acceptance
+   suite. The DEFINITIVE adversarial E2E test for artifact integrity.
+
+   - Reuses `tests/lib/test-supervisor.ts` + `tests/lib/test-capability.ts`.
+   - Generates a launcher keypair for tests 2-15.
+   - Uses `makeTestManifest` for constructing valid + tampered manifests.
+   - Sets `process.env.FORGE_ARTIFACT_STORE_ROOT` to a known temp dir BEFORE
+     `startTestSupervisor`. The test instantiates its own `ArtifactStore`
+     at the SAME path to retrieve artifacts the supervisor persisted.
+   - Tests 1 + 16 use the REAL supervisor + REAL substrate (no mocks).
+   - Each adversarial test actually exercises the REAL
+     `verifyArtifactManifest` / `ArtifactStore.store` / `computeEnvelopeHash`
+     / `canReachProductionReadyWithRuntime`. NO mocks for manifest
+     signing/verification.
+
+### The 16 tests
+
+| # | Test | Attack vector | Outcome |
+|---|------|---------------|---------|
+| 1 | FULL E2E: real execution produces a valid signed manifest | — (happy path) | manifest non-null, verifies, 7 required types present, all sha256 are 64 hex, envelope signature verifies |
+| 2 | artifact modified after execution → hash mismatch | tamper entry.sha256 | verifyArtifactManifest.valid=false, reason mentions "manifestHash does not match" |
+| 3 | artifact substituted (same name, different bytes) → reject | same artifactId+path, different sha256+size | manifestHash mismatch on tampered; ArtifactStore.store rejects content-hash mismatch even if re-signed |
+| 4 | manifest modified → reject | change repositorySha without re-signing | manifestHash mismatch |
+| 5 | missing required artifact type → reject | remove install-log entry | reason mentions "Missing required artifact types: install-log" |
+| 6 | duplicate artifactId → reject | duplicate first entry | reason mentions "Duplicate artifactId" |
+| 7 | path traversal in artifact path → reject | path = "../../etc/passwd" | reason mentions "path traversal" |
+| 8 | artifact exceeds size limit → reject | size = 60 MiB (> 50 MiB limit) | reason mentions "exceeds limit" |
+| 9 | signed manifest replayed to another run → reject | verify exec-A manifest as exec-B | reason mentions "executionId mismatch" |
+| 10 | tampered manifest signature → reject | replace launcherSignature with random hex | reason mentions "signature" or "INVALID" |
+| 11 | wrong launcher public key → reject | sign with key A, verify with key B | reason mentions "signature" or "INVALID" |
+| 12 | manifest bound into envelope hash | two envelopes differ ONLY in artifactManifest | envelopeHash differs (proving the manifest is cryptographically bound into the worker's signed envelope) |
+| 13 | ArtifactStore content-addressed retrieval | store "hello world", retrieve by sha256 | retrieved content matches; idempotent re-store returns same key |
+| 14 | ArtifactStore rejects content hash mismatch | store(content, declaredSha256=wrong) | throws "Content hash mismatch" |
+| 15 | production predicate requires artifactManifestVerified | artifactManifestVerified=false (others true) | canReach=false, reason mentions "artifact"/"manifest"; true+all others → canReach=true |
+| 16 | real substrate produces real artifacts (E2E) | — (extends Test 1) | manifest has all 7 required types, each entry's content hashes to declared sha256 in ArtifactStore, substrate-attestation artifact is self-referentially captured (canonicalFactsJson + launcherSignature + nonce + executionId + substrateInstanceId all match envelope.substrateAttestation) |
+
+### Test output (16/16 passed)
+
+```
+[PASS] Test 1: FULL E2E — real execution produces a valid signed manifest
+[PASS] Test 2: artifact modified after execution → hash mismatch
+[PASS] Test 3: artifact substituted (same name, different bytes) → reject
+[PASS] Test 4: manifest modified (repositorySha changed without re-signing) → reject
+[PASS] Test 5: missing required artifact type (install-log) → reject
+[PASS] Test 6: duplicate artifactId → reject
+[PASS] Test 7: path traversal in artifact path (../../etc/passwd) → reject
+[PASS] Test 8: artifact exceeds size limit (62914560 > 52428800) → reject
+[PASS] Test 9: signed manifest replayed to another run → reject
+[PASS] Test 10: tampered manifest signature (random hex) → reject
+[PASS] Test 11: wrong launcher public key → reject
+[PASS] Test 12: manifest is bound into envelope hash
+[PASS] Test 13: ArtifactStore content-addressed retrieval
+[PASS] Test 14: ArtifactStore rejects content hash mismatch
+[PASS] Test 15: production predicate requires artifactManifestVerified
+[PASS] Test 16: real substrate produces real artifacts (E2E)
+
+=== e2e-artifact-integrity-invariants: 16 passed, 0 failed ===
+```
+
+### Full test suite results (761 passed, 0 failed — non-integration)
+
+Up from 745 in 18Z-A (added 16 via the new e2e-artifact-integrity-invariants suite).
+
+All non-integration test suites pass:
+
+| Suite | Passed | Status |
+|-------|--------|--------|
+| architecture-invariants | 16/16 | ✅ |
+| artifact-manifest-invariants | 21/21 | ✅ |
+| asymmetric-authority-invariants | 15/15 | ✅ |
+| canonical-import-gate | 33/33 | ✅ |
+| challenge-persistence | 14/14 | ✅ |
+| control-plane-capability-invariants | 14/14 | ✅ |
+| durable-identity-invariants | 11/11 | ✅ |
+| **e2e-artifact-integrity-invariants (NEW)** | **16/16** | **✅** |
+| e2e-capability-closure-invariants | 16/16 | ✅ |
+| e2e-launcher-key-isolation-invariants | 15/15 | ✅ |
+| e2e-repo-boundary-invariants | 14/14 | ✅ |
+| e2e-substrate-trust-invariants | 12/12 | ✅ |
+| enrollment-authority-closure | 14/14 | ✅ |
+| evidence-context-binding | 14/14 | ✅ |
+| evidence-protocol-closure | 16/16 | ✅ |
+| lease-fencing-invariants | 16/16 | ✅ |
+| manifest-verification | 40/40 | ✅ |
+| phase-18y-smoke | 13/13 | ✅ |
+| phase10-invariants | 7/7 | ✅ |
+| protocol-convergence-invariants | 10/10 | ✅ |
+| readiness-source-invariants | 11/11 | ✅ |
+| repo-boundary-invariants | 10/10 | ✅ |
+| repository-scanner-invariants | 99/99 | ✅ |
+| repository-source-invariants | 10/10 | ✅ |
+| reregister-lifetime-closure | 13/13 | ✅ |
+| runtime-executor-invariants | 102/102 | ✅ |
+| runtime-verification-invariants | 87/87 | ✅ |
+| substrate-isolation-invariants | 14/14 | ✅ |
+| substrate-key-isolation-invariants | 15/15 | ✅ |
+| substrate-trust-invariants | 12/12 | ✅ |
+| token-scoping-invariants | 24/24 | ✅ |
+| trusted-enrollment-invariants | 18/18 | ✅ |
+| worker-identity-integration | 11/11 | ✅ |
+| worker-runtime-wiring-invariants | 8/8 | ✅ |
+| **TOTAL (non-integration)** | **761/761** | **✅** |
+
+(4 integration suites — hostile-security-test, regression-test,
+security-test, worker-security-test — have pre-existing failures requiring
+a live server + DB; identical to HEAD `ffe56be`. Not regressions.)
+
+### Lint
+
+`bun run lint` → 1 error + 12 warnings, ALL PRE-EXISTING (documented in
+18W-C, 18X-A, 18X-B, 18Y-A, 18Y-B, 18Z-PRE, 18Z-A worklogs). 0 NEW
+errors/warnings in any 18Z-B file.
+
+Pre-existing error: `src/lib/evidence.ts:303` — `require()` style import
+(Phase 17 — not in scope for 18Z-B).
+Pre-existing warnings: unused eslint-disable directives in
+`src/app/api/_lib.ts` (8), `src/lib/github.ts` (2), `src/lib/secret-store.ts`
+(1), `src/lib/worker.ts` (1).
+
+### Commit + push
+
+```
+git commit -m "Phase 18Z: artifact & evidence integrity — content-addressed manifest, launcher-signed, bound into evidence envelope
+..."
+git push origin main
+```
+
+Commit SHA: `c79154f6944fec8164c5fe5f9694aeb2bcf1e9c1`
+Short SHA: `c79154f`
+Pushed to: `origin/main` (https://github.com/pectoraux/thevibecodingapp.git)
+
+### Triple-SHA verification
+
+| Location | HEAD SHA |
+|----------|----------|
+| Local `main` | `c79154f6944fec8164c5fe5f9694aeb2bcf1e9c1` |
+| Remote `origin/main` | `c79154f6944fec8164c5fe5f9694aeb2bcf1e9c1` |
+| Clean clone (`/tmp/forge-clean-clone`) | `c79154f6944fec8164c5fe5f9694aeb2bcf1e9c1` |
+
+All three match — the commit was pushed correctly + the clean clone
+retrieves the exact same commit.
+
+### Clean-clone E2E test result
+
+```bash
+cd /tmp && rm -rf forge-clean-clone && git clone <remote> forge-clean-clone && cd forge-clean-clone
+bun install --silent
+bun run tests/e2e-artifact-integrity-invariants.ts
+```
+
+Result: **16 passed, 0 failed** — the clean clone's E2E test runs the REAL
+substrate + REAL supervisor + REAL launcher (C binary) + REAL manifest
+signing/verification, all from a fresh checkout. No hidden state, no
+pre-existing artifacts. The test is reproducible end-to-end.
+
+### Honest final assessment — does 18Z close the artifact integrity gap?
+
+**Yes — 18Z closes the artifact integrity gap end-to-end at the level
+Forge's threat model targets (software-only, no hardware attestation).**
+
+Forge now has a complete, content-addressed, launcher-signed, envelope-
+bound, control-plane-verified artifact layer. Every artifact (install.log,
+build.log, runtime-stdout, runtime-stderr, health traces, the substrate
+attestation itself, ...) is bound via SHA-256 content hashes into a
+canonical manifest signed by the launcher (inside the substrate, with the
+SAME Ed25519 key that signs the attestation). The manifest is bound into
+the worker's envelope signature. The control plane verifies the manifest
+signature + hash + structure + binding + size limits + path safety before
+allowing PRODUCTION_READY.
+
+The 16 adversarial tests in `tests/e2e-artifact-integrity-invariants.ts`
+prove every attack vector in the user's acceptance criteria is REJECTED
+(modified, substituted, manifest-tampered, missing-required, duplicate-id,
+path-traversal, oversized, replayed, tampered-sig, wrong-key), the
+ArtifactStore is content-addressed + rejects hash mismatches, the
+production predicate requires a verified manifest, and the real substrate
+produces real artifacts that can be retrieved by sha256 and verified to
+match the signed manifest.
+
+#### What 18Z CLOSES
+
+1. Content-addressed artifact binding (launcher signs manifestHash over
+   canonical JSON of all entries).
+2. Tamper detection (any entry change → manifestHash mismatch → reject).
+3. Substitution detection at the store layer (ArtifactStore.store rejects
+   content whose actual hash ≠ declared sha256, even if the manifest is
+   re-signed).
+4. Missing required artifacts fail-closed (7 required types enforced).
+5. Replay protection (executionId binding).
+6. Signature forgery protection (launcher key is the SAME key as the
+   attestation — worker cannot forge either).
+7. Path traversal rejection (manifest entries with `..` / leading `/` /
+   backslash are rejected by verifyArtifactManifest AND by the supervisor
+   before reading the artifact from the workspace — defense-in-depth).
+8. Size limit enforcement (per-artifact 50 MiB + total 500 MiB, enforced
+   by both verifyArtifactManifest and ArtifactStore).
+9. Self-referential attestation capture (the launcher writes
+   `/workspace/attestation.json` and includes it as a
+   `substrate-attestation` artifact; Test 16 verifies the artifact's
+   content matches `envelope.substrateAttestation`).
+10. Envelope binding (manifest is bound into `computeResultHash` +
+    `computeEnvelopeHash`; Test 12 proves two envelopes differing ONLY in
+    `artifactManifest` produce different `envelopeHash`).
+
+#### What 18Z does NOT close (residual risk)
+
+1. Root-compromised supervisor host. A root-compromised host can `gcore`
+   the supervisor + extract the launcher key, then forge BOTH the
+   attestation AND the manifest. Full closure requires hardware attestation
+   (TPM/SGX/SEV-SNP) — out of scope.
+2. No GC for the ArtifactStore. Artifacts accumulate forever. Out of scope.
+3. Storage location defaults to `/tmp`. Production should use a durable
+   volume.
+4. Manifest doesn't cover the repo tree directly. `source-materialization`
+   is `git ls-tree HEAD` output (file list), NOT the actual repo content.
+   The repo SHA (signed in the capability + verified by the supervisor) is
+   the authoritative source identity.
+5. C ↔ TypeScript canonical JSON agreement. Verified by the 18Z-A smoke
+   test; a future change to either side's serialization would break this.
+6. Orchestrator writes log files best-effort. A crashed orchestrator
+   produces a manifest missing required types → fail-closed (correct
+   behavior).
+7. Same residual as 18X/18Y/18Z-PRE: not a hardware-attested substrate.
+
+## Stage summary
+
+- 16-test adversarial E2E suite committed: `tests/e2e-artifact-integrity-invariants.ts`.
+- All non-integration test suites GREEN: 761 tests, 0 failures (up from 745
+  in 18Z-A — added 16 via the new e2e-artifact-integrity-invariants suite).
+- Lint unchanged: 1 pre-existing error + 12 pre-existing warnings, 0 NEW.
+- Clean clone verified: HEAD `c79154f6944fec8164c5fe5f9694aeb2bcf1e9c1`
+  matches local + remote + clean clone; E2E test passes from clean clone
+  (16/16).
+- Triple-SHA verification: local == origin/main == clean clone.
+- The C launcher produces valid manifests end-to-end (Test 1 + Test 16
+  exercise the REAL substrate + REAL launcher + REAL manifest).
+- The manifest is bound into the envelope hash (Test 12).
+- The control plane verifies the manifest with the SAME pinned launcher
+  public key used for the attestation (Test 11 proves a different key
+  cannot verify the manifest).
+- Fail-closed: null/missing manifest → `artifactManifestVerified = false`
+  → PRODUCTION_READY blocked (Test 15).
+- Real substrate produces real, content-addressed, self-referentially
+  captured artifacts (Test 16).
+
+Stage Status: ✅ COMPLETE
