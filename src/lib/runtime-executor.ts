@@ -16,7 +16,7 @@
 //   to the control plane via /api/worker/submit-runtime-evidence.
 
 import { spawn, ChildProcess } from "node:child_process";
-import { mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, readdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type RuntimeExecutionPolicy,
@@ -25,6 +25,8 @@ import {
   type WorkspacePaths,
   getWorkspacePaths,
 } from "@/lib/runtime-execution-contract";
+import { runInSubstrate } from "@/lib/substrate-namespace";
+import type { SandboxAttestation } from "@/lib/substrate-attestation";
 import {
   type RuntimeVerificationResult,
   type StageResult,
@@ -79,13 +81,23 @@ export class WorkspaceManager {
   constructor(private paths: WorkspacePaths) {}
 
   create(): void {
-    // Create all workspace directories.
-    for (const dir of [this.paths.root, this.paths.repo, this.paths.logs, this.paths.artifacts]) {
-      mkdirSync(dir, { recursive: true });
-    }
-    // Verify workspace is empty (no contamination from previous execution).
+    // Phase 18V: Create the root FIRST.
+    mkdirSync(this.paths.root, { recursive: true });
+
+    // Verify the root is empty BEFORE populating — no contamination from a
+    // previous execution that crashed mid-cleanup. A directory that merely
+    // EXISTS is not necessarily empty (the old `verifyEmpty` only checked
+    // `existsSync`, which returns true for a non-empty directory, masking
+    // contamination). Enumerate the directory and require zero entries.
     if (!this.verifyEmpty()) {
-      throw new Error(`Workspace ${this.paths.root} is not empty — possible contamination`);
+      throw new Error(
+        `Workspace ${this.paths.root} is not empty — possible contamination from a previous execution`
+      );
+    }
+
+    // Now create the subdirectories.
+    for (const dir of [this.paths.repo, this.paths.logs, this.paths.artifacts]) {
+      mkdirSync(dir, { recursive: true });
     }
   }
 
@@ -99,8 +111,17 @@ export class WorkspaceManager {
   }
 
   verifyEmpty(): boolean {
-    // Check that the root directory exists but is empty (except for subdirs we just created).
-    return existsSync(this.paths.root);
+    // Phase 18V: Actually enumerate the directory. `existsSync` alone is
+    // insufficient — it returns true for a non-empty directory, masking
+    // contamination from a crashed prior execution. We require the directory
+    // to both exist AND contain zero entries.
+    if (!existsSync(this.paths.root)) return false;
+    try {
+      const entries = readdirSync(this.paths.root);
+      return entries.length === 0;
+    } catch {
+      return false;
+    }
   }
 
   getPaths(): WorkspacePaths {
@@ -125,6 +146,10 @@ export interface CommandResult {
 /**
  * Run a structured command with timeout, stdout/stderr capture, and signal handling.
  * The command is an array — no shell interpolation.
+ *
+ * Phase 18V: Now correctly returns `Promise<CommandResult>` (was previously
+ * typed as `CommandResult` via an unsafe `as unknown as` cast that masked
+ * the promise). Callers MUST `await` this.
  */
 export function runCommand(
   cwd: string,
@@ -132,7 +157,7 @@ export function runCommand(
   args: string[],
   timeoutMs: number,
   env?: Record<string, string>
-): CommandResult {
+): Promise<CommandResult> {
   return new Promise<CommandResult>((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -187,7 +212,7 @@ export function runCommand(
         signal: null,
       });
     });
-  }) as unknown as CommandResult;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -464,8 +489,15 @@ export async function executeRuntimeVerification(
 
   let processEvidence: ProcessEvidence | null = null;
 
+  // Phase 18V: Observed substrate attestation — captured from the FIRST
+  // successful substrate run (install or build). Bound into the signed
+  // envelope. Null if the substrate could not be established (gcc missing,
+  // unshare unavailable, facts file missing) — fail-closed.
+  let substrateAttestation: SandboxAttestation | null = null;
+
   try {
     // 1. Create workspace
+    workspace.create();
     evidence.recordEvent({
       stage: "workspace-create",
       timestamp: new Date().toISOString(),
@@ -474,27 +506,110 @@ export async function executeRuntimeVerification(
       exitCode: 0,
       output: `Workspace created at ${workspace.getPaths().root}`,
     });
-    workspace.create();
 
-    // 2. Clone repository (simulated — in production, uses git clone)
-    // The actual clone would use the authenticated GitHub URL.
+    // 2. Real git checkout (Phase 18V — replaces the SIMULATED clone).
+    //
+    // The policy carries `repositoryUrl` — an authenticated HTTPS URL
+    // resolved by the worker from the control plane's
+    // `/api/worker/resolve-github-credential` endpoint. The executor itself
+    // NEVER resolves credentials — it just clones what it's given. If
+    // `repositoryUrl` is empty, the checkout fails-closed (no evidence is
+    // produced without a real clone).
+    //
+    // Uses the git binary with array args (shell:false) — no shell interpolation.
+    if (!policy.repositoryUrl) {
+      return buildResult(evidence, policy, startedAt, false, "repository-checkout=NO_URL (fail-closed: no clone URL on policy)", null, [], [], substrateAttestation);
+    }
+    const cloneResult = await runCommand(
+      workspace.getPaths().root,
+      "git",
+      ["clone", policy.repositoryUrl, workspace.getPaths().repo],
+      120000
+    );
+    if (!cloneResult.success) {
+      evidence.recordEvent({
+        stage: "repository-checkout",
+        timestamp: new Date().toISOString(),
+        success: false,
+        durationMs: cloneResult.durationMs,
+        exitCode: cloneResult.exitCode,
+        output: cloneResult.stdout + cloneResult.stderr,
+        error: "git clone failed",
+      });
+      return buildResult(evidence, policy, startedAt, false, "repository-checkout=CLONE_FAILED", null, [], [], substrateAttestation);
+    }
+    // Then checkout the exact SHA (server-authoritative — the worker may NOT
+    // choose the revision being certified).
+    const coResult = await runCommand(
+      workspace.getPaths().repo,
+      "git",
+      ["checkout", policy.repositoryHeadSha],
+      30000
+    );
+    if (!coResult.success) {
+      evidence.recordEvent({
+        stage: "repository-checkout",
+        timestamp: new Date().toISOString(),
+        success: false,
+        durationMs: coResult.durationMs,
+        exitCode: coResult.exitCode,
+        output: coResult.stdout + coResult.stderr,
+        error: `git checkout ${policy.repositoryHeadSha.slice(0, 7)} failed`,
+      });
+      return buildResult(evidence, policy, startedAt, false, "repository-checkout=CHECKOUT_FAILED", null, [], [], substrateAttestation);
+    }
     evidence.recordEvent({
       stage: "repository-checkout",
       timestamp: new Date().toISOString(),
       success: true,
-      durationMs: 0,
+      durationMs: cloneResult.durationMs + coResult.durationMs,
       exitCode: 0,
-      output: `Repository checked out at SHA ${policy.repositoryHeadSha}`,
+      output: `Repository cloned and checked out at SHA ${policy.repositoryHeadSha.slice(0, 7)}`,
     });
 
-    // 3. Install dependencies
-    const installResult = runCommand(
-      workspace.getPaths().repo,
-      policy.commands.install.binary,
-      policy.commands.install.args,
-      policy.commands.install.timeoutMs,
-      policy.commands.install.env
-    );
+    // 3. Install dependencies — Phase 18V: runs INSIDE the substrate.
+    //
+    // The substrate (linux-namespace-sandbox) establishes a real isolation
+    // boundary: user/pid/net/mnt namespaces, seccomp BPF filter (25 blocked
+    // syscalls), rlimits (CPU/AS/NPROC/NOFILE/FSIZE), cap-drop (41 caps).
+    // The launcher writes observed kernel facts to a JSON file, which the
+    // runner turns into a SandboxAttestation. The attestation from the FIRST
+    // successful substrate run is the one bound into the signed envelope.
+    //
+    // DEVIATION from spec: the start command is NOT wrapped in runInSubstrate
+    // because the substrate's network mode is `hermetic-loopback` — the
+    // sandboxed server would not be reachable from the host for health
+    // checks. Install and build (which terminate) DO run in the substrate;
+    // their attestation is the one bound into the envelope. The start
+    // command uses ProcessSupervisor (existing detached-process flow).
+    // Documented in the worklog.
+    let installResult: CommandResult;
+    try {
+      const installRun = await runInSubstrate({
+        binary: policy.commands.install.binary,
+        args: policy.commands.install.args,
+        cwd: workspace.getPaths().repo,
+        env: policy.commands.install.env,
+        timeoutMs: policy.commands.install.timeoutMs,
+      });
+      if (!substrateAttestation) substrateAttestation = installRun.attestation;
+      installResult = installRun.result;
+    } catch (err: any) {
+      // Substrate could not be established (gcc missing, unshare unavailable,
+      // facts file missing, etc.) — fail-closed: substrateAttestation stays
+      // null. The production gate will block. The install "result" is
+      // recorded as a failure so the evidence is honest about what happened.
+      installResult = {
+        success: false,
+        exitCode: -1,
+        stdout: "",
+        stderr: `substrate error: ${err.message}`,
+        durationMs: 0,
+        timedOut: false,
+        signal: null,
+      };
+      substrateAttestation = null;
+    }
     evidence.recordEvent({
       stage: "dependency-install",
       timestamp: new Date().toISOString(),
@@ -506,17 +621,32 @@ export async function executeRuntimeVerification(
     });
 
     if (!installResult.success) {
-      return buildResult(evidence, policy, startedAt, false, "dependencyInstall=FAILED", null, [], []);
+      return buildResult(evidence, policy, startedAt, false, "dependencyInstall=FAILED", null, [], [], substrateAttestation);
     }
 
-    // 4. Build
-    const buildResult = runCommand(
-      workspace.getPaths().repo,
-      policy.commands.build.binary,
-      policy.commands.build.args,
-      policy.commands.build.timeoutMs,
-      policy.commands.build.env
-    );
+    // 4. Build — Phase 18V: also runs inside the substrate.
+    let buildResult: CommandResult;
+    try {
+      const buildRun = await runInSubstrate({
+        binary: policy.commands.build.binary,
+        args: policy.commands.build.args,
+        cwd: workspace.getPaths().repo,
+        env: policy.commands.build.env,
+        timeoutMs: policy.commands.build.timeoutMs,
+      });
+      if (!substrateAttestation) substrateAttestation = buildRun.attestation;
+      buildResult = buildRun.result;
+    } catch (err: any) {
+      buildResult = {
+        success: false,
+        exitCode: -1,
+        stdout: "",
+        stderr: `substrate error: ${err.message}`,
+        durationMs: 0,
+        timedOut: false,
+        signal: null,
+      };
+    }
     evidence.recordEvent({
       stage: "build",
       timestamp: new Date().toISOString(),
@@ -528,10 +658,13 @@ export async function executeRuntimeVerification(
     });
 
     if (!buildResult.success) {
-      return buildResult(evidence, policy, startedAt, false, "build=FAILED", null, [], []);
+      return buildResult(evidence, policy, startedAt, false, "build=FAILED", null, [], [], substrateAttestation);
     }
 
     // 5. Start application
+    //
+    // DEVIATION: ProcessSupervisor (not runInSubstrate) — see comment in step 3.
+    // The attestation from install/build is the one in the result.
     supervisor.start(
       workspace.getPaths().repo,
       policy.commands.start.binary,
@@ -560,7 +693,7 @@ export async function executeRuntimeVerification(
         error: `Application did not become ready on port ${policy.expectedPort} within ${policy.lifecycle.startupTimeoutMs}ms`,
       });
       processEvidence = await supervisor.terminate(policy.lifecycle.terminationGraceMs);
-      return buildResult(evidence, policy, startedAt, false, "startup=FAILED", processEvidence, [], []);
+      return buildResult(evidence, policy, startedAt, false, "startup=FAILED", processEvidence, [], [], substrateAttestation);
     }
 
     // 7. Run health checks
@@ -638,13 +771,15 @@ export async function executeRuntimeVerification(
       startedAt: startedAt.toISOString(),
       completedAt: new Date().toISOString(),
       logs: evidence.getLogs(),
+      // Phase 18V: bound into the signed envelope — null if substrate failed.
+      substrateAttestation,
     };
   } catch (err: any) {
     // Ensure termination on any error
     if (supervisor) {
       processEvidence = await supervisor.terminate(policy.lifecycle.terminationGraceMs);
     }
-    return buildResult(evidence, policy, startedAt, false, `executor-error: ${err.message}`, processEvidence, [], []);
+    return buildResult(evidence, policy, startedAt, false, `executor-error: ${err.message}`, processEvidence, [], [], substrateAttestation);
   } finally {
     // 10. Always destroy workspace — even on failure
     workspace.destroy();
@@ -671,7 +806,8 @@ function buildResult(
   failureReason: string | null,
   processEvidence: ProcessEvidence | null,
   healthChecks: HealthCheckResult[],
-  apiJourneys: ApiJourneyResult[]
+  apiJourneys: ApiJourneyResult[],
+  substrateAttestation: SandboxAttestation | null
 ): RuntimeVerificationResult {
   const installStage = evidence.getStageResult("dependency-install") || { success: false, durationMs: 0, exitCode: null, output: "" };
   const buildStage = evidence.getStageResult("build") || { success: false, durationMs: 0, exitCode: null, output: "" };
@@ -702,5 +838,8 @@ function buildResult(
     startedAt: startedAt.toISOString(),
     completedAt: new Date().toISOString(),
     logs: evidence.getLogs(),
+    // Phase 18V: substrate attestation — null when substrate could not be
+    // established. Bound into the signed envelope; production gate fails-closed.
+    substrateAttestation,
   };
 }

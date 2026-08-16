@@ -64,3 +64,4 @@ worklog.md
 API_CONTRACT.md
 seed.ts
 .git-sha
+src/lib/substrate/forge-launcher

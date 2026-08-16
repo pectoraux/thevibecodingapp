@@ -24,6 +24,7 @@
 //     AND repositoryHeadVerified
 
 import { createHash } from "node:crypto";
+import type { SandboxAttestation } from "@/lib/substrate-attestation";
 
 // ---------------------------------------------------------------------------
 // Required vs Optional check policy
@@ -234,6 +235,14 @@ export interface RuntimeVerificationResult {
 
   // Truncated logs
   logs: string;
+
+  /**
+   * Phase 18V: Observed substrate attestation from the install/build substrate
+   * runs. Bound into the signed ExecutionEvidenceEnvelope. Null when the
+   * substrate could not be established (gcc missing, unshare unavailable, etc.)
+   * — the production gate fails-closed in that case.
+   */
+  substrateAttestation: SandboxAttestation | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +307,20 @@ export interface ProductionReadinessEvidence {
   runtimeEvidencePersisted: boolean;
 
   // Environment
+  /**
+   * Phase 18V: Now means "a verified substrate attestation was presented" —
+   * NOT a config label. The route sets this to
+   * `isSubstrateVerified(envelope.substrateAttestation)`. No attestation =>
+   * false => PRODUCTION_READY blocked (fail-closed).
+   */
   executionEnvironmentSandboxed: boolean;
+  /**
+   * Phase 18V: Explicit redundant flag — true iff the substrate attestation
+   * was present AND passed `verifySubstrateAttestation`. Same value as
+   * `executionEnvironmentSandboxed` (kept as an explicit field for clarity in
+   * evidence records).
+   */
+  substrateAttestationVerified: boolean;
   repositoryHeadVerified: boolean;
 }
 
@@ -308,6 +330,10 @@ export interface ProductionReadinessEvidence {
  * PRODUCTION_READY requires BOTH static AND runtime verification.
  * Static inspection (Phase 17) proves the code looks correct.
  * Runtime verification (Phase 18) proves the application works.
+ *
+ * Phase 18V: Also requires a VERIFIED substrate attestation — proof that the
+ * runtime execution ran inside a real isolation boundary (linux namespace +
+ * seccomp + rlimits + cap-drop). No attestation => fail-closed.
  *
  * Neither alone is sufficient.
  */
@@ -322,6 +348,7 @@ export function canReachProductionReadyWithRuntime(
     evidence.runtimeVerificationPassed &&
     evidence.runtimeEvidencePersisted &&
     evidence.executionEnvironmentSandboxed &&
+    evidence.substrateAttestationVerified &&
     evidence.repositoryHeadVerified
   );
 }
@@ -342,6 +369,7 @@ export function getProductionReadinessFailureReason(
   if (!evidence.runtimeVerificationPassed) reasons.push("runtimeVerification=FAILED");
   if (!evidence.runtimeEvidencePersisted) reasons.push("runtimeEvidence=NOT_PERSISTED");
   if (!evidence.executionEnvironmentSandboxed) reasons.push("environment=UNSANDBOXED");
+  if (!evidence.substrateAttestationVerified) reasons.push("substrateAttestation=NOT_VERIFIED (no verified isolation boundary — PRODUCTION_READY blocked, fail-closed)");
   if (!evidence.repositoryHeadVerified) reasons.push("repositoryHead=UNVERIFIED");
 
   return reasons.length > 0 ? reasons.join(", ") : null;

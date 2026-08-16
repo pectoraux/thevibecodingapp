@@ -806,6 +806,17 @@ model RuntimeEvidence {
 
   createdAt       DateTime @default(now())
 
+  // Phase 18V: Substrate attestation — observed isolation facts bound into
+  // the signed ExecutionEvidenceEnvelope. JSON: SandboxAttestation
+  // (observed namespace inodes, seccomp profile hash, rlimits, capabilities
+  // dropped, network mode, readonly rootfs). Null when the substrate could
+  // not be established (gcc missing, unshare unavailable, facts file missing)
+  // — the production gate fails-closed in that case.
+  substrateAttestation String?
+  // Whether verifySubstrateAttestation passed at submission time. False when
+  // the attestation is null OR invalid. PRODUCTION_READY requires true.
+  substrateVerified     Boolean @default(false)
+
   @@index([projectId])
   @@index([repositoryHeadSha])
   @@index([passed])

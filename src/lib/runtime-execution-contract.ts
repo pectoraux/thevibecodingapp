@@ -31,6 +31,7 @@
 //   RuntimeEvidenceSubmission
 
 import { createHash } from "node:crypto";
+import type { SandboxAttestation } from "@/lib/substrate-attestation";
 
 /**
  * Recursive canonical serialization for stable hashing/signing.
@@ -315,8 +316,21 @@ export type RuntimeStage =
 export interface RuntimeExecutionPolicy {
   /** The exact SHA to checkout and verify. */
   repositoryHeadSha: string;
-  /** The GitHub repo to clone. */
+  /** The GitHub repo slug (owner/name) for identity binding. */
   githubRepo: string;
+  /**
+   * Phase 18V: The fully-qualified repository URL used by `git clone`.
+   *
+   * In production this is an authenticated HTTPS URL
+   * (`https://x-access-token:<token>@github.com/<owner>/<repo>.git`)
+   * resolved by the worker from the control plane's
+   * `/api/worker/resolve-github-credential` endpoint. The worker passes the
+   * URL into `executeRuntimeVerification` so the executor itself never
+   * resolves credentials — it just clones what it's given.
+   *
+   * For local/dev runs this may be a filesystem path.
+   */
+  repositoryUrl: string;
 
   /** Sandbox isolation model. */
   sandbox: SandboxModel;
@@ -376,6 +390,14 @@ export function deriveRuntimeExecutionPolicy(
     containerImageHash?: string | null;
     runtimePlanHash: string;
     architectureHash: string | null;
+    /**
+     * Phase 18V: Fully-qualified URL for `git clone`. In production this is
+     * the authenticated `https://x-access-token:<token>@github.com/...` URL
+     * resolved by the worker. Required for real checkout (no simulated clone).
+     * If omitted, the policy's repositoryUrl is empty and the executor will
+     * fail the checkout step (fail-closed).
+     */
+    repositoryUrl?: string;
   }
 ): RuntimeExecutionPolicy {
   const sandbox = createSandboxModel(options.executionId, options.sandboxRoot);
@@ -418,6 +440,7 @@ export function deriveRuntimeExecutionPolicy(
   return {
     repositoryHeadSha: plan.repositoryHeadSha,
     githubRepo: plan.githubRepo,
+    repositoryUrl: options.repositoryUrl ?? "",
     sandbox,
     commands,
     lifecycle,
@@ -528,6 +551,13 @@ export interface ExecutionEvidenceEnvelope {
   // Phase 18G: Logs are INSIDE the signed envelope (not a separate unsigned field).
   logs: string;
 
+  // Phase 18V: Observed substrate attestation — proves the execution ran
+  // inside a real isolation boundary. Bound into the result hash AND the
+  // envelope hash (so it is Ed25519-authenticated). Null =>
+  // executionEnvironmentSandboxed is false => PRODUCTION_READY blocked.
+  // Fail-closed: no attestation = no production.
+  substrateAttestation: SandboxAttestation | null;
+
   // Derived hashes (computed from the above, included in envelope)
   resultHash: string;
   envelopeHash: string;
@@ -593,6 +623,7 @@ export function computeResultHash(result: Omit<ExecutionEvidenceEnvelope, "resul
     passed: result.passed,
     startedAt: result.startedAt,
     startupResult: result.startupResult,
+    substrateAttestation: result.substrateAttestation, // Phase 18V
     teardownResult: result.teardownResult,
   };
   return createHash("sha256").update(canonicalSerialize(resultFields)).digest("hex");
@@ -619,6 +650,7 @@ export function computeEnvelopeHash(
     resultHash: envelope.resultHash,
     runtimePlanHash: envelope.runtimePlanHash,
     startedAt: envelope.startedAt,
+    substrateAttestation: envelope.substrateAttestation, // Phase 18V
     workerId: envelope.workerId,
     // Include all stage results in the envelope hash too.
     apiJourneys: envelope.apiJourneys,

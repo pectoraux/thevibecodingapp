@@ -16,6 +16,10 @@ import {
   verifyEvidenceEnvelope,
   type ExecutionEvidenceEnvelope,
 } from "@/lib/runtime-execution-contract";
+import {
+  verifySubstrateAttestation,
+  isSubstrateVerified,
+} from "@/lib/substrate-attestation";
 
 // POST /api/worker/submit-runtime-evidence
 //
@@ -115,6 +119,48 @@ export async function POST(req: Request) {
         error: "REJECTED: Evidence envelope signature verification FAILED against the worker's registered public key.",
       }, { status: 403 });
     }
+
+    // Phase 18V: Verify the substrate attestation. This replaces the Phase 18F
+    // placeholder (hardcoded `executionEnvironmentSandboxed: false`). The
+    // attestation is OBSERVED substrate facts (kernel namespace inodes,
+    // seccomp BPF mode, rlimits, cap-drop), bound into the signed envelope
+    // (Phase 18V-A added `substrateAttestation` to the envelope hash, which
+    // is what Ed25519 signs). No attestation => fail-closed.
+    //
+    // The evidence is ACCEPTED even when the attestation is null/invalid —
+    // the worker still produced RUNTIME_VERIFIED evidence. But PRODUCTION_READY
+    // is BLOCKED (fail-closed) when the attestation is missing or invalid.
+    const substrateVerification = verifySubstrateAttestation(
+      envelope.substrateAttestation ?? null
+    );
+    // Sanity check: the detailed verifier and the boolean shortcut must agree.
+    // (Defense-in-depth: catches a future refactor that breaks one but not
+    // the other. The two functions share the same underlying logic, so they
+    // must return the same verdict.)
+    const substrateVerifiedShortcut = isSubstrateVerified(
+      envelope.substrateAttestation ?? null
+    );
+    if (substrateVerification.valid !== substrateVerifiedShortcut) {
+      // Should never happen — but if it does, fail-closed (treat as unverified).
+      await ensureBuildEvent({
+        projectId,
+        type: BuildEventType.HUMAN_REVIEW_REQUIRED,
+        level: "error",
+        message: `Substrate verifier disagreement — verifySubstrateAttestation.valid=${substrateVerification.valid} vs isSubstrateVerified=${substrateVerifiedShortcut}. FAIL-CLOSED: treating as unverified.`,
+        payload: JSON.stringify({
+          eventType: "SUBSTRATE_VERIFIER_DISAGREEMENT",
+          detailed: substrateVerification,
+          shortcut: substrateVerifiedShortcut,
+        }),
+      });
+    }
+    // Canonical verdict: fail-closed when the two verifiers disagree OR when
+    // the detailed verifier reports invalid. We use a separate const so the
+    // rest of the route can rely on a single source of truth.
+    const substrateVerified =
+      substrateVerification.valid &&
+      substrateVerifiedShortcut &&
+      substrateVerification.valid === substrateVerifiedShortcut;
 
     // Phase 18G: Verify envelope identity matches the token identity.
     if (envelope.executionId !== token.executionId || envelope.workerId !== token.workerId) {
@@ -282,6 +328,16 @@ export async function POST(req: Request) {
         idempotencyKey,
         startedAt: new Date(result.startedAt),
         completedAt: new Date(result.completedAt),
+        // Phase 18V: Substrate attestation — observed isolation facts bound
+        // into the signed envelope. Persisted as JSON so reviewers can inspect
+        // the exact namespace inodes, seccomp profile hash, rlimits, cap-drop.
+        // `substrateVerified` records whether the attestation passed
+        // `verifySubstrateAttestation` (cross-checked with `isSubstrateVerified`)
+        // at submission time. The production gate consults this.
+        substrateAttestation: envelope.substrateAttestation
+          ? JSON.stringify(envelope.substrateAttestation)
+          : null,
+        substrateVerified,
       },
     });
 
@@ -308,8 +364,36 @@ export async function POST(req: Request) {
         // Phase 18B: Explicit event type — RUNTIME_VERIFIED, NOT PRODUCTION_READY.
         eventType: runtimeEventPassed ? "RUNTIME_VERIFIED" : "RUNTIME_VERIFICATION_FAILED",
         productionReadyEligible: false,
+        // Phase 18V: Substrate attestation status in the event payload.
+        substrateVerified,
+        substrateAttestationPresent: envelope.substrateAttestation !== null,
+        substrateVerificationReasons: substrateVerification.reasons,
       }),
     });
+
+    // Phase 18V: If the runtime passed but the substrate attestation is
+    // missing or invalid, emit a build event warning that PRODUCTION_READY
+    // is blocked (fail-closed). The evidence is still accepted as
+    // RUNTIME_VERIFIED — but production deployment requires a verified
+    // isolation boundary.
+    if (runtimeEventPassed && !substrateVerified) {
+      const reasons = substrateVerification.reasons.join("; ");
+      await ensureBuildEvent({
+        projectId,
+        type: BuildEventType.HUMAN_REVIEW_REQUIRED,
+        level: "warn",
+        message: `RUNTIME_VERIFIED but NO verified substrate attestation — PRODUCTION_READY blocked (fail-closed). Reasons: ${reasons}`,
+        payload: JSON.stringify({
+          runtimeEvidenceId: evidence.id,
+          repositoryHeadSha: result.repositoryHeadSha,
+          eventType: "RUNTIME_VERIFIED_NO_SUBSTRATE",
+          substrateVerified: false,
+          substrateAttestationPresent: envelope.substrateAttestation !== null,
+          substrateVerificationReasons: substrateVerification.reasons,
+          productionReadyEligible: false,
+        }),
+      });
+    }
 
     // Phase 18A: Evaluate the COMPLETE canonical production predicate.
     // Only if ALL conditions pass do we emit PRODUCTION_READY.
@@ -333,12 +417,15 @@ export async function POST(req: Request) {
         staticReadinessPassed,
         runtimeVerificationPassed: evaluation.passed,
         runtimeEvidencePersisted: true, // just persisted
-        // Phase 18F: Do NOT trust FORGE_EXECUTION_MODE config label.
-        // The production predicate requires a VERIFIED execution substrate,
-        // not a configuration string. In filesystem-only mode, this is false.
-        // Container mode would provide substrate attestation (future phase).
-        // Config says "sandbox" ≠ system is sandboxed.
-        executionEnvironmentSandboxed: false, // FAIL-CLOSED: no verified substrate attestation exists yet.
+        // Phase 18V: Now derived from the VERIFIED substrate attestation —
+        // NOT a config label. `isSubstrateVerified` runs the full attestation
+        // check (namespace inodes differ from host, seccompMode=2, seccomp
+        // profile hash matches the required filter, all rlimits finite, all
+        // 41 caps dropped, networkMode=hermetic-loopback, readonlyRootfs=true).
+        // No attestation => false => PRODUCTION_READY blocked (fail-closed).
+        // Replaces the Phase 18F hardcoded-false placeholder.
+        executionEnvironmentSandboxed: substrateVerified,
+        substrateAttestationVerified: substrateVerified,
         repositoryHeadVerified: headVerified,
       };
 
@@ -391,6 +478,13 @@ export async function POST(req: Request) {
       productionReady,
       headVerified,
       expectedSha,
+      // Phase 18V: Surface the substrate attestation verification result so
+      // the worker (and reviewers) can see exactly why PRODUCTION_READY was
+      // blocked when it is. `substrateVerified` is the canonical
+      // `isSubstrateVerified(envelope.substrateAttestation)` result.
+      substrateVerified,
+      substrateAttestationPresent: envelope.substrateAttestation !== null,
+      substrateVerificationReasons: substrateVerification.reasons,
     });
   } catch (e: any) {
     return NextResponse.json({ error: e.message ?? "Failed to submit runtime evidence" }, { status: 500 });

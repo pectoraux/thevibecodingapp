@@ -890,11 +890,25 @@ const endpointCode18F = readFile("src/app/api/worker/submit-runtime-evidence/rou
   record("Phase 18F: endpoint verifies envelope identity matches token", endpointCode18F.includes("envelope.executionId !== token.executionId"), "");
 }
 
-// Test 82: Endpoint does NOT trust FORGE_EXECUTION_MODE.
+// Test 82: Endpoint does NOT trust FORGE_EXECUTION_MODE (Phase 18V: now derives sandboxed flag from verified substrate attestation).
 {
   const noConfigTrust = !endpointCode18F.includes('FORGE_EXECUTION_MODE === "sandbox"');
-  const failClosed = endpointCode18F.includes("executionEnvironmentSandboxed: false");
-  record("Phase 18F: endpoint does NOT trust config label (fail-closed: false)", noConfigTrust && failClosed, `noConfig: ${noConfigTrust}, failClosed: ${failClosed}`);
+  // Phase 18V: the route no longer hardcodes `executionEnvironmentSandboxed: false`.
+  // It now derives both `executionEnvironmentSandboxed` and
+  // `substrateAttestationVerified` from `substrateVerified` (the result of
+  // `verifySubstrateAttestation` + `isSubstrateVerified` cross-check). When
+  // the attestation is null/invalid, `substrateVerified` is false → both
+  // fields are false → PRODUCTION_READY blocked. Same fail-closed semantics,
+  // but now backed by a real attestation rather than a placeholder false.
+  const usesAttestation = endpointCode18F.includes("verifySubstrateAttestation") &&
+    endpointCode18F.includes("isSubstrateVerified") &&
+    endpointCode18F.includes("executionEnvironmentSandboxed: substrateVerified") &&
+    endpointCode18F.includes("substrateAttestationVerified: substrateVerified");
+  record(
+    "Phase 18V: endpoint derives sandboxed flag from verified substrate attestation (fail-closed when null/invalid)",
+    noConfigTrust && usesAttestation,
+    `noConfig: ${noConfigTrust}, usesAttestation: ${usesAttestation}`
+  );
 }
 
 // Test 83: Envelope signing + verification round-trip.
@@ -910,6 +924,8 @@ const endpointCode18F = readFile("src/app/api/worker/submit-runtime-evidence/rou
     healthChecks: [], apiJourneys: [], integrationChecks: [], backgroundJobChecks: [], browserJourneys: [],
     teardownResult: { success: true, durationMs: 1 },
     passed: true, failureReason: null, startedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
+    // Phase 18V: bound into the envelope hash. Null = no verified substrate.
+    substrateAttestation: null,
   };
   const resultHash = computeResultHash(data);
   const envelopeHash = computeEnvelopeHash({ ...data, resultHash });
@@ -931,6 +947,8 @@ const endpointCode18F = readFile("src/app/api/worker/submit-runtime-evidence/rou
     healthChecks: [], apiJourneys: [], integrationChecks: [], backgroundJobChecks: [], browserJourneys: [],
     teardownResult: { success: true, durationMs: 1 },
     passed: true, failureReason: null, startedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
+    // Phase 18V: bound into the envelope hash. Null = no verified substrate.
+    substrateAttestation: null,
   };
   const resultHash = computeResultHash(data);
   const envelopeHash = computeEnvelopeHash({ ...data, resultHash });
@@ -1056,6 +1074,8 @@ const endpointCode18G = readFile("src/app/api/worker/submit-runtime-evidence/rou
     healthChecks: [], apiJourneys: [], integrationChecks: [], backgroundJobChecks: [], browserJourneys: [],
     teardownResult: { success: true, durationMs: 1 },
     passed: true, failureReason: null, startedAt: "t", completedAt: "t", logs: "",
+    // Phase 18V: bound into the envelope hash. Null = no verified substrate.
+    substrateAttestation: null,
   };
   const rh = computeResultHash(data);
   const eh = computeEnvelopeHash({ ...data, resultHash: rh });

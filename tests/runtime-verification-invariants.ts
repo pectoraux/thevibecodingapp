@@ -201,6 +201,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, architectureFrozen: false };
@@ -217,6 +218,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, runtimeVerificationPassed: false };
@@ -233,6 +235,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, staticReadinessPassed: false };
@@ -249,6 +252,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, runtimeEvidencePersisted: false };
@@ -265,6 +269,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, executionEnvironmentSandboxed: false };
@@ -281,6 +286,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   const withFalse = { ...allTrue, repositoryHeadVerified: false };
@@ -297,6 +303,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     architectureFrozen: false, allTasksCompleted: false, allTasksIntegrated: false,
     staticReadinessPassed: false, runtimeVerificationPassed: false,
     runtimeEvidencePersisted: false, executionEnvironmentSandboxed: false,
+    substrateAttestationVerified: false,
     repositoryHeadVerified: false,
   };
   const reason = getProductionReadinessFailureReason(allFalse);
@@ -322,6 +329,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     architectureFrozen: true, allTasksCompleted: true, allTasksIntegrated: true,
     staticReadinessPassed: true, runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   const reason = getProductionReadinessFailureReason(allTrue);
@@ -356,6 +364,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     startedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
     logs: "",
+    substrateAttestation: null,
   };
   const evaluation = evaluateRuntimeVerificationResult(result, makeMinimalPlan());
   record(
@@ -385,6 +394,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     startedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
     logs: "",
+    substrateAttestation: null,
   };
   const evaluation = evaluateRuntimeVerificationResult(result, makeMinimalPlan());
   record(
@@ -414,6 +424,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     startedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
     logs: "",
+    substrateAttestation: null,
   };
   const evaluation = evaluateRuntimeVerificationResult(result, makeMinimalPlan());
   record(
@@ -447,6 +458,7 @@ const runtimeModule = readFile("src/lib/runtime-verification.ts");
     startedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
     logs: "",
+    substrateAttestation: null,
   };
   const evaluation = evaluateRuntimeVerificationResult(result, planWithHealth);
   record(
@@ -1092,6 +1104,7 @@ function makeMinimalResult(): RuntimeVerificationResult {
     startedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
     logs: "",
+    substrateAttestation: null,
   };
 }
 
@@ -1331,6 +1344,7 @@ const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/ro
     staticReadinessPassed: false, // STATIC FAILS
     runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true, executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   record(
@@ -1348,6 +1362,7 @@ const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/ro
     runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: false, // UNSANDBOXED
+    substrateAttestationVerified: false,
     repositoryHeadVerified: true,
   };
   record(
@@ -1365,6 +1380,7 @@ const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/ro
     runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: false, // SHA NOT VERIFIED
   };
   record(
@@ -1382,6 +1398,7 @@ const evidenceRoute18B = readFile("src/app/api/worker/submit-runtime-evidence/ro
     runtimeVerificationPassed: true,
     runtimeEvidencePersisted: true,
     executionEnvironmentSandboxed: true,
+    substrateAttestationVerified: true,
     repositoryHeadVerified: true,
   };
   record(

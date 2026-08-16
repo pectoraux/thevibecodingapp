@@ -346,6 +346,198 @@ async function triggerSchedulerTick(): Promise<void> {
   try { await apiCall("/api/scheduler/tick", "POST", {}, sessionToken!); } catch {}
 }
 
+// ---------------------------------------------------------------------------
+// Phase 18V: Runtime Evidence Envelope construction (INTEGRATION POINT)
+// ---------------------------------------------------------------------------
+//
+// The poller does NOT currently perform runtime verification via
+// `executeRuntimeVerification` — its existing flow is task execution (install
+// → lint → test → build → commit → push → guardian → reviewer → submit-evidence).
+// Runtime verification (clone at exact SHA → install → build → start → health
+// checks → API journeys → stop → submit-runtime-evidence) is a SEPARATE flow
+// that will be wired in a future phase.
+//
+// When that flow IS wired in, this is the integration point:
+//   1. The worker resolves a GitHub credential from the control plane
+//      (`/api/worker/resolve-github-credential`).
+//   2. The worker constructs a `RuntimeExecutionPolicy` (via
+//      `deriveRuntimeExecutionPolicy`) including the authenticated
+//      `repositoryUrl`.
+//   3. The worker calls `executeRuntimeVerification(policy, plan)` — which
+//      runs install + build INSIDE the substrate (linux-namespace-sandbox)
+//      and captures a `SandboxAttestation`.
+//   4. The worker constructs an `ExecutionEvidenceEnvelope` from the result,
+//      including `substrateAttestation` (the observed kernel facts from the
+//      substrate — bound into the Ed25519 signature).
+//   5. The worker signs the envelope with its Ed25519 private key and POSTs
+//      it to `/api/worker/submit-runtime-evidence`.
+//
+// SUBSTRATE INTEGRATION NOTE: the substrate runner lives in
+// `src/lib/substrate-namespace.ts` (a separate module that uses `@/lib/...`
+// path aliases). The worker is a standalone bun project that uses relative
+// imports. To import the substrate runner, EITHER:
+//   (a) Set up a `tsconfig.json` in `mini-services/execution-worker/` with
+//       `paths: { "@/*": ["../../src/*"] }` so `@/lib/substrate-namespace`
+//       resolves. OR
+//   (b) Copy the substrate runner + launcher into the worker (duplication,
+//       not recommended). OR
+//   (c) Publish the substrate runner as a shared package (production approach).
+// Option (a) is the simplest — Bun respects tsconfig `paths`.
+//
+// For now, this stub constructs an envelope with `substrateAttestation: null`
+// (so the contract field is present and the signature is consistent). When
+// runtime verification is wired in, replace `null` with the captured
+// `SandboxAttestation` from `executeRuntimeVerification`.
+
+// TODO(phase-18V-integration): wire executeRuntimeVerification into the
+// worker loop. The current poller only does task execution; runtime
+// verification (clone + install + build + start + health + API journeys +
+// stop + submit-runtime-evidence) is a future phase. When wired in, replace
+// `substrateAttestation: null` below with the real attestation.
+async function buildAndSubmitRuntimeEvidenceEnvelope(_params: {
+  executionId: string;
+  leaseId: string;
+  projectId: string;
+  repositoryHeadSha: string;
+  runtimeVerificationResult: any;
+}): Promise<any> {
+  if (!workerPrivateKeyPem) {
+    console.warn("[worker] Cannot sign runtime evidence envelope — no Ed25519 private key");
+    return null;
+  }
+
+  // Phase 18V: substrateAttestation is null for now — the poller has not yet
+  // wired in executeRuntimeVerification (which would run install/build inside
+  // the substrate and capture the attestation). The field MUST be present in
+  // the envelope so the signature is consistent with the contract. The
+  // control plane's production gate fails-closed on null (no PRODUCTION_READY).
+  const substrateAttestation = null;
+
+  // Build the envelope fields (matches ExecutionEvidenceEnvelope in
+  // src/lib/runtime-execution-contract.ts). The resultHash and envelopeHash
+  // are computed canonically — but we can't import the canonical serializer
+  // here without setting up path aliases. So we replicate the canonical
+  // serialization inline (sorted keys, recursive).
+  const envelopeFields = {
+    executionId: _params.executionId,
+    workerId: WORKER_ID,
+    leaseId: _params.leaseId,
+    repositoryHeadSha: _params.repositoryHeadSha,
+    architectureHash: _params.runtimeVerificationResult.architectureHash ?? null,
+    runtimePlanHash: _params.runtimeVerificationResult.runtimePlanHash ?? "",
+    environmentFingerprint: _params.runtimeVerificationResult.environmentFingerprint,
+    dependencyInstallResult: _params.runtimeVerificationResult.dependencyInstallResult,
+    buildResult: _params.runtimeVerificationResult.buildResult,
+    startupResult: _params.runtimeVerificationResult.startupResult,
+    healthChecks: _params.runtimeVerificationResult.healthChecks ?? [],
+    apiJourneys: _params.runtimeVerificationResult.apiJourneys ?? [],
+    integrationChecks: _params.runtimeVerificationResult.integrationChecks ?? [],
+    backgroundJobChecks: _params.runtimeVerificationResult.backgroundJobChecks ?? [],
+    browserJourneys: _params.runtimeVerificationResult.browserJourneys ?? [],
+    teardownResult: _params.runtimeVerificationResult.teardownResult,
+    passed: _params.runtimeVerificationResult.passed,
+    failureReason: _params.runtimeVerificationResult.failureReason,
+    startedAt: _params.runtimeVerificationResult.startedAt,
+    completedAt: _params.runtimeVerificationResult.completedAt,
+    logs: _params.runtimeVerificationResult.logs ?? "",
+    // Phase 18V: observed substrate attestation — null for now (poller has not
+    // wired in executeRuntimeVerification yet). Bound into the envelope hash
+    // so the signature is consistent with the contract.
+    substrateAttestation,
+  };
+
+  // Canonical serialization (sorted keys, recursive) — mirrors
+  // canonicalSerialize in src/lib/runtime-execution-contract.ts.
+  function canonicalSerialize(value: any): string {
+    if (value === null) return "null";
+    if (typeof value === "boolean") return value.toString();
+    if (typeof value === "number") return value.toString();
+    if (typeof value === "string") return JSON.stringify(value);
+    if (Array.isArray(value)) {
+      return "[" + value.map(canonicalSerialize).join(",") + "]";
+    }
+    if (typeof value === "object") {
+      const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+      const pairs = keys.map((k) => JSON.stringify(k) + ":" + canonicalSerialize(value[k]));
+      return "{" + pairs.join(",") + "}";
+    }
+    return "null";
+  }
+
+  // Compute resultHash (only the result fields) and envelopeHash (all fields
+  // except the signature). The order MUST match the control plane's
+  // computeResultHash / computeEnvelopeHash or signature verification fails.
+  const resultFields = {
+    apiJourneys: envelopeFields.apiJourneys,
+    backgroundJobChecks: envelopeFields.backgroundJobChecks,
+    browserJourneys: envelopeFields.browserJourneys,
+    buildResult: envelopeFields.buildResult,
+    completedAt: envelopeFields.completedAt,
+    dependencyInstallResult: envelopeFields.dependencyInstallResult,
+    failureReason: envelopeFields.failureReason,
+    healthChecks: envelopeFields.healthChecks,
+    integrationChecks: envelopeFields.integrationChecks,
+    passed: envelopeFields.passed,
+    startedAt: envelopeFields.startedAt,
+    startupResult: envelopeFields.startupResult,
+    substrateAttestation: envelopeFields.substrateAttestation,
+    teardownResult: envelopeFields.teardownResult,
+  };
+  const resultHash = createHash("sha256").update(canonicalSerialize(resultFields)).digest("hex");
+
+  const envelopeFieldsForHash = {
+    architectureHash: envelopeFields.architectureHash,
+    completedAt: envelopeFields.completedAt,
+    dependencyInstallResult: envelopeFields.dependencyInstallResult,
+    environmentFingerprint: envelopeFields.environmentFingerprint,
+    executionId: envelopeFields.executionId,
+    failureReason: envelopeFields.failureReason,
+    leaseId: envelopeFields.leaseId,
+    logs: envelopeFields.logs,
+    passed: envelopeFields.passed,
+    repositoryHeadSha: envelopeFields.repositoryHeadSha,
+    resultHash,
+    runtimePlanHash: envelopeFields.runtimePlanHash,
+    startedAt: envelopeFields.startedAt,
+    substrateAttestation: envelopeFields.substrateAttestation,
+    workerId: envelopeFields.workerId,
+    apiJourneys: envelopeFields.apiJourneys,
+    backgroundJobChecks: envelopeFields.backgroundJobChecks,
+    browserJourneys: envelopeFields.browserJourneys,
+    buildResult: envelopeFields.buildResult,
+    healthChecks: envelopeFields.healthChecks,
+    integrationChecks: envelopeFields.integrationChecks,
+    startupResult: envelopeFields.startupResult,
+    teardownResult: envelopeFields.teardownResult,
+  };
+  const envelopeHash = createHash("sha256").update(canonicalSerialize(envelopeFieldsForHash)).digest("hex");
+
+  // Sign the envelopeHash with the worker's Ed25519 private key.
+  const signature = cryptoSign(null, Buffer.from(envelopeHash, "utf-8"), workerPrivateKeyPem).toString("hex");
+
+  const envelope = {
+    ...envelopeFields,
+    resultHash,
+    envelopeHash,
+    signature: {
+      signature,
+      algorithm: "ed25519" as const,
+      workerId: WORKER_ID,
+      executionId: _params.executionId,
+      signedAt: new Date().toISOString(),
+    },
+  };
+
+  // Submit to the control plane. The control plane verifies the signature
+  // against the worker's registered public key, then verifies the substrate
+  // attestation (Phase 18V). With substrateAttestation=null, the evidence
+  // is accepted as RUNTIME_VERIFIED but PRODUCTION_READY is blocked.
+  return apiCall("/api/worker/submit-runtime-evidence", "POST", {
+    envelope,
+    attempt: 0,
+  }, executionToken!);
+}
+
 // --- Execute a command in the sandbox ---
 function runCommand(cwd: string, command: string, args: string[], timeoutMs: number): Promise<{
   exitCode: number | null; stdout: string; stderr: string; durationMs: number; timedOut: boolean; success: boolean;
