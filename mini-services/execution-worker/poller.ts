@@ -228,13 +228,24 @@ async function register(): Promise<void> {
   // Phase 18L: Load or generate DURABLE Ed25519 keypair (survives restart).
   loadOrGenerateWorkerKeypair();
 
+  // Phase 18Q: Sign enrollment challenge with Ed25519 private key.
+  // The enrollment secret is provided via FORGE_WORKER_ENROLLMENT_SECRET env.
+  const enrollmentSecret = process.env.FORGE_WORKER_ENROLLMENT_SECRET;
+  const enrollmentChallenge = `FORGE_ENROLLMENT:${WORKER_ID}:${enrollmentSecret || ""}`;
+  let enrollmentSignature: string | undefined;
+  if (enrollmentSecret && workerPrivateKeyPem) {
+    enrollmentSignature = cryptoSign(null, Buffer.from(enrollmentChallenge, "utf-8"), workerPrivateKeyPem).toString("hex");
+  }
+
   const result = await apiCall("/api/worker/register", "POST", {
     workerVersion: WORKER_VERSION, protocolVersion: PROTOCOL_VERSION,
     capabilities: ["node", "git", "test", "build"], maxConcurrency: 1,
     publicKeyPem: workerPublicKeyPem, // Phase 18L: Same key on every restart.
+    enrollmentSecret, // Phase 18Q: One-time enrollment secret.
+    enrollmentSignature, // Phase 18Q: Ed25519 signature proving key possession.
   }, createRegToken());
   sessionToken = result.sessionToken;
-  console.log(`[worker] Registered (with Ed25519 public key)`);
+  console.log(`[worker] Registered (with Ed25519 public key + enrollment proof)`);
 }
 
 async function claimJob(): Promise<{ job: any; executionToken: string } | null> {

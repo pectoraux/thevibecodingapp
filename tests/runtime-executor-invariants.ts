@@ -1092,9 +1092,9 @@ const rotateKeyCode18H = readFile("src/app/api/worker/rotate-key/route.ts");
 // Test 96: Register update block does NOT set publicKeyPem.
 {
   // The update block should have a comment saying publicKeyPem is never updated.
-  const hasImmutableComment = registerCode18H.includes("publicKeyPem is NEVER updated here");
+  const hasImmutableComment = registerCode18H.includes("Key rotation requires") || registerCode18H.includes("already has a registered signing key");
   record(
-    "Phase 18H: register update block does NOT set publicKeyPem (immutable after create)",
+    "Phase 18H: register has immutability guard (rejects key replacement)",
     hasImmutableComment,
     `hasImmutableComment: ${hasImmutableComment}`
   );

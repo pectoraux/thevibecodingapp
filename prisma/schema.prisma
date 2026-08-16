@@ -617,6 +617,53 @@ model WorkerRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 18Q: Worker Enrollment — pre-provisioned trusted worker identity.
+//
+// An admin creates a WorkerEnrollment BEFORE the worker starts.
+// The enrollment binds a workerId to an expected public key fingerprint
+// and a one-time enrollment secret.
+//
+// The worker proves possession of its Ed25519 private key by signing
+// a challenge. The control plane verifies the signature against the
+// expected public key fingerprint. Only then is the worker activated
+// in WorkerRegistry.
+//
+// This removes the ability of anyone with FORGE_WORKER_SECRET to
+// create arbitrary workerId → publicKey bindings.
+//
+// Lifecycle: PENDING → ACTIVE → (revoked by key rotation or admin)
+// ---------------------------------------------------------------------------
+
+model WorkerEnrollment {
+  id                        String   @id @default(cuid())
+  workerId                  String   @unique
+
+  // Expected Ed25519 public key fingerprint (SHA-256 of the PEM, first 32 hex chars).
+  // The worker must prove possession of the corresponding private key.
+  expectedPublicKeyFingerprint String
+
+  // One-time enrollment secret (bcrypt-hashed). Used by the worker to
+  // identify which enrollment it's claiming. Single-use.
+  enrollmentSecretHash      String
+
+  // Status: PENDING (created, not yet activated) | ACTIVE (worker proved key) | REVOKED
+  status                    String   @default("PENDING")
+
+  // Single-use tracking
+  activatedAt               DateTime?
+  revokedAt                 DateTime?
+  revokedReason             String?
+
+  // Admin who created the enrollment
+  createdBy                 String?
+
+  createdAt                 DateTime @default(now())
+
+  @@index([status])
+  @@index([workerId])
+}
+
+// ---------------------------------------------------------------------------
 // Phase 7: ExecutionJob — individual task execution (separate from BuildJob)
 // ---------------------------------------------------------------------------
 
