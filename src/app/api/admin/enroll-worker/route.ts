@@ -3,28 +3,25 @@ import { db } from "@/lib/db";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { requireUserId } from "@/lib/auth";
+import { requireUserId, isAdmin } from "@/lib/auth";
 
 // POST /api/admin/enroll-worker
 //
-// Phase 18Q: Pre-provision a trusted worker identity.
-//
-// An admin creates a WorkerEnrollment BEFORE the worker starts.
-// The enrollment binds:
-//   - workerId (chosen by admin, not by the worker)
-//   - expectedPublicKeyFingerprint (SHA-256 of the worker's Ed25519 public key PEM)
-//   - enrollmentSecret (one-time, bcrypt-hashed)
-//
-// The worker later proves possession of its Ed25519 private key by signing
-// a challenge. The control plane verifies the signature against the expected
-// fingerprint. Only then is the worker activated.
-//
-// This removes the ability of anyone with FORGE_WORKER_SECRET to create
-// arbitrary workerId → publicKey bindings.
+// Phase 18Q/18R: Pre-provision a trusted worker identity.
+// Phase 18R fixes:
+//   - ADMIN-ONLY (not any authenticated user)
+//   - Full SHA-256 fingerprint (not truncated to 128 bits)
+//   - Enrollment expiration (expiresAt)
 export async function POST(req: Request) {
   try {
     const userId = await requireUserId();
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+    // Phase 18R P0 #1: ADMIN-ONLY authorization.
+    const admin = await isAdmin();
+    if (!admin) {
+      return NextResponse.json({ error: "Forbidden: admin role required to enroll workers" }, { status: 403 });
+    }
 
     const body = await req.json();
     const { workerId, publicKeyPem } = body;
@@ -33,12 +30,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing required fields: workerId, publicKeyPem" }, { status: 400 });
     }
 
-    // Compute the fingerprint of the provided public key.
-    const fingerprint = createHash("sha256").update(publicKeyPem).digest("hex").slice(0, 32);
+    // Phase 18R P0 #3: Full SHA-256 fingerprint (64 hex chars = 256 bits, not truncated).
+    const fingerprint = createHash("sha256").update(publicKeyPem).digest("hex");
 
     // Generate a one-time enrollment secret.
     const enrollmentSecret = randomUUID();
     const enrollmentSecretHash = bcrypt.hashSync(enrollmentSecret, 10);
+
+    // Phase 18R: Enrollment expires in 24 hours.
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
     // Check if worker is already enrolled.
     const existing = await db.workerEnrollment.findUnique({
@@ -52,12 +52,13 @@ export async function POST(req: Request) {
         }, { status: 409 });
       }
       if (existing.status === "PENDING") {
-        // Update the pending enrollment with the new key fingerprint.
+        // Update the pending enrollment with the new key fingerprint + new expiration.
         await db.workerEnrollment.update({
           where: { workerId },
           data: {
             expectedPublicKeyFingerprint: fingerprint,
             enrollmentSecretHash,
+            expiresAt,
             createdBy: userId,
           },
         });
@@ -65,6 +66,7 @@ export async function POST(req: Request) {
           ok: true,
           workerId,
           enrollmentSecret,
+          expiresAt: expiresAt.toISOString(),
           message: "Pending enrollment updated. Worker can now activate by proving key possession.",
         });
       }
@@ -77,6 +79,7 @@ export async function POST(req: Request) {
         expectedPublicKeyFingerprint: fingerprint,
         enrollmentSecretHash,
         status: "PENDING",
+        expiresAt,
         createdBy: userId,
       },
     });
@@ -86,6 +89,7 @@ export async function POST(req: Request) {
       workerId,
       enrollmentSecret,
       publicKeyFingerprint: fingerprint,
+      expiresAt: expiresAt.toISOString(),
       message: "Worker enrollment created. The worker must prove possession of its Ed25519 private key to activate. Provide the enrollmentSecret to the worker via a secure out-of-band channel.",
     });
   } catch (e: any) {

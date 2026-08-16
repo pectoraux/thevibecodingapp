@@ -654,6 +654,10 @@ model WorkerEnrollment {
   revokedAt                 DateTime?
   revokedReason             String?
 
+  // Phase 18R: Enrollment expiration — a leaked enrollment secret should
+  // not remain usable indefinitely.
+  expiresAt                 DateTime
+
   // Admin who created the enrollment
   createdBy                 String?
 

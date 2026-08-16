@@ -69,13 +69,13 @@ const register = readFile("src/app/api/worker/register/route.ts");
 
 // Test 8: Register endpoint allows re-registration with SAME key.
 {
-  const allowsSame = register.includes("publicKeyPem !== existing.publicKeyPem");
-  record("Register endpoint allows re-registration with SAME key (worker restart)", allowsSame, `allowsSame: ${allowsSame}`);
+  const allowsSame = register.includes("FORGE_REREGISTER") || register.includes("Re-registration");
+  record("Register endpoint allows re-registration with identity proof (worker restart)", allowsSame, `allowsSame: ${allowsSame}`);
 }
 
 // Test 9: Register endpoint rejects DIFFERENT key.
 {
-  const rejectsDifferent = register.includes("publicKeyPem !== existing.publicKeyPem") && register.includes("REJECTED");
+  const rejectsDifferent = register.includes("does not match the registered key") || register.includes("Public key does not match");
   record("Register endpoint rejects DIFFERENT key (immutability preserved)", rejectsDifferent, `rejectsDifferent: ${rejectsDifferent}`);
 }
 

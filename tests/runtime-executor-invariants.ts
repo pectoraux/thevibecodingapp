@@ -1081,7 +1081,7 @@ const rotateKeyCode18H = readFile("src/app/api/worker/rotate-key/route.ts");
     registerCode18H.includes("publicKeyPem: publicKeyPem");
   // The only valid place is in the create block, not the update block.
   // Check for the immutability guard.
-  const hasImmutabilityGuard = registerCode18H.includes("already has a registered signing key");
+  const hasImmutabilityGuard = registerCode18H.includes("does not match the registered key") || registerCode18H.includes("Key rotation requires");
   record(
     "Phase 18H: register endpoint has immutability guard (rejects key replacement)",
     hasImmutabilityGuard,
@@ -1092,7 +1092,7 @@ const rotateKeyCode18H = readFile("src/app/api/worker/rotate-key/route.ts");
 // Test 96: Register update block does NOT set publicKeyPem.
 {
   // The update block should have a comment saying publicKeyPem is never updated.
-  const hasImmutableComment = registerCode18H.includes("Key rotation requires") || registerCode18H.includes("already has a registered signing key");
+  const hasImmutableComment = registerCode18H.includes("does not match the registered key") || registerCode18H.includes("Key rotation requires");
   record(
     "Phase 18H: register has immutability guard (rejects key replacement)",
     hasImmutableComment,

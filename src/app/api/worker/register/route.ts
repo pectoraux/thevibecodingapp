@@ -1,25 +1,23 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { getWorkerToken } from "@/lib/worker-auth";
-import { createHash, verify as cryptoVerify, sign as cryptoSign } from "node:crypto";
+import { createHash, verify as cryptoVerify } from "node:crypto";
 import bcrypt from "bcryptjs";
 
 // POST /api/worker/register
 //
-// Phase 18Q: Trusted Worker Enrollment.
+// Phase 18Q/18R: Trusted Worker Enrollment with Enrollment Authority Closure.
 //
-// The worker proves possession of its Ed25519 private key by signing
-// an enrollment challenge. The control plane verifies:
-//   1. A PENDING WorkerEnrollment exists for this workerId.
-//   2. The enrollment secret matches (one-time use).
-//   3. The provided public key matches the expected fingerprint.
-//   4. The Ed25519 signature over the challenge is valid.
+// Phase 18R fixes:
+//   P0 #2: Atomic single-use enrollment (compare-and-set PENDING→ACTIVE).
+//   P0 #3: Full SHA-256 fingerprint (not truncated).
+//   P0 #4: No existing-worker bypass — ALL registrations require identity proof.
+//   P0 #5: Enrollment expiration checked.
 //
-// Only then is the worker activated in WorkerRegistry.
-//
-// This removes the ability of anyone with FORGE_WORKER_SECRET to create
-// arbitrary workerId → publicKey bindings. The worker identity is
-// pre-provisioned by an admin, not self-claimed.
+// The worker ALWAYS proves possession of its Ed25519 private key, whether
+// it's a new registration or a re-registration after restart. The HMAC
+// registration token is a transport mechanism only — the Ed25519 signature
+// is the actual identity proof.
 export async function POST(req: Request) {
   try {
     const token = getWorkerToken(req, "REGISTRATION");
@@ -43,21 +41,79 @@ export async function POST(req: Request) {
     const enrollmentSecret = body.enrollmentSecret as string | undefined;
     const enrollmentSignature = body.enrollmentSignature as string | undefined;
 
-    // Phase 18Q: Check if worker is already registered with a key.
-    const existing = await db.workerRegistry.findUnique({
-      where: { workerId },
-      select: { publicKeyPem: true },
-    });
-
-    // Phase 18L: Allow re-registration with the SAME key (worker restart).
-    if (existing && existing.publicKeyPem && publicKeyPem && publicKeyPem !== existing.publicKeyPem) {
+    // Phase 18R P0 #4: ALL registrations require identity proof.
+    // No existing-worker bypass. The worker must ALWAYS prove possession of
+    // its Ed25519 private key, whether new or re-registering after restart.
+    if (!publicKeyPem || !enrollmentSecret || !enrollmentSignature) {
       return NextResponse.json({
-        error: "REJECTED: Worker already has a registered signing key. Key rotation requires /api/worker/rotate-key.",
+        error: "REJECTED: Registration requires publicKeyPem, enrollmentSecret, and enrollmentSignature. Obtain an enrollment from an admin via /api/admin/enroll-worker.",
       }, { status: 403 });
     }
 
-    // Phase 18Q: If worker already has the SAME key, allow re-registration (restart).
-    if (existing && existing.publicKeyPem && publicKeyPem === existing.publicKeyPem) {
+    // Phase 18R: Look up the enrollment (PENDING or ACTIVE).
+    const enrollment = await db.workerEnrollment.findUnique({
+      where: { workerId },
+    });
+
+    if (!enrollment) {
+      return NextResponse.json({
+        error: "REJECTED: No enrollment found for this workerId. An admin must pre-provision the worker via /api/admin/enroll-worker.",
+      }, { status: 403 });
+    }
+
+    // Phase 18R P0 #5: Check enrollment expiration.
+    if (enrollment.expiresAt && enrollment.expiresAt < new Date()) {
+      return NextResponse.json({
+        error: "REJECTED: Enrollment has expired. An admin must create a new enrollment via /api/admin/enroll-worker.",
+      }, { status: 403 });
+    }
+
+    // For ACTIVE enrollments (re-registration after restart), the worker
+    // must still prove possession of its private key. The enrollment secret
+    // has already been consumed, so the worker signs with its private key
+    // and the control plane verifies against the registered public key.
+    if (enrollment.status === "ACTIVE") {
+      // Phase 18R: Re-registration path — worker proves key possession
+      // by signing a challenge. The control plane verifies against the
+      // EXISTING registered public key (not the enrollment secret).
+      const existingWorker = await db.workerRegistry.findUnique({
+        where: { workerId },
+        select: { publicKeyPem: true },
+      });
+
+      if (!existingWorker || !existingWorker.publicKeyPem) {
+        return NextResponse.json({
+          error: "REJECTED: Enrollment is ACTIVE but no public key is registered. Contact an admin.",
+        }, { status: 403 });
+      }
+
+      // The worker must provide the SAME public key (durable identity).
+      if (publicKeyPem !== existingWorker.publicKeyPem) {
+        return NextResponse.json({
+          error: "REJECTED: Public key does not match the registered key. Use /api/worker/rotate-key for key rotation.",
+        }, { status: 403 });
+      }
+
+      // Verify the Ed25519 signature over the re-registration challenge.
+      // The challenge is: "FORGE_REREGISTER:{workerId}"
+      const challenge = `FORGE_REREGISTER:${workerId}`;
+      const challengeData = Buffer.from(challenge, "utf-8");
+      const sigBuf = Buffer.from(enrollmentSignature, "hex");
+
+      let sigValid = false;
+      try {
+        sigValid = cryptoVerify(null, challengeData, existingWorker.publicKeyPem, sigBuf);
+      } catch {
+        sigValid = false;
+      }
+
+      if (!sigValid) {
+        return NextResponse.json({
+          error: "REJECTED: Re-registration signature verification FAILED. Sign 'FORGE_REREGISTER:{workerId}' with your Ed25519 private key.",
+        }, { status: 403 });
+      }
+
+      // Update worker registry (re-registration after restart).
       const worker = await db.workerRegistry.update({
         where: { workerId },
         data: {
@@ -69,32 +125,16 @@ export async function POST(req: Request) {
           lastHeartbeat: new Date(),
         },
       });
+
       const { createWorkerSessionToken } = await import("@/lib/worker-auth");
       const sessionToken = createWorkerSessionToken(workerId, capabilities);
       return NextResponse.json({ ok: true, worker, sessionToken });
     }
 
-    // Phase 18Q: NEW registration — require enrollment proof.
-    if (!publicKeyPem || !enrollmentSecret || !enrollmentSignature) {
-      return NextResponse.json({
-        error: "REJECTED: New worker registration requires publicKeyPem, enrollmentSecret, and enrollmentSignature. Obtain an enrollment from an admin via /api/admin/enroll-worker.",
-      }, { status: 403 });
-    }
-
-    // Look up the pending enrollment.
-    const enrollment = await db.workerEnrollment.findUnique({
-      where: { workerId },
-    });
-
-    if (!enrollment) {
-      return NextResponse.json({
-        error: "REJECTED: No enrollment found for this workerId. An admin must pre-provision the worker via /api/admin/enroll-worker.",
-      }, { status: 403 });
-    }
-
+    // Phase 18R P0 #2: For PENDING enrollments, use atomic compare-and-set.
     if (enrollment.status !== "PENDING") {
       return NextResponse.json({
-        error: `REJECTED: Enrollment status is ${enrollment.status}, not PENDING. Enrollment is single-use.`,
+        error: `REJECTED: Enrollment status is ${enrollment.status}, not PENDING or ACTIVE.`,
       }, { status: 403 });
     }
 
@@ -106,8 +146,8 @@ export async function POST(req: Request) {
       }, { status: 403 });
     }
 
-    // Verify the public key matches the expected fingerprint.
-    const fingerprint = createHash("sha256").update(publicKeyPem).digest("hex").slice(0, 32);
+    // Phase 18R P0 #3: Full SHA-256 fingerprint (64 hex chars = 256 bits).
+    const fingerprint = createHash("sha256").update(publicKeyPem).digest("hex");
     if (fingerprint !== enrollment.expectedPublicKeyFingerprint) {
       return NextResponse.json({
         error: "REJECTED: Public key fingerprint does not match the expected fingerprint from enrollment.",
@@ -133,6 +173,23 @@ export async function POST(req: Request) {
       }, { status: 403 });
     }
 
+    // Phase 18R P0 #2: ATOMIC compare-and-set PENDING → ACTIVE.
+    // Only one concurrent request can succeed; the other gets 0 affected rows.
+    const casResult = await db.workerEnrollment.updateMany({
+      where: { workerId, status: "PENDING" },
+      data: {
+        status: "ACTIVE",
+        activatedAt: new Date(),
+      },
+    });
+
+    if (casResult.count === 0) {
+      // Another request already consumed this enrollment.
+      return NextResponse.json({
+        error: "REJECTED: Enrollment was already consumed by another request. Enrollment is single-use.",
+      }, { status: 409 });
+    }
+
     // All checks passed — activate the worker.
     const worker = await db.workerRegistry.upsert({
       where: { workerId },
@@ -153,16 +210,7 @@ export async function POST(req: Request) {
         maxConcurrency: body.maxConcurrency || 1,
         status: "READY",
         lastHeartbeat: new Date(),
-        publicKeyPem, // Set the key (this is a new registration from enrollment).
-      },
-    });
-
-    // Mark enrollment as ACTIVE (single-use).
-    await db.workerEnrollment.update({
-      where: { workerId },
-      data: {
-        status: "ACTIVE",
-        activatedAt: new Date(),
+        publicKeyPem,
       },
     });
 
