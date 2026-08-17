@@ -46,6 +46,7 @@ import {
   computeWorkloadHash,
   verifyExecutionCapability,
   type ExecutionCapability,
+  type ExecutionCapabilityInput,
 } from "@/lib/execution-capability";
 
 /** A single recorded call to the mock /api/supervisor/resolve-repo-credential endpoint. */
@@ -83,7 +84,7 @@ export interface TestSupervisor {
    */
   resolveRepoCredentialCalls: ResolveRepoCredentialCall[];
   /** Sign an ExecutionCapability using the control-plane private key. */
-  signCapability: (input: Omit<SignCapabilityInput, "workloadHash" | "runtimePlan"> & Partial<Pick<SignCapabilityInput, "workloadHash" | "runtimePlan">>) => ExecutionCapability;
+  signCapability: (input: Omit<SignCapabilityInput, "workloadHash" | "runtimePlan" | "workerId"> & Partial<Pick<SignCapabilityInput, "workloadHash" | "runtimePlan" | "workerId">>) => ExecutionCapability;
   /** Stop the supervisor (SIGTERM → 5s grace → SIGKILL) + stop the mock. */
   stop: () => Promise<void>;
 }
@@ -104,6 +105,13 @@ export interface SignCapabilityInput {
   executionId: string;
   nonce: string;
   leaseId: string;
+  /**
+   * Phase 18Z.1: the worker identity bound into the capability. Optional in
+   * the signCapability helper — defaults to "test-worker" if not provided.
+   * The supervisor reads this from the signed capability (NOT from the
+   * request body).
+   */
+  workerId?: string;
   repositoryHeadSha: string;
   repositoryUrl: string;
   runtimePlanHash: string;
@@ -258,8 +266,8 @@ export async function startTestSupervisor(opts?: {
 
   // 8. Return the handle.
   const signCapability = (
-    input: Omit<SignCapabilityInput, "workloadHash" | "runtimePlan"> &
-      Partial<Pick<SignCapabilityInput, "workloadHash" | "runtimePlan">>
+    input: Omit<SignCapabilityInput, "workloadHash" | "runtimePlan" | "workerId"> &
+      Partial<Pick<SignCapabilityInput, "workloadHash" | "runtimePlan" | "workerId">>
   ): ExecutionCapability => {
     // Phase 18Y: if runtimePlan / workloadHash are not provided, default to
     // an empty plan and derive the workloadHash from it. Most tests don't
@@ -269,10 +277,15 @@ export async function startTestSupervisor(opts?: {
     const workloadHash: string =
       input.workloadHash ??
       computeWorkloadHash(deriveWorkloadFromPlan(runtimePlan));
-    const fullInput: SignCapabilityInput = {
+    const fullInput: ExecutionCapabilityInput = {
       executionId: input.executionId,
       nonce: input.nonce,
       leaseId: input.leaseId,
+      // Phase 18Z.1: workerId is bound into the capability. Default to
+      // "test-worker" if the test doesn't care (most don't — they don't
+      // verify the manifest's workerId binding). Tests that DO care (e.g.,
+      // e2e-artifact-integrity-invariants Test 1) pass workerId explicitly.
+      workerId: input.workerId ?? "test-worker",
       repositoryHeadSha: input.repositoryHeadSha,
       repositoryUrl: input.repositoryUrl,
       runtimePlanHash: input.runtimePlanHash,

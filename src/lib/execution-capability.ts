@@ -111,6 +111,11 @@ export interface ExecutionCapability {
   executionId: string;
   nonce: string;
   leaseId: string;
+  /** Phase 18Z.1: The worker identity bound into the capability. The
+   *  supervisor reads this from the signed capability (NOT from the request
+   *  body) and binds it into the artifact manifest. A worker cannot forge a
+   *  different workerId without invalidating the control-plane signature. */
+  workerId: string;
   repositoryHeadSha: string;
   /** Phase 18Z-PRE: The repository URL the supervisor must clone. The supervisor
    *  derives this from the signed capability — the worker does NOT supply a
@@ -134,6 +139,8 @@ export interface ExecutionCapabilityInput {
   executionId: string;
   nonce: string;
   leaseId: string;
+  /** Phase 18Z.1: The worker identity bound into the capability (signed). */
+  workerId: string;
   repositoryHeadSha: string;
   /** Phase 18Z-PRE: The repository URL the supervisor must clone. */
   repositoryUrl: string;
@@ -323,6 +330,7 @@ export function verifyExecutionCapability(
     executionId: cap.executionId,
     nonce: cap.nonce,
     leaseId: cap.leaseId,
+    workerId: cap.workerId,
     repositoryHeadSha: cap.repositoryHeadSha,
     repositoryUrl: cap.repositoryUrl,
     runtimePlanHash: cap.runtimePlanHash,
@@ -403,6 +411,7 @@ function canonicalCapabilityJson(input: ExecutionCapabilityInput | ExecutionCapa
     repositoryUrl: input.repositoryUrl,
     runtimePlan: canonicalSerializeValue(input.runtimePlan),
     runtimePlanHash: input.runtimePlanHash,
+    workerId: input.workerId,
     workloadHash: input.workloadHash,
   };
   const keys = Object.keys(fields)

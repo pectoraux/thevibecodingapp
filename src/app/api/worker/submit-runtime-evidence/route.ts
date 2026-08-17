@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 import { db } from "@/lib/db";
 import { getWorkerToken } from "@/lib/worker-auth";
 import { ensureBuildEvent } from "@/lib/events";
@@ -27,6 +28,7 @@ import {
   verifyArtifactManifest,
   type ManifestVerificationResult,
 } from "@/lib/artifact-manifest";
+import { ArtifactStore } from "@/lib/artifact-store";
 
 // POST /api/worker/submit-runtime-evidence
 //
@@ -427,10 +429,66 @@ export async function POST(req: Request) {
       manifestVerification = verifyArtifactManifest(
         envelope.artifactManifest ?? null,
         launcherPublicKeyPem,
-        token.executionId
+        {
+          executionId: token.executionId,
+          workerId: token.workerId,
+          // Phase 18Z.1: bind the manifest to the EXACT (executionId, workerId,
+          // repositorySha, substrateInstanceId) tuple the control plane
+          // expects. repositorySha is the SERVER-AUTHORITATIVE SHA
+          // (project.canonicalHeadSha) — NOT the worker-reported SHA. This
+          // prevents a worker from relaying a manifest signed for a different
+          // SHA (the launcher inside the substrate signed the manifest with
+          // cap.repositoryHeadSha, which the control plane signed into the
+          // capability; if the worker tries to swap the manifest to one from a
+          // different execution, the binding fails here).
+          repositorySha: project.canonicalHeadSha ?? "",
+          substrateInstanceId: envelope.substrateAttestation?.substrateInstanceId ?? "",
+        }
       );
     }
     const artifactManifestVerified = manifestVerification.valid;
+
+    // Phase 18Z.1: Artifact retrievability check. The manifest being signed +
+    // structurally valid is NOT enough — the control plane must verify EVERY
+    // declared artifact is actually RETRIEVABLE from the content-addressed
+    // store AND the retrieved content hashes to the declared sha256. This
+    // closes the gap where the supervisor signed a manifest but failed to
+    // persist an artifact (e.g., disk full, store corruption, supervisor bug).
+    // The supervisor's persistence loop is fail-closed (Phase 18Z.1) — but
+    // the control plane independently re-verifies, so a buggy or malicious
+    // supervisor cannot trick the control plane into accepting evidence whose
+    // artifacts are not actually retrievable.
+    let artifactRetrievable = false;
+    if (artifactManifestVerified && envelope.artifactManifest) {
+      const storeRoot = process.env.FORGE_ARTIFACT_STORE_ROOT || "/tmp/forge-artifacts";
+      const store = new ArtifactStore(storeRoot);
+      const failures: string[] = [];
+      for (const entry of envelope.artifactManifest.entries) {
+        try {
+          if (!store.exists(entry.sha256)) {
+            failures.push(`${entry.artifactId} not found in store`);
+            continue;
+          }
+          const content = store.retrieve(entry.sha256);
+          const actualHash = createHash("sha256").update(content).digest("hex");
+          if (actualHash !== entry.sha256) {
+            failures.push(`${entry.artifactId} content hash mismatch`);
+          }
+        } catch (e: any) {
+          failures.push(`${entry.artifactId} retrieval error: ${e?.message ?? String(e)}`);
+        }
+      }
+      artifactRetrievable = failures.length === 0;
+      if (!artifactRetrievable) {
+        await ensureBuildEvent({
+          projectId,
+          type: BuildEventType.TASK_FAILED,
+          level: "error",
+          message: `ARTIFACT_NOT_RETRIEVABLE — ${failures.length} artifact(s) not persisted or hash mismatch. Evidence is untrusted; PRODUCTION_READY blocked.`,
+          payload: JSON.stringify({ failures }),
+        });
+      }
+    }
 
     // If the manifest verification failed, emit a build event with the
     // specific failure reasons. The evidence is still ACCEPTED as
@@ -742,6 +800,14 @@ export async function POST(req: Request) {
         // types present + executionId bound). Fail-closed: null/missing
         // manifest → false → PRODUCTION_READY blocked.
         artifactManifestVerified,
+        // Phase 18Z.1: the control plane INDEPENDENTLY verifies every artifact
+        // declared in the manifest is retrievable from the content-addressed
+        // store AND the retrieved content hashes to the declared sha256. This
+        // is the secondary gate (the supervisor's persistence loop is the
+        // primary gate — both are fail-closed). A buggy or malicious
+        // supervisor that signs a manifest without persisting the artifacts
+        // cannot get past this check.
+        artifactRetrievable,
         repositoryHeadVerified: headVerified,
       };
 

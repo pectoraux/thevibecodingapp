@@ -89,6 +89,13 @@ export interface MakeTestCapabilityOpts {
   executionId: string;
   nonce: string;
   leaseId: string;
+  /**
+   * Phase 18Z.1: the worker identity bound into the capability. Optional —
+   * defaults to "test-worker". The supervisor reads this from the signed
+   * capability (NOT from the request body) and binds it into the artifact
+   * manifest.
+   */
+  workerId?: string;
   repositoryHeadSha: string;
   /**
    * Phase 18Z-PRE: the repository URL the supervisor must clone. The
@@ -135,6 +142,7 @@ export function makeTestCapability(
     executionId: opts.executionId,
     nonce: opts.nonce,
     leaseId: opts.leaseId,
+    workerId: opts.workerId ?? "test-worker",
     repositoryHeadSha: opts.repositoryHeadSha,
     repositoryUrl: opts.repositoryUrl,
     runtimePlanHash,

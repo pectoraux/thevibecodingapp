@@ -685,6 +685,7 @@ let test1Sha = "";
       executionId,
       nonce,
       leaseId: "lease-closure-11",
+      workerId: "rogue-closure-worker",
       repositoryHeadSha: sha,
       repositoryUrl: fileUrlForPath(repoPath),
       runtimePlanHash: "e2e-closure-plan-hash",
@@ -918,6 +919,7 @@ let test1Sha = "";
     executionEnvironmentSandboxed: false,
     substrateAttestationVerified: false,
     artifactManifestVerified: true, // Phase 18Z-A
+    artifactRetrievable: true, // Phase 18Z.1
     repositoryHeadVerified: true,
   };
   const canReach = canReachProductionReadyWithRuntime(evidence);

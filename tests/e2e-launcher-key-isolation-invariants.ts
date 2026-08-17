@@ -547,6 +547,7 @@ let test1Capability: ExecutionCapability | null = null;
     executionId,
     nonce,
     leaseId: "lease-1",
+    workerId: "e2e-iso-6-forged-worker",
     repositoryHeadSha: sha,
     repositoryUrl: fileUrlForPath(repoPath),
     runtimePlanHash: "plan-hash",
@@ -937,6 +938,7 @@ let test1Capability: ExecutionCapability | null = null;
     executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
     artifactManifestVerified: true, // Phase 18Z-A
+    artifactRetrievable: true, // Phase 18Z.1
     repositoryHeadVerified: true,
   };
   const withoutTrust: ProductionReadinessEvidence = {

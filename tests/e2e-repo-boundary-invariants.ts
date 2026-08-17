@@ -511,6 +511,7 @@ let test1Nonce = "";
     executionId,
     nonce,
     leaseId: "lease-e2e-rb-7",
+    workerId: "e2e-rb-7-worker",
     repositoryHeadSha: sha,
     repositoryUrl: "", // ← empty → pre-check 2f fails
     runtimePlanHash: "e2e-repo-boundary-plan-hash",
@@ -882,6 +883,7 @@ let test1Nonce = "";
     executionEnvironmentSandboxed: false, // ← NOT sandboxed
     substrateAttestationVerified: false,  // ← NO verified attestation
     artifactManifestVerified: true,       // Phase 18Z-A (true here — this test isolates the substrate flag)
+    artifactRetrievable: true,             // Phase 18Z.1
     repositoryHeadVerified: true,
   };
   const canReach = canReachProductionReadyWithRuntime(evidence);

@@ -156,6 +156,10 @@ function signValidCap(
     executionId: string;
     nonce: string;
     leaseId: string;
+    /** Phase 18Z.1: workerId bound into the capability + the artifact
+     *  manifest. The supervisor reads this from the signed capability (NOT
+     *  from the request body). */
+    workerId: string;
     repositoryHeadSha: string;
     repositoryUrl: string;
     expiresAt?: string;
@@ -166,6 +170,7 @@ function signValidCap(
     executionId: opts.executionId,
     nonce: opts.nonce,
     leaseId: opts.leaseId,
+    workerId: opts.workerId,
     repositoryHeadSha: opts.repositoryHeadSha,
     repositoryUrl: opts.repositoryUrl,
     runtimePlanHash: "e2e-artifact-plan-hash",
@@ -211,6 +216,7 @@ let test1WorkerId = "";
   const plan = makeTestPlan(3000);
   const capability = signValidCap(SUPERVISOR, {
     executionId, nonce, leaseId: "lease-artifact-1",
+    workerId,
     repositoryHeadSha: sha, repositoryUrl: fileUrlForPath(repoPath),
   });
   test1ExecutionId = executionId;
@@ -236,7 +242,12 @@ let test1WorkerId = "";
   const manifest = envelope.artifactManifest;
   const manifestNonNull = manifest !== null && manifest !== undefined;
   const verification = manifestNonNull
-    ? verifyArtifactManifest(manifest, LAUNCHER_PUBLIC_KEY, executionId)
+    ? verifyArtifactManifest(manifest, LAUNCHER_PUBLIC_KEY, {
+        executionId,
+        workerId,
+        repositorySha: sha,
+        substrateInstanceId: envelope.substrateAttestation?.substrateInstanceId ?? "",
+      })
     : { valid: false, reasons: ["manifest is null"] };
   const requiredPresent = manifestNonNull
     ? REQUIRED_ARTIFACT_TYPES.every((t) => manifest!.entries.some((e) => e.type === t))
@@ -283,7 +294,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     tampered,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const hashReason = verification.reasons.some((r) =>
     r.includes("manifestHash does not match")
@@ -332,7 +343,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     tampered,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const hashMismatch = verification.reasons.some((r) =>
     r.includes("manifestHash does not match")
@@ -351,7 +362,7 @@ let test1WorkerId = "";
   const reSignedVerification = verifyArtifactManifest(
     reSigned,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   // The re-signed tampered manifest SHOULD now pass verifyArtifactManifest
   // (hash + signature + structure are all consistent). The substitution
@@ -408,7 +419,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     tampered,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const hashReason = verification.reasons.some((r) =>
     r.includes("manifestHash does not match")
@@ -455,7 +466,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     signed,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const missingReason = verification.reasons.some((r) =>
     r.includes("Missing required artifact types") && r.includes("install-log")
@@ -503,7 +514,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     signed,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const dupReason = verification.reasons.some((r) =>
     r.includes("Duplicate artifactId")
@@ -549,7 +560,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     signed,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const traversalReason = verification.reasons.some((r) =>
     r.toLowerCase().includes("path traversal")
@@ -596,7 +607,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     signed,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const sizeReason = verification.reasons.some((r) =>
     r.includes("exceeds limit")
@@ -629,7 +640,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    execB
+    { executionId: execB, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const execReason = verification.reasons.some((r) =>
     r.includes("executionId mismatch")
@@ -663,7 +674,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     tampered,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const sigReason = verification.reasons.some((r) =>
     r.includes("signature") || r.includes("INVALID")
@@ -694,7 +705,7 @@ let test1WorkerId = "";
   const verification = verifyArtifactManifest(
     manifest,
     WRONG_LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const sigReason = verification.reasons.some((r) =>
     r.includes("signature") || r.includes("INVALID")
@@ -872,13 +883,15 @@ let test1WorkerId = "";
     executionEnvironmentSandboxed: true,
     substrateAttestationVerified: true,
     artifactManifestVerified: false,
+    artifactRetrievable: true, // Phase 18Z.1 — isolating artifactManifestVerified here
     repositoryHeadVerified: true,
   };
   const canReachFail = canReachProductionReadyWithRuntime(evidenceFail);
   const reasonFail = getProductionReadinessFailureReason(evidenceFail) ?? "";
   const reasonMentionsArtifactOrManifest = /artifact/i.test(reasonFail) || /manifest/i.test(reasonFail);
 
-  // Pass case: all conditions true (including artifactManifestVerified).
+  // Pass case: all conditions true (including artifactManifestVerified +
+  // artifactRetrievable).
   const evidencePass: ProductionReadinessEvidence = {
     ...evidenceFail,
     artifactManifestVerified: true,

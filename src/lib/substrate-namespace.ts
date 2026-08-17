@@ -450,11 +450,16 @@ export interface RunInSubstrateOptions {
    */
   launcherKeyPem: string;
   /**
-   * Phase 18Z-A: The worker ID, bound into the artifact manifest's hash +
-   * signature. The launcher writes this to /workspace/manifest.json.
+   * Phase 18Z-A / 18Z.1: The worker ID, bound into the artifact manifest's
+   * hash + signature. The launcher writes this to /workspace/manifest.json.
    * Optional (defaults to empty string) — direct callers (e.g., hostile
-   * tests) may omit it. The supervisor passes the real value from the
-   * capability.
+   * tests) may omit it.
+   *
+   * Phase 18Z.1: the supervisor passes `cap.workerId` here (the value signed
+   * into the capability by the control plane). The supervisor does NOT read
+   * workerId from the request body — that would let a worker lie about its
+   * identity. The capability signature covers workerId, so the worker cannot
+   * forge it.
    */
   workerId?: string;
   /**

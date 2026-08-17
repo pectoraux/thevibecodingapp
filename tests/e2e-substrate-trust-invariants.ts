@@ -665,6 +665,7 @@ console.log(`[e2e-test] Supervisor started at ${SUPERVISOR.url} (launcher key fi
     runtimeEvidencePersisted: true,
     repositoryHeadVerified: true,
     artifactManifestVerified: true, // Phase 18Z-A
+    artifactRetrievable: true, // Phase 18Z.1
     // Will be overridden per-case:
     executionEnvironmentSandboxed: false,
     substrateAttestationVerified: false,

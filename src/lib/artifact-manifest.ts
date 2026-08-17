@@ -259,6 +259,10 @@ export interface ManifestVerificationResult {
  *   2. launcherSignature is a valid Ed25519 signature over manifestHash
  *      using the pinned launcher public key (proves the launcher produced it).
  *   3. executionId matches the expected executionId (binding).
+ *   3a. workerId matches the expected workerId (Phase 18Z.1 binding).
+ *   3b. repositorySha matches the expected repositorySha (Phase 18Z.1 binding).
+ *   3c. substrateInstanceId matches the expected substrateInstanceId
+ *       (Phase 18Z.1 binding).
  *   4. All REQUIRED_ARTIFACT_TYPES are present in the entries.
  *   5. No duplicate artifactId.
  *   6. Each entry's sha256 is a valid 64-hex string.
@@ -272,7 +276,7 @@ export interface ManifestVerificationResult {
 export function verifyArtifactManifest(
   manifest: ArtifactManifest | null | undefined,
   launcherPublicKeyPem: string,
-  expectedExecutionId: string
+  expected: { executionId: string; workerId: string; repositorySha: string; substrateInstanceId: string }
 ): ManifestVerificationResult {
   const reasons: string[] = [];
   if (!manifest) {
@@ -335,10 +339,24 @@ export function verifyArtifactManifest(
   }
 
   // 3. Verify executionId binding.
-  if (manifest.executionId !== expectedExecutionId) {
+  if (manifest.executionId !== expected.executionId) {
     reasons.push(
-      `executionId mismatch: manifest=${manifest.executionId} expected=${expectedExecutionId}`
+      `executionId mismatch: manifest=${manifest.executionId} expected=${expected.executionId}`
     );
+  }
+
+  // Phase 18Z.1: Verify the OTHER three binding fields (workerId,
+  // repositorySha, substrateInstanceId). The manifest is bound to a specific
+  // (executionId, workerId, repositorySha, substrateInstanceId) tuple — any
+  // mismatch indicates a replay / substitution / forgery attempt.
+  if (manifest.workerId !== expected.workerId) {
+    reasons.push(`workerId mismatch: manifest=${manifest.workerId} expected=${expected.workerId}`);
+  }
+  if (manifest.repositorySha !== expected.repositorySha) {
+    reasons.push(`repositorySha mismatch: manifest=${manifest.repositorySha} expected=${expected.repositorySha}`);
+  }
+  if (manifest.substrateInstanceId !== expected.substrateInstanceId) {
+    reasons.push(`substrateInstanceId mismatch: manifest=${manifest.substrateInstanceId} expected=${expected.substrateInstanceId}`);
   }
 
   // 4. Verify required artifact types present.

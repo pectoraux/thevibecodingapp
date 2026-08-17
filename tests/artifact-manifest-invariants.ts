@@ -147,7 +147,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   record(
     "Test 2: signArtifactManifest + verifyArtifactManifest round-trip (valid → ok)",
@@ -180,7 +180,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     tampered,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const hashMismatch = verification.reasons.some((r) =>
     r.includes("manifestHash does not match")
@@ -212,7 +212,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     tampered,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const sigFailed = verification.reasons.some((r) =>
     r.includes("signature") || r.includes("INVALID")
@@ -255,7 +255,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const missingReason = verification.reasons.some((r) =>
     r.includes("Missing required artifact types")
@@ -297,7 +297,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const dupReason = verification.reasons.some((r) =>
     r.includes("Duplicate artifactId")
@@ -341,7 +341,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const traversalReason = verification.reasons.some((r) =>
     r.includes("path traversal")
@@ -385,7 +385,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const traversalReason = verification.reasons.some((r) =>
     r.includes("path traversal")
@@ -429,7 +429,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const sizeReason = verification.reasons.some((r) =>
     r.includes("exceeds limit")
@@ -482,7 +482,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const tooManyReason = verification.reasons.some((r) =>
     r.includes("Too many entries")
@@ -509,7 +509,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    "DIFFERENT_EXECUTION_ID"
+    { executionId: "DIFFERENT_EXECUTION_ID", workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const execIdReason = verification.reasons.some((r) =>
     r.includes("executionId mismatch")
@@ -537,7 +537,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     manifest,
     WRONG_LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   const sigReason = verification.reasons.some((r) =>
     r.includes("INVALID") || r.includes("signature")
@@ -557,7 +557,7 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const verification = verifyArtifactManifest(
     null,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   );
   record(
     "Test 13: Null manifest → REJECT (fail-closed)",
@@ -789,14 +789,14 @@ const SUBSTRATE_INSTANCE_ID = "11111111-1111-1111-1111-111111111111";
   const manifestOk = verifyArtifactManifest(
     manifest,
     LAUNCHER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   ).valid;
   // Verify the manifest CANNOT be verified with the WORKER's public key
   // (different keypair — the worker doesn't sign the manifest).
   const workerOk = verifyArtifactManifest(
     manifest,
     WORKER_KEY.publicKeyPem,
-    EXECUTION_ID
+    { executionId: EXECUTION_ID, workerId: WORKER_ID, repositorySha: REPOSITORY_SHA, substrateInstanceId: SUBSTRATE_INSTANCE_ID }
   ).valid;
   record(
     "Test 21: Manifest signature uses the launcher key (NOT the worker key)",

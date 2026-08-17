@@ -5538,3 +5538,321 @@ match the signed manifest.
   captured artifacts (Test 16).
 
 Stage Status: ✅ COMPLETE
+
+---
+
+## Phase 18Z.1-A (Task 18Z.1-A) — Closing two integrity gaps in 18Z
+
+**Date:** Phase 18Z.1-A
+**Base commit:** `7b999a6` (Phase 18Z-B)
+**Status:** ✅ COMPLETE — both gaps closed, 9 test suites GREEN (208 tests, 0 failures), 0 NEW lint/TS errors.
+
+### The two gaps
+
+#### Gap 1 (P0): workerId was worker-controlled
+
+**Before 18Z.1-A:**
+- `ExecutionCapability` had NO `workerId` field (control-plane signature did not
+  cover worker identity).
+- The supervisor read `workerId` from the **request body**:
+  `workerId: (body as { workerId?: string }).workerId ?? "unknown"`.
+  A compromised worker could lie about its identity → the launcher would sign
+  a manifest under the attacker-chosen workerId → the control plane would
+  accept it (the launcher signature was valid).
+- `verifyArtifactManifest` only checked `executionId` — NOT `workerId`,
+  `repositorySha`, or `substrateInstanceId`. A manifest signed for execution A
+  could be replayed against execution B (as long as the launcher signature +
+  hash + executionId matched).
+
+**After 18Z.1-A:**
+- `ExecutionCapability` + `ExecutionCapabilityInput` now have a required
+  `workerId: string` field. The control plane (job-spec route) signs
+  `workerId: token.workerId` into the capability.
+- The supervisor now REJECTS any `workerId` field in the request body
+  (`Phase 18Z.1: the supervisor does NOT accept a 'workerId' field in the
+  request body. The workerId is derived from the signed capability.`).
+- The supervisor reads `workerId: cap.workerId` from the signed capability
+  and passes that to `runInSubstrate` (which binds it into the manifest).
+- `verifyArtifactManifest` signature changed from
+  `(manifest, pubKey, expectedExecutionId: string)` to
+  `(manifest, pubKey, expected: { executionId, workerId, repositorySha,
+  substrateInstanceId })`. The verifier now checks ALL FOUR binding fields.
+- The submit-runtime-evidence route passes the server-authoritative tuple:
+  `{ executionId: token.executionId, workerId: token.workerId,
+  repositorySha: project.canonicalHeadSha ?? "",
+  substrateInstanceId: envelope.substrateAttestation?.substrateInstanceId ?? "" }`.
+
+#### Gap 2 (P1): artifact persistence failure didn't fail the execution
+
+**Before 18Z.1-A:**
+- The supervisor caught artifact-store failures and logged warnings, then
+  returned 200 with the manifest. A worker could submit an envelope with a
+  valid signed manifest whose artifacts were NEVER actually persisted → the
+  evidence was unverifiable at audit time but the control plane accepted it.
+- The control plane (submit-runtime-evidence route) did NOT verify artifacts
+  were retrievable from the store.
+- `ProductionReadinessEvidence` had `artifactManifestVerified` but NOT
+  `artifactRetrievable`.
+
+**After 18Z.1-A:**
+- The supervisor's artifact persistence loop is now FAIL-CLOSED. For each
+  manifest entry:
+  - Path traversal → fail-closed (added to `persistFailures`).
+  - File not found → fail-closed.
+  - `readFileSync` throws → fail-closed.
+  - `artifactStore.store()` throws (hash mismatch, size limit) → fail-closed.
+  - After storing, retrieve + re-hash to verify → if mismatch → fail-closed.
+  - If `retrieve()` throws → fail-closed.
+  - If ANY failures → return HTTP 500 with all failure reasons. The manifest
+    is NOT returned. Evidence is untrusted.
+- The control plane INDEPENDENTLY verifies every artifact is retrievable:
+  - For each manifest entry, check `store.exists(sha256)`.
+  - Retrieve the content and re-hash; if mismatch → fail.
+  - If ANY failures → emit `ARTIFACT_NOT_RETRIEVABLE` build event
+    (`TASK_FAILED`, level=error), `artifactRetrievable = false`.
+- `ProductionReadinessEvidence` now has `artifactRetrievable: boolean`.
+- `canReachProductionReadyWithRuntime` now requires
+  `evidence.artifactRetrievable &&` (in addition to all other conditions).
+- `getProductionReadinessFailureReason` mentions
+  `artifactRetrievable=NOT_RETRIEVABLE` when it's the failing condition.
+
+### Files modified
+
+**Source (7 files):**
+
+1. `src/lib/execution-capability.ts`
+   - Added `workerId: string` to `ExecutionCapability` interface.
+   - Added `workerId: string` to `ExecutionCapabilityInput` interface.
+   - Added `workerId: input.workerId` to `canonicalCapabilityJson` fields map
+     (so the signature covers it).
+   - Added `workerId: cap.workerId` to the input reconstruction in
+     `verifyExecutionCapability`.
+
+2. `src/lib/artifact-manifest.ts`
+   - Changed `verifyArtifactManifest` third parameter from
+     `expectedExecutionId: string` to
+     `expected: { executionId, workerId, repositorySha, substrateInstanceId }`.
+   - Added three new binding checks after the executionId check:
+     `workerId`, `repositorySha`, `substrateInstanceId`.
+   - Updated doc comment to list the new checks (3a, 3b, 3c).
+
+3. `src/app/api/worker/job-spec/route.ts`
+   - Added `workerId: token.workerId` to the `capabilityInput` object
+     (the control-plane-signed capability now binds worker identity).
+
+4. `mini-services/substrate-supervisor/index.ts`
+   - Added a NEW rejection: if `body.workerId !== undefined` → 403
+     "Phase 18Z.1: the supervisor does NOT accept a 'workerId' field in the
+     request body."
+   - Changed `workerId: (body as { workerId?: string }).workerId ?? "unknown"`
+     to `workerId: cap.workerId` (read from the SIGNED capability).
+   - Replaced the best-effort artifact persistence loop with a FAIL-CLOSED
+     loop. Collects all failures into `persistFailures[]`; if any, returns
+     HTTP 500 with `{ error, reasons: persistFailures }` and does NOT return
+     the manifest.
+   - Added post-store retrieve + re-hash verification (defense-in-depth).
+   - Added `import { createHash } from "node:crypto"`.
+
+5. `src/app/api/worker/submit-runtime-evidence/route.ts`
+   - Updated `verifyArtifactManifest` call to pass the full expected object:
+     `{ executionId: token.executionId, workerId: token.workerId,
+     repositorySha: project.canonicalHeadSha ?? "",
+     substrateInstanceId: envelope.substrateAttestation?.substrateInstanceId ?? "" }`.
+   - Added artifact retrievability check after manifest verification:
+     for each manifest entry, `store.exists(sha256)` + `store.retrieve(sha256)`
+     + re-hash. If any fail → emit `ARTIFACT_NOT_RETRIEVABLE` build event
+     and set `artifactRetrievable = false`.
+   - Added `artifactRetrievable` to the `prodEvidence` object.
+   - Added imports: `import { createHash } from "node:crypto"` and
+     `import { ArtifactStore } from "@/lib/artifact-store"`.
+
+6. `src/lib/runtime-verification.ts`
+   - Added `artifactRetrievable: boolean` to `ProductionReadinessEvidence`.
+   - Added `evidence.artifactRetrievable &&` to
+     `canReachProductionReadyWithRuntime`.
+   - Added `if (!evidence.artifactRetrievable) reasons.push(...)` to
+     `getProductionReadinessFailureReason` (mentions
+     `artifactRetrievable=NOT_RETRIEVABLE`).
+
+7. `src/lib/substrate-namespace.ts`
+   - Updated the doc comment for the `workerId` field to accurately say
+     the supervisor passes `cap.workerId` (from the signed capability),
+     NOT a value from the request body. No code change.
+
+**Tests (10 files):**
+
+8. `tests/lib/test-capability.ts`
+   - Added `workerId?: string` to `MakeTestCapabilityOpts` (optional, defaults
+     to `"test-worker"`).
+   - Added `workerId: opts.workerId ?? "test-worker"` to the input.
+
+9. `tests/lib/test-supervisor.ts`
+   - Added `workerId?: string` to `SignCapabilityInput` (optional).
+   - Updated `signCapability`'s function signature to also omit `workerId`
+     from the required input (callers can pass it if they care).
+   - Added `workerId: input.workerId ?? "test-worker"` to `fullInput`.
+   - Changed `fullInput: SignCapabilityInput` to
+     `fullInput: ExecutionCapabilityInput` (so the type matches what
+     `signExecutionCapability` expects).
+   - Added `type ExecutionCapabilityInput` to the imports.
+
+10. `tests/artifact-manifest-invariants.ts`
+    - Updated ALL 14 `verifyArtifactManifest` calls to the new signature:
+      `(manifest, pubKey, { executionId, workerId, repositorySha, substrateInstanceId })`.
+
+11. `tests/e2e-artifact-integrity-invariants.ts`
+    - Updated ALL 12 `verifyArtifactManifest` calls to the new signature.
+    - Added `workerId: string` to the `signValidCap` helper's `opts` (now
+      required) and pass it to `sup.signCapability`.
+    - Test 1 now passes `workerId` to `signValidCap` so the capability's
+      workerId matches the envelope's workerId (and the manifest's workerId).
+
+12. `tests/control-plane-capability-invariants.ts`
+    - Added `workerId?: string` to `issueCapabilityLikeJobSpecRoute`'s params
+      (defaults to `"cp-capability-test-worker"`).
+    - Added `workerId` to the `capabilityInput` and `expiredInput`
+      constructions.
+
+13. `tests/e2e-capability-closure-invariants.ts`
+    - Added `workerId: "rogue-closure-worker"` to the rogue capability
+      input (Test 11).
+    - Added `artifactRetrievable: true` to the `ProductionReadinessEvidence`
+      construction (Test 15).
+
+14. `tests/e2e-repo-boundary-invariants.ts`
+    - Added `workerId: "e2e-rb-7-worker"` to the `badInput` capability
+      construction (Test 7).
+    - Added `artifactRetrievable: true` to the `ProductionReadinessEvidence`
+      construction (Test 14).
+
+15. `tests/e2e-launcher-key-isolation-invariants.ts`
+    - Added `workerId: "e2e-iso-6-forged-worker"` to the `capInput`
+      construction (Test 6).
+    - Added `artifactRetrievable: true` to the `ProductionReadinessEvidence`
+      construction (Test 14).
+
+16. `tests/e2e-substrate-trust-invariants.ts`
+    - Added `artifactRetrievable: true` to the `baseEvidence`
+      `ProductionReadinessEvidence` construction (Test 11).
+
+17. `tests/runtime-verification-invariants.ts`
+    - Added `artifactRetrievable: true` to ALL 12 `ProductionReadinessEvidence`
+      constructions (via `replace_all` on the `artifactManifestVerified: true,`
+      line).
+
+18. `tests/substrate-key-isolation-invariants.ts`
+    - Added `workerId: "substrate-iso-forged-worker"` to the `capInput`
+      (Test 8) and `workerId: "substrate-iso-15-worker"` to the `input`
+      (Test 15).
+
+### Verification
+
+**Lint:** `bun run lint` — 1 pre-existing error + 12 pre-existing warnings, 0 NEW
+(same as the 18Z-B baseline).
+
+**TypeScript:** `bunx tsc --noEmit` — 289 errors before AND after (all
+pre-existing — DB schema mismatches for `substrateNonce`/`substrateCapability`
+fields, `publicKeyPem` on `WorkerRegistry`, `substrateAttestation` on
+`RuntimeEvidence`, spawn/ChildProcess typing in test-supervisor.ts, etc.).
+0 NEW TypeScript errors introduced.
+
+**Test suites (all GREEN):**
+
+| Suite | Tests | Status |
+|-------|-------|--------|
+| `artifact-manifest-invariants` | 21 passed | ✅ |
+| `e2e-artifact-integrity-invariants` | 16 passed | ✅ |
+| `control-plane-capability-invariants` | 14 passed | ✅ |
+| `e2e-capability-closure-invariants` | 16 passed | ✅ |
+| `e2e-repo-boundary-invariants` | 14 passed | ✅ |
+| `e2e-launcher-key-isolation-invariants` | 15 passed | ✅ |
+| `e2e-substrate-trust-invariants` | 12 passed | ✅ |
+| `runtime-verification-invariants` | 87 passed | ✅ |
+| `phase-18y-smoke` | 13 passed | ✅ |
+| **TOTAL** | **208 passed, 0 failed** | ✅ |
+
+### Confirmations
+
+1. **`workerId` is now derived from the capability (not the body).** ✅
+   - The job-spec route signs `workerId: token.workerId` into the capability.
+   - The supervisor REJECTS `workerId` in the request body (HTTP 403).
+   - The supervisor reads `workerId: cap.workerId` from the signed capability.
+   - The capability signature covers `workerId` (it's in
+     `canonicalCapabilityJson`'s `fields` map).
+
+2. **`verifyArtifactManifest` checks all 4 bindings.** ✅
+   - `executionId` (existing check, updated to use `expected.executionId`).
+   - `workerId` (NEW — `manifest.workerId !== expected.workerId`).
+   - `repositorySha` (NEW — `manifest.repositorySha !== expected.repositorySha`).
+   - `substrateInstanceId` (NEW —
+     `manifest.substrateInstanceId !== expected.substrateInstanceId`).
+
+3. **Artifact store failure is fail-closed.** ✅
+   - The supervisor's persistence loop collects ALL failures into
+     `persistFailures[]`. If any → HTTP 500 with `{ error, reasons }` and
+     the manifest is NOT returned.
+   - Failures include: path traversal, file not found, `readFileSync` throw,
+     `store.store()` throw (hash mismatch / size limit), post-store retrieve
+     throw, post-store hash mismatch.
+   - The control plane INDEPENDENTLY re-verifies (defense-in-depth): for each
+     manifest entry, `store.exists(sha256)` + `store.retrieve(sha256)` +
+     re-hash. If any fail → `ARTIFACT_NOT_RETRIEVABLE` event +
+     `artifactRetrievable = false` → PRODUCTION_READY blocked.
+
+4. **`artifactRetrievable` is in the production predicate.** ✅
+   - `ProductionReadinessEvidence.artifactRetrievable: boolean` (required).
+   - `canReachProductionReadyWithRuntime` requires
+     `evidence.artifactRetrievable &&`.
+   - `getProductionReadinessFailureReason` mentions
+     `artifactRetrievable=NOT_RETRIEVABLE` when it's the failing condition.
+
+### Constraints honored
+
+- ❌ Did NOT commit (per task spec — implement + verify only).
+- ✅ Fail-closed everywhere (supervisor persistence + control-plane
+  retrievability check + manifest binding).
+- ✅ NO `shell:true` (TypeScript strict mode, all spawns use arg arrays).
+- ✅ The supervisor REJECTS `workerId` in the request body.
+- ✅ `verifyArtifactManifest` checks all 4 binding fields.
+- ✅ Artifact store failure is fail-closed (supervisor returns 500, control
+  plane independently re-verifies).
+- ✅ `artifactRetrievable` is in the production predicate.
+
+### Test failure encountered + fix
+
+Initial run of `e2e-artifact-integrity-invariants` Test 1 failed:
+`workerId mismatch: manifest=test-worker expected=e2e-artifact-integrity-worker`.
+Root cause: the `signValidCap` helper used `sup.signCapability` which defaulted
+`workerId` to `"test-worker"` (the test-supervisor default), but the envelope
+was built with `workerId: "e2e-artifact-integrity-worker"`. The supervisor
+read `cap.workerId = "test-worker"` and bound it into the manifest, so the
+manifest had `workerId="test-worker"`. When the test verified the manifest
+with `expected.workerId = "e2e-artifact-integrity-worker"` (from the
+envelope's workerId), the new binding check correctly rejected it.
+
+Fix: added `workerId: string` to the `signValidCap` helper's `opts` (now
+required) and pass it to `sup.signCapability`. Test 1 now passes
+`workerId: "e2e-artifact-integrity-worker"` explicitly. After the fix, all
+16 tests in `e2e-artifact-integrity-invariants` pass.
+
+This is exactly the kind of bug the new binding check is designed to catch —
+a capability whose workerId doesn't match the envelope's workerId is now
+rejected. The test surfaced the gap, and the fix (sign the right workerId
+into the capability) is the correct production behavior.
+
+### Honest residual risk
+
+The same residual risks from 18Z remain (no hardware attestation; supervisor
+host compromise extracts the launcher key; ArtifactStore has no GC; storage
+defaults to `/tmp`). 18Z.1-A does NOT change the threat model — it closes
+TWO specific integrity gaps:
+
+1. Worker-controlled workerId (closed: workerId is signed into the
+   capability, the supervisor rejects it in the body, the verifier checks
+   all 4 bindings).
+2. Best-effort artifact persistence (closed: supervisor is fail-closed,
+   control plane independently re-verifies retrievability, the production
+   predicate requires `artifactRetrievable`).
+
+Stage Status: ✅ COMPLETE — both gaps closed, 9 test suites GREEN (208
+tests, 0 failures), 0 NEW lint/TS errors. Not committed (per task spec).

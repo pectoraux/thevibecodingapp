@@ -132,6 +132,7 @@ import { readFileSync, unlinkSync, existsSync, mkdirSync, writeFileSync, copyFil
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 import { runInSubstrate } from "@/lib/substrate-namespace";
 import {
@@ -282,6 +283,22 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       if ((body as { workload?: unknown }).workload !== undefined) {
         sendJson(res, 403, {
           error: "Phase 18Y: the supervisor does NOT accept a 'workload' field. The workload is derived from cap.runtimePlan (control-plane-signed). The worker cannot supply the workload.",
+        } satisfies ErrorResponseBody);
+        return;
+      }
+
+      // =====================================================================
+      // Phase 18Z.1: REJECT any `workerId` field. The worker must NOT supply
+      // its own identity in the request body — the supervisor reads workerId
+      // from the SIGNED capability (cap.workerId). This closes the gap where
+      // a worker could lie about its identity and have the manifest signed
+      // under a different workerId (which the control plane would then
+      // accept, because the manifest signature was valid). The capability
+      // signature covers workerId, so the worker cannot forge it.
+      // =====================================================================
+      if ((body as { workerId?: unknown }).workerId !== undefined) {
+        sendJson(res, 403, {
+          error: "Phase 18Z.1: the supervisor does NOT accept a 'workerId' field in the request body. The workerId is derived from the signed capability.",
         } satisfies ErrorResponseBody);
         return;
       }
@@ -614,8 +631,10 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
           nonce: cap.nonce,
           executionId: cap.executionId,
           launcherKeyPem,
-          // Phase 18Z-A: bound into the artifact manifest.
-          workerId: (body as { workerId?: string }).workerId ?? "unknown",
+          // Phase 18Z.1: workerId comes from the SIGNED capability (NOT from
+          // the request body). The capability signature covers workerId, so
+          // the worker cannot lie about its identity.
+          workerId: cap.workerId,
           repositorySha: cap.repositoryHeadSha,
         });
       } catch (err) {
@@ -642,24 +661,31 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       }
 
       // =====================================================================
-      // 11.5 (Phase 18Z-A): Persist artifacts to the content-addressed store.
+      // 11.5 (Phase 18Z-A / 18Z.1): Persist artifacts to the content-addressed store.
       //
       // The manifest's storageRef values point at LOGICAL paths within the
       // workspace (e.g., "logs/install.log", "attestation.json"). The
       // supervisor reads each artifact from <workspace>/<storageRef>, stores
       // it in the ArtifactStore keyed by sha256 (the content-addressed key),
       // and verifies the stored content's hash matches the manifest's
-      // declared sha256 (fail-closed on mismatch).
+      // declared sha256.
       //
       // The manifest's storageRef is NOT modified — it stays as the launcher
       // signed it (mutating it would break the signature). Consumers retrieve
       // artifacts by sha256 from the store, NOT by storageRef.
       //
-      // Best-effort: if an artifact can't be read or its hash doesn't match,
-      // we emit a warning but don't fail the request (the manifest verifier
-      // on the control plane will catch the mismatch — fail-closed there).
+      // Phase 18Z.1 — FAIL-CLOSED: if ANY artifact cannot be read, stored, or
+      // re-hashed to the declared sha256, the supervisor returns HTTP 500 and
+      // does NOT return the manifest. Evidence is untrusted. The control
+      // plane's `artifactRetrievable` predicate at submit-runtime-evidence time
+      // is a SECONDARY check — the supervisor's persistence is the primary
+      // gate. (Before 18Z.1, the supervisor logged warnings + returned 200,
+      // which let a worker submit an envelope whose manifest was signed but
+      // whose artifacts were never actually persisted → unverifiable at audit
+      // time. That gap is now closed.)
       // =====================================================================
       if (manifest && Array.isArray(manifest.entries)) {
+        const persistFailures: string[] = [];
         for (const entry of manifest.entries) {
           // Defense-in-depth: reject path traversal in the storageRef before
           // reading from the workspace. (verifyArtifactManifest also checks
@@ -671,34 +697,60 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
             entry.path.includes("..") ||
             entry.path.includes("\\")
           ) {
-            console.warn(
-              `[substrate-supervisor] Path traversal in manifest entry ${entry.artifactId}: ${entry.path} — skipping persist`
+            persistFailures.push(
+              `Artifact persistence failed — manifest entry ${entry.artifactId} has a path-traversal storageRef '${entry.path}'. Evidence is untrusted.`
             );
             continue;
           }
           const artifactPath = join(workspace, entry.path);
+          if (!existsSync(artifactPath)) {
+            persistFailures.push(
+              `Artifact persistence failed — manifest entry ${entry.artifactId} file not found at ${entry.path}. Evidence is untrusted.`
+            );
+            continue;
+          }
+          let content: Buffer;
           try {
-            if (!existsSync(artifactPath)) {
-              console.warn(
-                `[substrate-supervisor] Artifact ${entry.artifactId} (${entry.path}) not found in workspace — skipping persist`
-              );
-              continue;
-            }
-            const content = readFileSync(artifactPath);
-            // Store with declared sha256 — the store verifies the content
-            // hash matches (throws on mismatch → fail-closed).
-            try {
-              artifactStore.store(content, entry.sha256);
-            } catch (storeErr) {
-              console.warn(
-                `[substrate-supervisor] Artifact ${entry.artifactId} (${entry.path}) store failed: ${storeErr instanceof Error ? storeErr.message : String(storeErr)} — hash mismatch indicates tampering (fail-closed at verification)`
-              );
-            }
+            content = readFileSync(artifactPath);
           } catch (readErr) {
-            console.warn(
-              `[substrate-supervisor] Artifact ${entry.artifactId} (${entry.path}) read failed: ${readErr instanceof Error ? readErr.message : String(readErr)}`
+            persistFailures.push(
+              `Artifact persistence failed — ${entry.artifactId}: ${readErr instanceof Error ? readErr.message : String(readErr)}. Evidence is untrusted.`
+            );
+            continue;
+          }
+          // Store with declared sha256 — the store verifies the content
+          // hash matches (throws on mismatch → fail-closed).
+          try {
+            artifactStore.store(content, entry.sha256);
+          } catch (storeErr) {
+            persistFailures.push(
+              `Artifact persistence failed — ${entry.artifactId}: ${storeErr instanceof Error ? storeErr.message : String(storeErr)}. Evidence is untrusted.`
+            );
+            continue;
+          }
+          // Phase 18Z.1: retrieve + re-hash to verify the persisted content
+          // matches the declared sha256 (defense-in-depth — catches disk
+          // corruption that occurred between store() and the read-back).
+          try {
+            const retrieved = artifactStore.retrieve(entry.sha256);
+            const actualHash = createHash("sha256").update(retrieved).digest("hex");
+            if (actualHash !== entry.sha256) {
+              persistFailures.push(
+                `Artifact persistence failed — ${entry.artifactId}: post-store hash mismatch (declared=${entry.sha256.slice(0, 16)}... actual=${actualHash.slice(0, 16)}...). Evidence is untrusted.`
+              );
+            }
+          } catch (retrieveErr) {
+            persistFailures.push(
+              `Artifact persistence failed — ${entry.artifactId}: post-store retrieve error: ${retrieveErr instanceof Error ? retrieveErr.message : String(retrieveErr)}. Evidence is untrusted.`
             );
           }
+        }
+        if (persistFailures.length > 0) {
+          sendJson(res, 500, {
+            error: `Phase 18Z.1: artifact persistence failed — ${persistFailures.length} failure(s). Evidence is untrusted; the manifest is NOT returned.`,
+            reasons: persistFailures,
+          } satisfies ErrorResponseBody);
+          return;
         }
       }
 

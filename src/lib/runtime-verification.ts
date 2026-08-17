@@ -332,6 +332,19 @@ export interface ProductionReadinessEvidence {
    * `sha256(build.log) === <signed manifest hash>`.
    */
   artifactManifestVerified: boolean;
+  /**
+   * Phase 18Z.1: True iff the control plane INDEPENDENTLY verified every
+   * artifact declared in the manifest is RETRIEVABLE from the content-
+   * addressed store AND the retrieved content hashes to the declared
+   * sha256. This is the secondary gate (the supervisor's persistence loop
+   * is the primary gate — both are fail-closed).
+   *
+   * Fail-closed: any artifact not retrievable (or hash mismatch) => false
+   * => PRODUCTION_READY blocked. Forge never trusts "manifest signed" — it
+   * trusts "artifact retrievable from the content-addressed store + hash
+   * matches the signed declaration".
+   */
+  artifactRetrievable: boolean;
   repositoryHeadVerified: boolean;
 }
 
@@ -361,6 +374,7 @@ export function canReachProductionReadyWithRuntime(
     evidence.executionEnvironmentSandboxed &&
     evidence.substrateAttestationVerified &&
     evidence.artifactManifestVerified &&
+    evidence.artifactRetrievable &&
     evidence.repositoryHeadVerified
   );
 }
@@ -383,6 +397,7 @@ export function getProductionReadinessFailureReason(
   if (!evidence.executionEnvironmentSandboxed) reasons.push("environment=UNSANDBOXED");
   if (!evidence.substrateAttestationVerified) reasons.push("substrateAttestation=NOT_VERIFIED (no verified isolation boundary — PRODUCTION_READY blocked, fail-closed)");
   if (!evidence.artifactManifestVerified) reasons.push("artifactManifest=NOT_VERIFIED (no signed content-addressed manifest — PRODUCTION_READY blocked, fail-closed)");
+  if (!evidence.artifactRetrievable) reasons.push("artifactRetrievable=NOT_RETRIEVABLE (signed manifest is present but artifacts cannot be retrieved from the content-addressed store or hash mismatch — PRODUCTION_READY blocked, fail-closed)");
   if (!evidence.repositoryHeadVerified) reasons.push("repositoryHead=UNVERIFIED");
 
   return reasons.length > 0 ? reasons.join(", ") : null;

@@ -246,6 +246,11 @@ export async function POST(req: Request) {
       executionId: job.executionId,
       nonce: substrateNonce,
       leaseId: job.leaseId ?? "",
+      // Phase 18Z.1: workerId is signed into the capability (NOT read from
+      // the supervisor's request body). The supervisor binds this value into
+      // the artifact manifest, and the control plane verifies the manifest's
+      // workerId === token.workerId at submit-runtime-evidence time.
+      workerId: token.workerId,
       repositoryHeadSha: project?.canonicalHeadSha ?? "",
       repositoryUrl, // Phase 18Z-PRE
       runtimePlanHash,

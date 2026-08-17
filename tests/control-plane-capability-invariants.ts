@@ -219,6 +219,9 @@ function issueCapabilityLikeJobSpecRoute(params: {
   executionId: string;
   nonce: string;
   leaseId: string;
+  /** Phase 18Z.1: workerId bound into the capability. Defaults to
+   *  "cp-capability-test-worker" if not provided. */
+  workerId?: string;
   repositoryHeadSha: string;
   architecture?: {
     contractJson: string | null;
@@ -280,6 +283,7 @@ function issueCapabilityLikeJobSpecRoute(params: {
     executionId: params.executionId,
     nonce: params.nonce,
     leaseId: params.leaseId,
+    workerId: params.workerId ?? "cp-capability-test-worker",
     repositoryHeadSha: params.repositoryHeadSha,
     repositoryUrl,
     runtimePlanHash,
@@ -553,6 +557,7 @@ console.log(`[cp-capability-test] getControlPlanePublicKey(): ${(getControlPlane
     executionId: randomUUID(),
     nonce: randomUUID(),
     leaseId: "lease-test-6",
+    workerId: "cp-capability-test-worker-expired",
     repositoryHeadSha: "abc123",
     runtimePlanHash: "plan-hash",
     architectureHash: null,
